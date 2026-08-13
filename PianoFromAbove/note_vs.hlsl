@@ -64,7 +64,7 @@ NotePSInput main(uint id : SV_VertexID) {
         x = fixed[0].note_x[note] + fixed[0].bends[chan];
         y = round(root.notes_y + root.notes_cy * (1.0f - note_data[note_index].pos / root.timespan));
         cx = sharp ? root.white_cx * 0.65f : root.white_cx;
-        cy = max(round(root.notes_cy * note_data[note_index].length / root.timespan), 0);
+        cy = max(round(root.notes_cy * note_data[note_index].length / root.timespan), root.deflate);
     }
     bool is_right = vertex == 1 || vertex == 2;
     uint color_idx = root.stripMode > 0.5 ? (vertex < 2) : is_right;
