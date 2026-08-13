@@ -1,8 +1,11 @@
-# PianoFromAbove
+# PlayGroundFromAbove
+Absolutely diabolical.
 
-Welcome to my viz branch. This includes all the changes of upstream's viz branch, but with other hacky tweaks included!
+(incomplete)
 
-This is currently (much) faster than upstream viz.
+
+
+
 
 ## How to build
 
@@ -14,6 +17,3 @@ This is currently (much) faster than upstream viz.
 * Cross fingers
 * Build! (Release, x64)
 
-Once that's done, there should be a Release\PFA-1.1.0viz-x86_64.exe that you can run.
-
-Remember to WinMM patch it!
