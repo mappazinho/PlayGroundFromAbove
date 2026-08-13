@@ -1752,14 +1752,17 @@ GameState::GameError MainScreen::Logic( void )
             });
         }
 
-        if (cViz.bNerdStats) {
-            for (; !m_dNPSNotes.empty(); m_dNPSNotes.pop_front()) {
-                if (std::get<0>(m_dNPSNotes.front()) >= m_llStartTime - 1000000)
-                    break;
-            }
-            if (notes_played != 0)
-                m_dNPSNotes.push_back(std::make_tuple(m_llStartTime, notes_played));
+        for (; !m_dNPSNotes.empty(); m_dNPSNotes.pop_front()) {
+            if (std::get<0>(m_dNPSNotes.front()) >= m_llStartTime - 1000000)
+                break;
         }
+        if (notes_played != 0)
+            m_dNPSNotes.push_back(std::make_tuple(m_llStartTime, notes_played));
+
+        long long lagNps = 0;
+        for (size_t i = 0; i < m_dNPSNotes.size(); i++)
+            lagNps += std::get<1>(m_dNPSNotes[i]);
+        m_pRenderer->SetLagNPS(lagNps);
     }
 
     AdvanceIterators( m_llStartTime, false );
@@ -3829,6 +3832,11 @@ GameState::GameError FreePlayScreen::Logic()
     m_iFreePlayNoteCount = 0;
     while (!m_dNPSNotes.empty() && std::get<0>(m_dNPSNotes.front()) < m_llFreePlayTime - 1000000)
         m_dNPSNotes.pop_front();
+
+    long long lagNps = 0;
+    for (size_t i = 0; i < m_dNPSNotes.size(); i++)
+        lagNps += std::get<1>(m_dNPSNotes[i]);
+    m_pRenderer->SetLagNPS(lagNps);
 
     m_pRenderer->ClearAndBeginScene(0xFF000000);
     RenderLines();

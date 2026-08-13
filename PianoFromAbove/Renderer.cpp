@@ -10,6 +10,7 @@
 #include "d3dx12/d3dx12.h"
 #ifdef _DEBUG
 #include <dxgidebug.h>
+#include <mmsystem.h>
 #endif
 #include "RectPixelShader.h"
 #include "RectVertexShader.h"
@@ -1421,6 +1422,49 @@ HRESULT D3D12Renderer::Present() {
         if (branch == 0) HeartbeatLog("present:minimized-skip");
         else if (branch == 1) HeartbeatLog("present:vsync-on");
         else HeartbeatLog("present:tearing-on");
+    }
+
+    // Lag Intensifier: throttle the frame rate by NPS tier. 1x does nothing.
+    // 2x activates at >= 1M NPS, 3x halves that threshold, 4x halves it again.
+    // FPS caps are randomly re-rolled once per second within the tier's range.
+    if (m_iLagIntensity > 1 && branch != 0) {
+        const long long tier = 1000000LL >> (m_iLagIntensity - 1);
+        int capMin, capMax;
+        if (m_llLagNPS >= tier * 2) {
+            capMin = 1; capMax = 5;
+        } else if (m_llLagNPS >= tier) {
+            capMin = 15; capMax = 20;
+        } else {
+            capMin = 30; capMax = 60;
+        }
+        static std::chrono::steady_clock::time_point s_lastRoll;
+        static int s_capMin = 0, s_capMax = 0, s_cap = 60;
+        static std::chrono::steady_clock::time_point s_lastPresent;
+        const auto now = std::chrono::steady_clock::now();
+        const bool tierChanged = s_capMin != capMin || s_capMax != capMax;
+        const double sinceRoll = std::chrono::duration<double>(now - s_lastRoll).count();
+        if (tierChanged || sinceRoll >= 1.0) {
+            s_capMin = capMin; s_capMax = capMax;
+            s_cap = capMin + (int)(rand() % (capMax - capMin + 1));
+            s_lastRoll = now;
+            static bool s_periodSet = false;
+            if (!s_periodSet) {
+                timeBeginPeriod(1);
+                s_periodSet = true;
+            }
+        }
+        const double frameMs = 1000.0 / s_cap;
+        const double elapsed = std::chrono::duration<double, std::milli>(now - s_lastPresent).count();
+        const double sleepMs = frameMs - elapsed;
+        if (sleepMs > 0.5)
+            Sleep((DWORD)sleepMs);
+        s_lastPresent = std::chrono::steady_clock::now();
+        static int s_lagLog = 0;
+        if ((s_lagLog++ & 63) == 0) {
+            char buf[96];
+            sprintf_s(buf, "lag:nps=%lld tier=%lld cap=%d", m_llLagNPS, tier, s_cap);
+            HeartbeatLog(buf);
+        }
     }
     s_frames++;
     if (s_frames == 1 || s_frames == 128) {
@@ -2840,6 +2884,10 @@ void D3D12Renderer::RenderImGuiFrame() {
                 m_fCorruption = corrupt / 100.0f;
             ImGui::EndDisabled();
             ImGui::Text("Effective: %d%%", (int)(m_fLastCorruption * 100.0f + 0.5f));
+            ImGui::Separator();
+            int lag = (int)m_iLagIntensity - 1;
+            if (ImGui::Combo("Lag Intensifier", &lag, "1x (No Lag)\0" "2x\0" "3x\0" "4x\0\0"))
+                m_iLagIntensity = (unsigned)lag + 1;
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("RenderMode")) {

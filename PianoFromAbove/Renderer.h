@@ -169,6 +169,9 @@ public:
     float m_fCorruption = 0.0f;
     bool m_bCorruptorRamp = false; // ramp corruption 0% -> slider value over the song
     float m_fLastCorruption = 0.0f; // last effective corruption (for the Fun menu readout)
+    unsigned m_iLagIntensity = 1; // Fun menu: 1 = no lag, 2/3/4 = NPS-based FPS throttling tiers
+    long long m_llLagNPS = 0; // current notes-per-second, fed by GameState for the lag throttler
+    void SetLagNPS(long long nps) { m_llLagNPS = nps; }
 
     int m_iPianoRollStartNote = 0;
     int m_iPianoRollEndNote = 127;
@@ -223,7 +226,7 @@ private:
     ComPtr<ID3D12RootSignature> m_pRectRootSignature;
     ComPtr<ID3D12PipelineState> m_pRectPipelineState;
     ComPtr<ID3D12RootSignature> m_pNoteRootSignature;
-ComPtr<ID3D12PipelineState> m_pNotePipelineState;
+    ComPtr<ID3D12PipelineState> m_pNotePipelineState;
 ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12PipelineState> m_pBackgroundPipelineState;
     ComPtr<ID3D12RootSignature> m_pBloomRootSignature;
