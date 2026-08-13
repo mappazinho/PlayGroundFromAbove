@@ -5,6 +5,8 @@ struct RootSignatureData {
     float notes_cy;
     float white_cx;
     float timespan;
+    float stripMode;
+    float stripTimeSpan;
 };
 
 struct RectPSInput {

@@ -14,6 +14,10 @@
 #include <string>
 #include <functional>
 #include <deque>
+#include <vector>
+#include <tuple>
+#include <unordered_map>
+#include <cstdint>
 using namespace std;
 
 //#include "ProtoBuf\MetaData.pb.h"
@@ -21,47 +25,52 @@ using namespace std;
 #include "MIDI.h"
 #include "Misc.h"
 
-//Abstract base class
+// Abstract base class
 class GameState
 {
 public:
     enum GameError { Success = 0, BadPointer, OutOfMemory, DirectXError };
     enum State { Intro = 0, Splash, Practice };
 
-    //Static methods
+    // Static methods
     static const wstring Errors[];
     static GameError ChangeState( GameState *pNextState, GameState **pDestObj );
 
-    //Constructors
+    // Constructors
     GameState( HWND hWnd, D3D12Renderer *pRenderer ) : m_hWnd( hWnd ), m_pRenderer( pRenderer ), m_pNextState( NULL ) {};
     virtual ~GameState( void ) {};
 
-    // Initialize after all other game states have been deleted
+    virtual const char* DebugName() const = 0;
+    virtual bool IsFreePlay() const { return false; }
+
     virtual GameError Init() = 0;
 
-    //Handle events
     virtual GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) = 0;
 
-    //Run logic
     virtual GameError Logic() = 0;
 
-    //Render scene
     virtual GameError Render() = 0;
 
-    //Null for same state, 
+    // Called by the game thread just before a new song load begins; frees the
+    // heavy song data so the old state stops consuming RAM while the next file
+    // is parsed. After this, Logic()/Render() are no-ops until ChangeState
+    // deletes the state.
+    virtual void Discard() { m_bDiscarded = true; }
+    bool IsDiscarded() const { return m_bDiscarded; }
+
     GameState *NextState() { return m_pNextState; };
 
     void SetHWnd( HWND hWnd ) { m_hWnd = hWnd; }
     void SetRenderer( D3D12Renderer *pRenderer ) { m_pRenderer = pRenderer; }
 
 protected:
-    //Windows info
     HWND m_hWnd;
 
-    //Rendering device
     D3D12Renderer *m_pRenderer;
 
     GameState *m_pNextState;
+
+    bool m_bDiscarded = false;
 
     static const int QueueSize = 50;
 };
@@ -82,10 +91,12 @@ class SplashScreen : public GameState
 public:
     SplashScreen( HWND hWnd, D3D12Renderer *pRenderer );
 
-    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-    GameError Init();
-    GameError Logic();
-    GameError Render();
+    const char* DebugName() const override { return "SplashScreen"; }
+
+    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError Init() override;
+    GameError Logic() override;
+    GameError Render() override;
 
 private:
     void InitNotes( const vector< MIDIEvent* > &vEvents );
@@ -97,13 +108,12 @@ private:
 
     void RenderGlobals();
     void RenderNotes();
-    void RenderNote(MIDIChannelEvent* pNote);
+    void RenderNote(MIDIChannelEvent pNote);
     float GetNoteX( int iNote );
     void GenNoteXTable();
 
-    // MIDI info
     MIDI m_MIDI; // The song to display
-    vector< MIDIChannelEvent* > m_vEvents; // The channel events of the song
+    vector< MIDIChannelEvent > m_vEvents; // The channel events of the song
     int m_iStartPos;
     int m_iEndPos;
     long long m_llStartTime;
@@ -112,6 +122,7 @@ private:
     double m_dVolume;
     bool m_bPaused;
     bool m_bMute;
+    bool m_bAudioStarted = false;
 
     MIDIOutDevice m_OutDevice;
 
@@ -119,7 +130,6 @@ private:
     static const long long TimeSpan = 3000000;
     vector< TrackSettings > m_vTrackSettings;
 
-    // Computed in RenderGlobal
     int m_iStartNote, m_iEndNote; // Start and end notes of the songs
     float m_fNotesX, m_fNotesY, m_fNotesCX, m_fNotesCY; // Notes position
     int m_iAllWhiteKeys; // Number of white keys are on the screen
@@ -134,24 +144,12 @@ class IntroScreen : public GameState
 public:
     IntroScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( hWnd, pRenderer ) {}
 
-    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-    GameError Init();
-    GameError Logic();
-    GameError Render();
-};
+    const char* DebugName() const override { return "IntroScreen"; }
 
-class CustomHashFunc {
-public:
-    unsigned operator() (MIDIChannelEvent* key) const {
-        return (uint64_t)key & 0xFFFFFFFF;
-    }
-};
-
-class CustomKeyEqualFunc {
-public:
-    bool operator() (MIDIChannelEvent* a, MIDIChannelEvent* b) const {
-        return a == b;
-    }
+    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError Init() override;
+    GameError Logic() override;
+    GameError Render() override;
 };
 
 typedef struct {
@@ -166,17 +164,18 @@ public:
 
     MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, D3D12Renderer *pRenderer );
 
-    // GameState functions
-    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-    GameError Init();
-    GameError Logic( void );
-    GameError Render( void );
+    const char* DebugName() const override { return "MainScreen"; }
+    virtual bool IsFreePlay() const { return false; }
 
-    // Info
+    GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError Init() override;
+    GameError Logic( void ) override;
+    GameError Render( void ) override;
+    void Discard() override;
+
     bool IsValid() const { return m_MIDI.IsValid(); }
     const MIDI& GetMIDI() const { return m_MIDI; }
 
-    // Settings
     void ToggleMuted( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bMuted =
                                                   !m_vTrackSettings[iTrack].aChannels[iChannel].bMuted; }
     void ToggleHidden( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bHidden =
@@ -187,12 +186,13 @@ public:
     ChannelSettings* GetChannelSettings( int iChannel );
     void SetChannelSettings( const vector< bool > &vMuted, const vector< bool > &vHidden, const vector< unsigned > &vColor );
 
-private:
-    // Initialization
+    bool m_bUseCustomAudio = false;
+    wstring m_sCustomAudioPath;
+
+protected:
     void InitColors();
     void InitState();
 
-    // Logic
     void UpdateState(int key, const thread_work_t& work);
     void JumpTo(long long llStartTime, bool bUpdateGUI = true);
     void PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange);
@@ -201,7 +201,6 @@ private:
     MIDIMetaEvent* GetPrevious( eventvec_t::const_iterator &itCurrent,
                                 const eventvec_t &vEventMap, int iDataLen );
 
-    // MIDI helpers
     int GetCurrentTick( long long llStartTime );
     int GetCurrentTick( long long llStartTime, int iLastTempoTick, long long llLastTempoTime, int iMicroSecsPerBeat );
     long long GetTickTime( int iTick );
@@ -210,25 +209,28 @@ private:
     int GetBeatTick( int iTick, int iBeatType, int iLastTempoTick );
     long long GetMinTime() const { return m_MIDI.GetInfo().llFirstNote - 3000000; }
     long long GetMaxTime() const { return m_MIDI.GetInfo().llTotalMicroSecs + 500000; }
+    float GetCorruptorAmount() const;
 
     // Rendering
     void RenderGlobals();
     void RenderLines();
     void RenderNotes();
-    void RenderNote(const MIDIChannelEvent* pNote);
+    void RenderNote(MIDIChannelEvent pNote);
+    void RenderPianoRollStripNote(MIDIChannelEvent pNote);
+    virtual NoteData BuildRenderNoteData(MIDIChannelEvent pNote) const;
     void GenNoteXTable();
     float GetNoteX( int iNote );
     void RenderKeys();
     void RenderBorder();
-    void RenderText();
-    void RenderStatusLine(int line, float width, const char* left, const char* format, ...);
+void RenderText();
+    void RenderStatusLine(int line, float width, float yOffset, float rightEdge, const char* left, const char* format, ...);
     void RenderStatus(int lines);
     void RenderMarker(const char* str);
     void RenderMessage( LPRECT prcMsg, TCHAR *sMsg );
 
     // MIDI info
     MIDI m_MIDI; // The song to display
-    vector< MIDIChannelEvent* > m_vEvents; // The channel events of the song
+    vector< MIDIChannelEvent > m_vEvents; // The rows of the song's channel events
     vector< MIDIMetaEvent* > m_vMetaEvents; // The meta events of the song
     eventvec_t m_vNoteOns; // Map: note->time->Event pos. Used for fast(er) random access to the song.
     eventvec_t m_vNonNotes; // Tracked for jumping
@@ -252,6 +254,7 @@ private:
     State m_eGameMode;
     long long m_iStartPos, m_iEndPos; // Postions of the start and end events that occur in the current window
     long long m_llStartTime, m_llTimeSpan;  // Times of the start and end events of the current window
+    long long m_llDisplayTime; // Wall-clock song position for the status bar:
     int m_iStartTick; // Tick that corresponds with m_llStartTime. Used to help with beat and metronome detection
     vector<int> m_vState[128];  // The notes that are on at time m_llStartTime.
     vector<thread_work_t> m_vThreadWork[128];
@@ -264,6 +267,7 @@ private:
     bool m_bAnyChannelMuted;
     double m_dVolume;
     bool m_bTickMode = false;
+    bool m_bAudioStarted = false; // Pre-rendered audio: started once per screen
 
     // FPS variables
     bool m_bShowFPS;
@@ -271,14 +275,19 @@ private:
     long long m_llFPSTime;
     double m_dFPS;
 
-    // Devices
+    long long m_llFrameMaxLate = 0;
+    unsigned long long m_ullFrameLateCount = 0;
+    long long m_llMaxLateMicros = 0;
+    unsigned long long m_ullLateEvents = 0;
+
     MIDIOutDevice m_OutDevice;
 
-    // Visual
     static const float SharpRatio;
     static const float KeyRatio;
     bool m_bShowKB;
     int m_eKeysShown;
+    int m_eTransitionSpeed;
+    float m_fKeysTransition = 0.0f;
     ChannelSettings m_csBackground;
     ChannelSettings m_csKBRed, m_csKBWhite, m_csKBSharp, m_csKBBackground;
     vector< TrackSettings > m_vTrackSettings;
@@ -286,6 +295,7 @@ private:
     deque<tuple<long long, long long>> m_dNPSNotes;
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;
+    float m_fLastBGBlur = -1.0f;
 
     float m_fZoomX, m_fOffsetX, m_fOffsetY;
     float m_fTempZoomX, m_fTempOffsetX, m_fTempOffsetY;
@@ -294,7 +304,6 @@ private:
 
     float notex_table[128];
 
-    // Computed in RenderGlobal
     int m_iStartNote, m_iEndNote; // Start and end notes of the songs
     float m_fNotesX, m_fNotesY, m_fNotesCX, m_fNotesCY; // Notes position
     int m_iAllWhiteKeys; // Number of white keys are on the screen
@@ -302,11 +311,98 @@ private:
     long long m_llRndStartTime; // Rounded start time to make stuff drop at the same time
     uint64_t m_aSkipRender[4];
     
-    // Frame dumping stuff
     bool m_bDumpFrames = false;
     std::vector<unsigned char> m_vImageData;
     HANDLE m_hVideoPipe;
 
     // Debug assertion fail workaround
     bool m_bNextMarkerInited = false;
+};
+
+class FreePlayScreen : public MainScreen
+{
+public:
+    FreePlayScreen(HWND hWnd, D3D12Renderer* pRenderer);
+
+    GameError Init() override;
+    GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
+    GameError Logic() override;
+    GameError Render() override { return Success; }
+    bool IsFreePlay() const override { return true; }
+    const char* DebugName() const override { return "FreePlayScreen"; }
+
+private:
+    int NoteFromMousePos(int mx, int my) const;
+    void NoteOn(int note, int velocity, long long llStamp = -1);
+    void NoteOnSingle(int note, int velocity, long long llStamp = -1);
+    void NoteOff(int note, bool bStretch = false, long long llStamp = -1);
+    void NoteOffSingle(int note, bool bStretch = false, long long llStamp = -1, int iSpecificIdx = -1);
+    void SlideTo(int note);   // legato: move the chord, only strike/release the edge keys
+    void ChordRelease(bool bStretch = false, long long llStamp = -1); // release this chord's own notes
+    int m_iChordEvent[128] = {}; // per key: event this key was struck with by the current chord, or -1
+
+    NoteData BuildRenderNoteData(MIDIChannelEvent pNote) const override;
+    void RenderNoteIdx(int idx);
+
+    struct ReleasedNote {
+        long long releaseTime;
+        long long finalLength;
+    };
+    std::unordered_map<int, ReleasedNote> m_mReleasedNotes; // eventIdx -> release info
+    std::deque<int> m_dReleaseOrder; // eventIdx of released notes, oldest first, for O(1) slot recycling
+
+    bool m_bShowColorPicker = true;
+    float m_fFreePlayColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f }; // RGBA
+    float m_fFreePlaySpeed = 1.0f; // 1.0 = real time, 2.0 = twice as fast
+    float m_fRepeaterNPS = 0.0f;   // note repeater: repeats per second while held (0 = off)
+    long long m_llRepeaterLast = 0; // last repeater fire time (us)
+    int m_iFreePlayRange = 1;    // keys struck at once per key press (1..128)
+    bool m_bSlamHeld = false;
+    bool m_bRainbow = false;     // rainbow colors per key press
+    int m_iRainbowOffset = 0;    // advances by one hue step per press
+    bool m_bMirrorKeys = false;  // duplicate each press at the opposite side of the piano
+    std::vector<int> m_vFreeSlots; // free color-slot indices for new notes
+    struct LoopEvent {
+        bool isOn;
+        unsigned char note;
+        unsigned char velocity;
+        unsigned int color;  // 0x00BBGGRR, captured when the note was recorded
+        long long time;      // usec from loop start
+    };
+    struct Loop {
+        char name[64] = {};
+        long long duration = 0;          // usec
+        std::vector<LoopEvent> events;   // sorted by time
+        bool playing = true;
+        long long playhead = 0;          // usec into the current iteration
+        long long lastTick = 0;
+        int nextEvent = 0;
+        int held[128];          // event index this loop currently holds per note, or -1
+        float velocity = 1.0f;           // playback velocity multiplier (0..2)
+        bool bColorOverride = false;      // when set, recolor the whole loop
+        unsigned int uColorOverride = 0;  // 0x00BBGGRR
+        float color[3] = { 1.0f, 1.0f, 1.0f }; // UI mirror of the override color
+    };
+    std::vector<Loop> m_vLoops;
+    bool m_bRecording = false;
+    bool m_bCountdown = false;
+    bool m_bPlayback = false; // true while loop playback drives note events (not captured)
+    bool m_bPlaybackColorPinned = false; // loop playback pins the note color instead of picker/rainbow
+    unsigned int m_uPlaybackColor = 0;   // color to use while pinned
+    long long m_llCountdownStart = 0;
+    long long m_llRecordStart = 0;
+    long long m_llRecordDuration = 4000000LL; // default 4 seconds
+    float m_fRecordSeconds = 4.0f;            // UI mirror
+    int m_iLoopCounter = 0;
+    std::vector<LoopEvent> m_vRecordingEvents;
+    void StartLoopRecording();
+    void StopLoopRecording();
+    void TickLooper();
+    void DeleteLoop(int i);
+    int m_iFreePlayNoteCount = 0;  // notes played this frame, for the NPS stat
+
+    bool m_bMouseDown = false;
+    int m_iLastClickedNote = -1;
+    long long m_llFreePlayTime = 0;
+    long long m_llFreePlayLastFrame = 0;
 };

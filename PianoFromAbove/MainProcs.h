@@ -16,23 +16,9 @@ using namespace std;
 
 // Message handlers for the main windows
 LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-HMENU GetMainMenu();
 VOID SizeWindows( int iMainWidth, int iMainHeight );
 
 LRESULT WINAPI GfxProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-VOID CopyMenuState( HMENU hMenuSrc, HMENU hMenuDest );
-
-LRESULT WINAPI BarProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-HWND CreateRebar( HWND hWndOwner );
-VOID DrawSliderChannel( LPNMCUSTOMDRAW lpnmcd, HWND hWndOwner );
-
-LRESULT WINAPI PosnProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
-VOID GetChannelRect( HWND hWnd, RECT *rcChannel );
-VOID GetThumbRect( HWND hWnd, int iPosition, const RECT *rcChannel, RECT *rcThumb );
-INT GetThumbPosition( short iXPos, RECT *rcChannel );
-VOID MoveThumbPosition( int iPositionNew, int &iPosition, HWND hWnd, RECT *rcChannel, RECT *rcThumbOld, BOOL bUpdateGame = TRUE );
-
-INT_PTR WINAPI AboutProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
 
 VOID HandOffMsg( UINT msg, WPARAM wParam, LPARAM lParam );
 VOID ShowControls( BOOL bShow );

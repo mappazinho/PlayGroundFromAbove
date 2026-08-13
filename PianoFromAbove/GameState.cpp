@@ -1,4 +1,4 @@
-/*************************************************************************************************
+﻿/*************************************************************************************************
 *
 * File: GameState.cpp
 *
@@ -12,12 +12,14 @@
 #include <tchar.h>
 #include <ppl.h>
 #include <dwmapi.h>
+#include <fstream>
 
 #include "Globals.h"
 #include "GameState.h"
 #include "Config.h"
 #include "resource.h"
 #include "ConfigProcs.h"
+#include "MIDIPreRenderPlayer.h"
 #include <d3d9types.h>
 
 const wstring GameState::Errors[] =
@@ -28,19 +30,104 @@ const wstring GameState::Errors[] =
     L"Error calling DirectX. It would be nice if you could submit feedback with a description of how this happened.",
 };
 
+
+static uint64_t CorruptSeed(MIDIChannelEvent pNote, MIDIChannelEvent pSister)
+{
+    uint64_t h = min((uint64_t)pNote, (uint64_t)pSister);
+    h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull; h ^= h >> 27; h *= 0x94d049bb133111ebull; h ^= h >> 31;
+    return h;
+}
+
+// Corrupted pitch for a note; identical for both events of a note on/off pair
+static int CorruptPitch(float fCorrupt, uint64_t h, int iNote)
+{
+    if (fCorrupt <= 0.0f)
+        return iNote;
+    float r = (float)(h & 0xFFFFF) * (1.0f / 1048576.0f);
+    iNote += (int)llroundf((r * 2.0f - 1.0f) * 60.0f * fCorrupt);
+    return min(max(iNote, 0), 127);
+}
+
+static int CorruptVelocity(float fCorrupt, uint64_t h, int iVelocity)
+{
+    if (fCorrupt <= 0.0f)
+        return iVelocity;
+    float r = (float)((h >> 20) & 0xFFFFF) * (1.0f / 1048576.0f);
+    iVelocity = (int)(iVelocity * (1.0 + (r * 2.0f - 1.0f) * 0.75 * fCorrupt) + 0.5);
+    return min(max(iVelocity, 1), 127);
+}
+
+static int CorruptValue(float fCorrupt, uint64_t h, int iValue)
+{
+    if (fCorrupt <= 0.0f)
+        return iValue;
+    float r = (float)((h >> 40) & 0xFFFFF) * (1.0f / 1048576.0f);
+    iValue += (int)llroundf((r * 2.0f - 1.0f) * 127.0f * fCorrupt);
+    return min(max(iValue, 0), 127);
+}
+
+static int CorruptPitchBend(float fCorrupt, uint64_t h, int iBend)
+{
+    if (fCorrupt <= 0.0f)
+        return iBend;
+    float r = (float)(h & 0xFFFFF) * (1.0f / 1048576.0f);
+    iBend += (int)llroundf((r * 2.0f - 1.0f) * 8192.0f * fCorrupt);
+    return min(max(iBend, 0), 16383);
+}
+
+static void CorruptNote(float fCorrupt, uint64_t h,
+    int& iNote, int& iTrack, int& iChannel,
+    long long& llNoteStart, long long& llNoteLength,
+    long long llTimeSpan, size_t iNumTracks)
+{
+    if (fCorrupt <= 0.0f)
+        return;
+
+    uint64_t h2 = h * 0x9e3779b97f4a7c15ull;
+    const float fScale = 1.0f / 1048576.0f;
+    float rTime = (float)((h >> 20) & 0xFFFFF) * fScale;
+    float rLen = (float)((h >> 40) & 0xFFFFF) * fScale;
+    float rCol = (float)(h2 & 0xFFFFF) * fScale;
+
+    iNote = CorruptPitch(fCorrupt, h, iNote);
+
+    llNoteStart += (long long)((double)(rTime * 2.0f - 1.0f) * (double)llTimeSpan * 0.10 * (double)fCorrupt);
+
+    llNoteLength = (long long)((double)llNoteLength * (1.0 + (double)(rLen * 2.0f - 1.0f) * 0.5 * (double)fCorrupt));
+// SplashScreen GameState object
+
+    if (iNumTracks > 0)
+    {
+        iTrack += (int)llroundf((rCol * 2.0f - 1.0f) * (float)iNumTracks * 0.5f * fCorrupt);
+        iTrack = min(max(iTrack, 0), (int)iNumTracks - 1);
+    }
+    iChannel += (int)llroundf((rCol * 2.0f - 1.0f) * 16.0f * fCorrupt);
+    iChannel = min(max(iChannel, 0), 15);
+}
+
+static void CustomAudioStop();
+
 GameState::GameError GameState::ChangeState( GameState *pNextState, GameState **pDestObj )
 {
-    // Null NextState is valid. Signifies no change in state.
     if ( !pNextState )
         return Success;
     if (!pDestObj )
         return BadPointer;
 
-    // Get rid of the old one. Carry over new window/renderer if needed
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        PRE_DbgLog("ChangeState: Stop prerender");
+        PRE_MIDIAudio->Stop();
+    }
+    CustomAudioStop();
+
     if ( *pDestObj )
     {
         if ( !pNextState->m_hWnd ) pNextState->m_hWnd = ( *pDestObj )->m_hWnd;
         if ( !pNextState->m_pRenderer ) pNextState->m_pRenderer = ( *pDestObj )->m_pRenderer;
+        char buf[128];
+        sprintf_s(buf, "ChangeState: %s -> %s", ( *pDestObj )->DebugName(), pNextState->DebugName());
+        HeartbeatLog(buf);
         delete *pDestObj;
     }
     *pDestObj = pNextState;
@@ -57,9 +144,6 @@ GameState::GameError GameState::ChangeState( GameState *pNextState, GameState **
     return Success;
 }
 
-//-----------------------------------------------------------------------------
-// IntroScreen GameState object
-//-----------------------------------------------------------------------------
 
 GameState::GameError IntroScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM lParam )
 {
@@ -90,7 +174,6 @@ GameState::GameError IntroScreen::Init()
 
 GameState::GameError IntroScreen::Logic()
 {
-    // Start new ImGui frame
     m_pRenderer->ImGuiStartFrame();
 
     Sleep( 10 );
@@ -101,27 +184,28 @@ GameState::GameError IntroScreen::Render()
 {
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
 
-    // Clear the backbuffer to a blue color
     m_pRenderer->ClearAndBeginScene( D3DCOLOR_XRGB( 0, 0, 0 ) );
     m_pRenderer->DrawRect( 0.0f, 0.0f, static_cast< float >( m_pRenderer->GetBufferWidth() ),
                            static_cast< float >( m_pRenderer->GetBufferHeight() ), 0x00000000 );
 
-    // Clear out the ImGui draw list
     m_pRenderer->BeginText();
     m_pRenderer->EndText();
 
-    // Present the backbuffer contents to the display
     m_pRenderer->EndScene();
     m_pRenderer->Present();
     return Success;
 }
 
-//-----------------------------------------------------------------------------
-// SplashScreen GameState object
-//-----------------------------------------------------------------------------
 
 SplashScreen::SplashScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( hWnd, pRenderer )
 {
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        PRE_DbgLog("SplashScreen ctor: Stop");
+        PRE_MIDIAudio->Stop();
+        m_bAudioStarted = false;
+    }
+
     HRSRC hResInfo = FindResource( NULL, MAKEINTRESOURCE( IDR_SPLASHMIDI ), TEXT( "MIDI" ) );
     HGLOBAL hRes = LoadResource( NULL, hResInfo );
     int iSize = SizeofResource( NULL, hResInfo );
@@ -130,9 +214,7 @@ SplashScreen::SplashScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( h
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
 
-    // Parse MIDI
     if (!viz.sSplashMIDI.empty()) {
-        // this is REALLY BAD, but i can't figure out how to make it move ownership of the memory pool vector instead of copying
         m_MIDI.~MIDI();
         new (&m_MIDI) MIDI(viz.sSplashMIDI);
         if (!m_MIDI.IsValid()) {
@@ -143,28 +225,15 @@ SplashScreen::SplashScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( h
     } else {
         m_MIDI.ParseMIDI(pData, iSize);
     }
-    vector< MIDIEvent* > vEvents;
-    vEvents.reserve( m_MIDI.GetInfo().iEventCount );
     m_MIDI.ConnectNotes(); // Order's important here
     m_MIDI.PostProcess(m_vEvents);
 
-    // Allocate
     m_vTrackSettings.resize( m_MIDI.GetInfo().iNumTracks );
     for (int i = 0; i < 128; i++)
         m_vState[i].reserve(128);
 
-    // Initialize
     //InitNotes( vEvents );
     InitState();
-}
-
-void SplashScreen::InitNotes( const vector< MIDIEvent* > &vEvents )
-{
-    //Get only the channel events
-    m_vEvents.reserve( vEvents.size() );
-    for ( vector< MIDIEvent* >::const_iterator it = vEvents.begin(); it != vEvents.end(); ++it )
-        if ( (*it)->GetEventType() == MIDIEvent::ChannelEvent )
-            m_vEvents.push_back( reinterpret_cast< MIDIChannelEvent* >( *it ) );
 }
 
 void SplashScreen::InitState()
@@ -197,6 +266,15 @@ void SplashScreen::InitState()
 
 GameState::GameError SplashScreen::Init()
 {
+    const size_t nTracks = min(m_vTrackSettings.size(), MaxTrackColors);
+    auto* track_colors = m_pRenderer->GetTrackColors();
+    for (size_t i = 0; i < nTracks; i++) {
+        for (size_t j = 0; j < 16; j++) {
+            auto& src = m_vTrackSettings[i].aChannels[j];
+            track_colors[i * 16 + j] = TrackColor{ src.iPrimaryRGB, src.iDarkRGB, src.iVeryDarkRGB };
+        }
+        m_pRenderer->MarkTrackColorsDirty(i);
+    }
     return Success;
 }
 
@@ -251,6 +329,7 @@ GameState::GameError SplashScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARA
             switch( iId )
             {
                 case ID_CHANGESTATE:
+                    HeartbeatLog("SplashScreen: ID_CHANGESTATE received");
                     m_pNextState = reinterpret_cast< GameState* >( lParam );
                     return Success;
                 case ID_VIEW_RESETDEVICE:
@@ -278,22 +357,295 @@ GameState::GameError SplashScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARA
     return Success;
 }
 
+// from the song clock every frame; the classic MIDI-device path is bypassed.
+// BASS is used purely as a decoder (BASS_STREAM_DECODE, no output device - on this
+// machine BASS's device resolution ends up on the silent "No sound" device). The
+// decoded samples are fed to a dedicated SDL queue-mode output device instead, the
+// same engine that already produces sound for the prerender.
+static HSTREAM s_hCustomAudio = 0;      // decode-only stream
+static SDL_AudioDeviceID s_hCustomSdl = 0;
+static float s_fCustomAudioVol = -1.0f;
+static double s_dFileRate = 0.0;        // frames/sec of the file
+static unsigned s_dFileChans = 0;
+static long long s_llFedUs = 0;         // total time fed into the SDL queue
+static double s_dFeedFrac = 0.0;        // fractional frame remainder between feeds
+
+static void CustomAudioStop()
+{
+    if (s_hCustomSdl)
+    {
+        SDL_CloseAudioDevice(s_hCustomSdl);
+        s_hCustomSdl = 0;
+    }
+    if (s_hCustomAudio)
+    {
+        BASS_StreamFree(s_hCustomAudio);
+        s_hCustomAudio = 0;
+    }
+    s_fCustomAudioVol = -1.0f;
+    s_dFileRate = 0.0;
+    s_dFileChans = 0;
+    s_llFedUs = 0;
+    s_dFeedFrac = 0.0;
+}
+
+// Opens a decode-only BASS stream plus a dedicated SDL queue-mode output device.
+// Returns 0 on failure.
+static HSTREAM CustomAudioOpen(const wstring &sFile)
+{
+    HSTREAM h = BASS_StreamCreateFile(FALSE, sFile.c_str(), 0, 0, BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
+    if (h == 0)
+    {
+        PRE_DbgLog("CustomAudio: failed to open %ls (err %d)", sFile.c_str(), BASS_ErrorGetCode());
+        return 0;
+    }
+
+    BASS_CHANNELINFO ci = {};
+    BASS_ChannelGetInfo(h, &ci);
+    s_dFileRate = ci.freq ? (double)ci.freq : 48000.0;
+    s_dFileChans = ci.chans ? ci.chans : 2;
+    PRE_DbgLog("CustomAudio: opened %ls rate=%.0f chans=%u len=%.2fs -> 0x%I64X err=%d", sFile.c_str(), s_dFileRate, (unsigned)ci.chans, (double)BASS_ChannelBytes2Seconds(h, BASS_ChannelGetLength(h, BASS_POS_BYTE)), (unsigned long long)h, (int)BASS_ErrorGetCode());
+
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
+    {
+        PRE_DbgLog("CustomAudio: SDL_InitSubSystem failed");
+        BASS_StreamFree(h);
+        return 0;
+    }
+
+    SDL_AudioSpec wanted = {};
+    wanted.freq = (int)s_dFileRate;
+    wanted.format = AUDIO_F32;
+    wanted.channels = 2;
+    wanted.samples = 2048;
+    wanted.callback = NULL; // queue mode
+    SDL_AudioSpec obtained = {};
+    int nDevs = SDL_GetNumAudioDevices(0);
+    for (int i = 0; i < nDevs; i++)
+        PRE_DbgLog("CustomAudio: SDL output dev[%d] = '%s'", i, SDL_GetAudioDeviceName(i, 0));
+    s_hCustomSdl = SDL_OpenAudioDevice(NULL, 0, &wanted, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+    if (s_hCustomSdl == 0)
+    {
+        PRE_DbgLog("CustomAudio: SDL_OpenAudioDevice failed: %s", SDL_GetError());
+        BASS_StreamFree(h);
+        return 0;
+    }
+    PRE_DbgLog("CustomAudio: SDL device opened id=%u freq=%d fmt=0x%X ch=%u", (unsigned)s_hCustomSdl, obtained.freq, (unsigned)obtained.format, (unsigned)obtained.channels);
+    SDL_PauseAudioDevice(s_hCustomSdl, 1);
+    s_llFedUs = 0;
+    return h;
+}
+
+// Plays the user-provided audio file (wav/mp3/ogg) in place of the prerender. The file's
+// t=0 maps to the first note of the song, i.e. the audio begins right after the 3-second
+// lead-in stall. The song clock (visuals) is the master; the SDL queue is drained by the
+// hardware, and we only re-seek (clear queue + rewind) when drift exceeds a small dead
+// zone, so pause/seek/speed all just work.
+static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long long llFirstNoteUs,
+                              bool bPaused, bool bMute, double dVolume)
+{
+    static auto s_tLog = std::chrono::steady_clock::now();
+    auto tNow = std::chrono::steady_clock::now();
+    bool bLog = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - s_tLog).count() >= 1000;
+    if (bLog) s_tLog = tNow;
+
+    long long llAudioUs = llSongUs - llFirstNoteUs;
+    if (s_hCustomAudio == 0)
+    {
+        if (llAudioUs < 0 || sFile.empty())
+        {
+            if (bLog) PRE_DbgLog("CUSTOM waiting audioUs=%.2f empty=%d", (double)llAudioUs / 1e6, (int)sFile.empty());
+            return;
+        }
+        s_hCustomAudio = CustomAudioOpen(sFile);
+        if (s_hCustomAudio == 0)
+            return;
+        s_fCustomAudioVol = -1.0f;
+    }
+
+    QWORD qLength = BASS_ChannelGetLength(s_hCustomAudio, BASS_POS_BYTE);
+    double dFileEndUs = qLength ? BASS_ChannelBytes2Seconds(s_hCustomAudio, qLength) * 1e6 : 0.0;
+
+    // Still inside the lead-in stall: keep the output device silent
+    if (llAudioUs < 0)
+    {
+        if (s_hCustomSdl) SDL_PauseAudioDevice(s_hCustomSdl, 1);
+        if (bLog) PRE_DbgLog("CUSTOM stall hold audioUs=%.2f", (double)llAudioUs / 1e6);
+        return;
+    }
+
+    long long llTargetUs = min(llAudioUs, (long long)dFileEndUs);
+    if (llTargetUs >= (long long)dFileEndUs || bPaused)
+    {
+        if (s_hCustomSdl) SDL_PauseAudioDevice(s_hCustomSdl, 1);
+        if (bLog) PRE_DbgLog("CUSTOM hold paused=%d target=%.2f end=%.2f", (int)bPaused, (double)llTargetUs / 1e6, dFileEndUs / 1e6);
+        return;
+    }
+
+    float fVol = (float)(bMute ? 0.0 : dVolume);
+    if (fVol != s_fCustomAudioVol)
+    {
+        s_fCustomAudioVol = fVol;
+        if (bLog) PRE_DbgLog("CUSTOM vol=%.2f", fVol);
+    }
+
+    // Queued playhead = what we fed minus what the device has consumed (device-format bytes)
+    SDL_AudioSpec obtained = {};
+    SDL_GetAudioDeviceSpec(s_hCustomSdl, 0, &obtained);
+    double dBpf = (double)(SDL_AUDIO_BITSIZE(obtained.format) / 8) * obtained.channels;
+    double dQueuedUs = dBpf > 0 ? (double)SDL_GetQueuedAudioSize(s_hCustomSdl) / dBpf / obtained.freq * 1e6 : 0.0;
+    double dPlayedUs = (double)s_llFedUs - dQueuedUs;
+
+    // Hard resync when the queued output has drifted from the song clock. The dead
+    // zone MUST stay well above the keep-ahead below (80ms): in steady state the
+    // queued playhead legitimately sits up to keep-ahead ahead of the target, so a
+    // tight threshold turns every refill cycle into a clear+seek -> clicks.
+    if (fabs(dPlayedUs - llTargetUs) > 250000.0)
+    {
+        SDL_ClearQueuedAudio(s_hCustomSdl);
+        BASS_ChannelSetPosition(s_hCustomAudio, BASS_ChannelSeconds2Bytes(s_hCustomAudio, llTargetUs / 1e6), BASS_POS_BYTE);
+        s_llFedUs = llTargetUs;
+        s_dFeedFrac = 0.0;
+        if (bLog) PRE_DbgLog("CUSTOM resync target=%.2f played=%.2f", (double)llTargetUs / 1e6, dPlayedUs / 1e6);
+    }
+
+    // Keep the device fed ~80ms ahead of the target so it never starves; the queue is
+    // drained by the hardware in real time and the song clock stays the master. Refill
+    // only when the queue drops below ~40ms, and then in one large chunk: micro-feeding
+    // every frame (the game loop runs far faster than the device pull period) makes the
+    // WASAPI device see shortfalls at every pull boundary and click on each one.
+    const long long kKeepAheadUs = 80000;
+    const double kRefillBelowUs = 40000.0;
+    if (dQueuedUs < kRefillBelowUs)
+    {
+        long long llWantUs = llTargetUs + kKeepAheadUs - s_llFedUs;
+        if (llWantUs > 0)
+        {
+            double dFrames = min((double)llWantUs / 1e6 * s_dFileRate, 0.25 * s_dFileRate) + s_dFeedFrac;
+            int nFrames = (int)dFrames;
+            s_dFeedFrac = dFrames - nFrames;
+            if (nFrames > 0)
+            {
+                static std::vector<float> s_pBuf;
+                s_pBuf.resize((size_t)nFrames * s_dFileChans);
+                DWORD dwGot = BASS_ChannelGetData(s_hCustomAudio, s_pBuf.data(), (DWORD)(s_pBuf.size() * sizeof(float)));
+                size_t nGotFrames = (size_t)(dwGot / sizeof(float) / s_dFileChans);
+                if (nGotFrames > 0)
+                {
+                    if (fVol != 1.0f)
+                        for (size_t i = 0; i < nGotFrames * s_dFileChans; i++)
+                            s_pBuf[i] *= fVol;
+                    SDL_QueueAudio(s_hCustomSdl, s_pBuf.data(), (Uint32)(nGotFrames * s_dFileChans * sizeof(float)));
+                }
+                s_llFedUs += (long long)((double)nGotFrames / s_dFileRate * 1e6);
+                if (bLog) PRE_DbgLog("CUSTOM run song=%.2f target=%.2f fed=%.2f queued=%.2f nGotF=%zu err=%d", (double)llSongUs / 1e6, (double)llTargetUs / 1e6, (double)s_llFedUs / 1e6, dQueuedUs / 1e6, nGotFrames, (int)BASS_ErrorGetCode());
+            }
+        }
+    }
+
+    // Never let the device idle silently mid-song: keep it running; the queue is
+    // always refilled on the next frame. Pausing happens only in the states above.
+    SDL_PauseAudioDevice(s_hCustomSdl, 0);
+}
+
+// from the song clock every frame; the classic MIDI-device path is bypassed.
+static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, const MIDI& midi, long long llStartTime, int iStartPos, bool& bAudioStarted)
+{
+    static Config &config = Config::GetConfig();
+    static AudioSettings &cAudio = config.GetAudioSettings();
+    static PlaybackSettings &cPlayback = config.GetPlaybackSettings();
+
+    if (!cAudio.bPreRenderAudio)
+    {
+        if (PRE_MIDIAudio)
+            SDL_PauseAudio(1);
+        return;
+    }
+
+    if (!PRE_MIDIAudio)
+    {
+        PRE_DbgLog("UPA: init (create MIDIAudio/BASS/SDL)");
+        WAVEFORMATEX wfFormat;
+        memset(&wfFormat, 0, sizeof(wfFormat));
+        wfFormat.nSamplesPerSec = 48000;
+        wfFormat.nChannels = 2;
+        wfFormat.nBlockAlign = (32 * 2) / 8;
+        wfFormat.wBitsPerSample = 32;
+        wfFormat.nAvgBytesPerSec = wfFormat.nSamplesPerSec * (32 * 2) / 8;
+        wfFormat.wFormatTag = WAVE_FORMAT_PCM;
+        BASSMIDI::InitBASS(wfFormat);
+
+        BASSMIDI::LoadSoundfont(cAudio.sPreSoundfontPath.c_str());
+
+        int initSecs = max(120, (cAudio.iPreBufferMs * 2 + 999) / 1000);
+        PRE_MIDIAudio = new MIDIAudio(48000 * initSecs);
+        PRE_MIDIAudio->m_bPaused = true;
+        PRE_InitAudio();
+    }
+
+    bool bPaused = cPlayback.GetPaused();
+    PRE_MIDIAudio->m_bPaused = bPaused;
+    g_preVolume = cPlayback.GetMute() ? 0.0 : cPlayback.GetVolume();
+
+    bool bRestart = false;
+    if (PRE_MIDIAudio->m_iDefaultVoices != cAudio.iPreVoices)
+    {
+        PRE_MIDIAudio->m_iDefaultVoices = cAudio.iPreVoices;
+        bRestart = true;
+    }
+    PRE_MIDIAudio->SetMaxAheadMs(cAudio.iPreBufferMs);
+    PRE_MIDIAudio->m_dFPS = cAudio.dPreFPS;
+    PRE_MIDIAudio->m_dAttack = (double)cAudio.iPreLMAttack / 1000.0;
+    PRE_MIDIAudio->m_dRelease = (double)cAudio.iPreLMRelease / 1000.0;
+    PRE_MIDIAudio->m_iVelThreshLow = cAudio.iPreVelThreshLow;
+    PRE_MIDIAudio->m_iVelThreshUpp = cAudio.iPreVelThreshUpp;
+    PRE_MIDIAudio->m_bDefaultNoFx = cAudio.bNoFX;
+    PRE_MIDIAudio->m_bUnderrunRepeat = cAudio.bPreUnderrunRepeat;
+    PRE_MIDIAudio->m_iRepeatFrames = cAudio.bPreRepeatCustom ? cAudio.iPreRepeatMs * 48 : 12000;
+    PRE_MIDIAudio->m_bExtendVisualsOnSkip = cAudio.bPreStutterOnLag;
+    PRE_MIDIAudio->SetReadSpeed(cPlayback.GetSpeed());
+
+    if (!bPaused)
+    {
+        SDL_PauseAudio(0);
+
+        if (bRestart)
+        {
+            PRE_DbgLog("UPA: generator restart");
+            PRE_MIDIAudio->Stop();
+            bAudioStarted = false;
+        }
+        if (!bAudioStarted)
+        {
+            PRE_DbgLog("UPA: StartRender t=%.2f", (double)llStartTime / 1e6);
+            PRE_MIDIAudio->m_pMIDI = &midi;
+            PRE_MIDIAudio->StartRender(llStartTime, true, const_cast<std::vector<MIDIChannelEvent>*>(&vEvents), cPlayback.GetSpeed(), iStartPos);
+            bAudioStarted = true;
+        }
+        else
+        {
+            PRE_MIDIAudio->SyncPlayer((double)llStartTime / 1e6, cPlayback.GetSpeed());
+        }
+    }
+    else
+    {
+        SDL_PauseAudio(1);
+    }
+}
+
 GameState::GameError SplashScreen::Logic()
 {
-    // Start new ImGui frame
     m_pRenderer->ImGuiStartFrame();
 
     static Config &config = Config::GetConfig();
     static PlaybackSettings &cPlayback = config.GetPlaybackSettings();
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
 
-    // Detect changes in state
     bool bPaused = cPlayback.GetPaused();
     bool bMute = cPlayback.GetMute();
     bool bMuteChanged = ( bMute != m_bMute );
     bool bPausedChanged = ( bPaused != m_bPaused );
     
-    // Set the state
     m_bMute = bMute;
     m_bPaused = bPaused;
     m_dVolume = cPlayback.GetVolume();
@@ -302,44 +654,107 @@ GameState::GameError SplashScreen::Logic()
     double dVolumeCorrect = ( mInfo.iVolumeSum > 0 ? ( m_dVolume * 127.0 * mInfo.iNoteCount ) / mInfo.iVolumeSum : 1.0 );
     dVolumeCorrect = min( dVolumeCorrect, dMaxCorrect );
 
-    // Time stuff
     long long llMaxTime = m_MIDI.GetInfo().llTotalMicroSecs + 500000;
     long long llElapsed = m_Timer.GetMicroSecs();
     m_Timer.Start();
 
-    // If we just paused, kill the music. SetVolume is better than AllNotesOff
     if ( ( bPausedChanged || bMuteChanged ) && ( m_bPaused || m_bMute ) )
         m_OutDevice.AllNotesOff();
 
-    // Figure out start and end times for display
-    long long llNextStartTime = m_llStartTime + llElapsed;
+    double dSpeed = cPlayback.GetSpeed();
+    long long llElapsedStep = 0;
+    if ( config.GetAudioSettings().bPreRenderAudio )
+        llElapsedStep = static_cast< long long >( (double)llElapsed * dSpeed + 0.5 );
+    else
+        llElapsedStep = static_cast< long long >( min( (double)llElapsed * dSpeed, 100000.0 ) + 0.5 );
+    long long llNextStartTime = m_llStartTime + llElapsedStep;
+    // fixed slew would break speed changes; instead cap the catch-up on top of
+    const long long kDeadZone = 20000;   // ignore drift smaller than 20ms
+    const long long kMaxCatchUp = 10000; // extra catch-up at most 10ms per frame
     if ( !bPaused && m_llStartTime < llMaxTime )
-        m_llStartTime = llNextStartTime;
+    {
+        if ( config.GetAudioSettings().bPreRenderAudio && config.GetAudioSettings().bPreStutterOnLag
+             && m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->IsAudioStarted() )
+        {
+            long long llAudioTime = (long long)( PRE_MIDIAudio->GetPlayerTime() * 1000000.0 );
+            if ( llAudioTime >= 0 && llAudioTime <= llMaxTime )
+            {
+                long long llAhead = llAudioTime - llNextStartTime;
+                if ( llAhead > kDeadZone )
+                {
+                    llNextStartTime += min( llAhead - kDeadZone, kMaxCatchUp );
+                }
+                else if ( llAhead < -kDeadZone )
+                {
+                    llNextStartTime = min( llNextStartTime, llAudioTime + kDeadZone );
+                    static auto s_tHoldLog = std::chrono::steady_clock::now();
+                    auto tNowHold = std::chrono::steady_clock::now();
+                    if ( std::chrono::duration_cast<std::chrono::milliseconds>(tNowHold - s_tHoldLog).count() >= 500 )
+                    {
+                        s_tHoldLog = tNowHold;
+                        PRE_DbgLog("CLK hold audio=%.3f vis=%.3f ahead=%.3f", (double)llAudioTime/1e6, (double)llNextStartTime/1e6, (double)llAhead/1e6);
+                    }
+                }
+                m_llStartTime = llNextStartTime;
+            }
+            else
+            {
+                m_llStartTime = llNextStartTime;
+            }
+        }
+        else
+        {
+            m_llStartTime = llNextStartTime;
+        }
+    }
     long long llEndTime = m_llStartTime + TimeSpan;
 
-    // Needs start time to be set. For creating textparticles.
     RenderGlobals();
 
-    // Advance end position
     int iEventCount = (int)m_vEvents.size();
-    while ( m_iEndPos + 1 < iEventCount && m_vEvents[m_iEndPos + 1]->GetAbsMicroSec() < llEndTime )
+    while ( m_iEndPos + 1 < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iEndPos + 1]) < llEndTime )
         m_iEndPos++;
+
+    // Pre-rendered audio mode drives the playback clock; skip the MIDI device
+    UpdatePreRenderAudio(m_vEvents, m_MIDI, m_llStartTime, m_iStartPos, m_bAudioStarted);
         
-    // Advance start position updating initial state as we pass stale events
-    // Also PLAYS THE MUSIC
-    while ( m_iStartPos < iEventCount && m_vEvents[m_iStartPos]->GetAbsMicroSec() <= m_llStartTime )
     {
-        MIDIChannelEvent *pEvent = m_vEvents[m_iStartPos];
-        if ( pEvent->GetChannelEventType() != MIDIChannelEvent::NoteOn )
-            m_OutDevice.PlayEvent( pEvent->GetEventCode(), pEvent->GetParam1(), pEvent->GetParam2() );
-        else if ( !m_bMute && !m_vTrackSettings[pEvent->GetTrack()].aChannels[pEvent->GetChannel()].bMuted )
-            m_OutDevice.PlayEvent( pEvent->GetEventCode(), pEvent->GetParam1(),
-                                    static_cast< int >( pEvent->GetParam2() * dVolumeCorrect + 0.5 ) );
-        UpdateState( m_iStartPos );
-        m_iStartPos++;
+        using clock_t = std::chrono::steady_clock;
+        static auto s_tPushLog = clock_t::now();
+        static long long s_iPushed = 0;
+        static double s_dMaxFrameUs = 0;
+        auto tPushStart = clock_t::now();
+        size_t iPushed = 0;
+        while ( m_iStartPos < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iStartPos]) <= m_llStartTime )
+        {
+            MIDIChannelEvent pEvent = m_vEvents[m_iStartPos];
+            if ( !Config::GetConfig().GetAudioSettings().bPreRenderAudio )
+            {
+                if ( m_MIDI.GetEventChannelEventType(pEvent) != MIDI::NoteOn )
+                    m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent), m_MIDI.GetEventParam2(pEvent) );
+                else if ( !m_bMute && !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted )
+                    m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent),
+                                            static_cast< int >( m_MIDI.GetEventParam2(pEvent) * dVolumeCorrect + 0.5 ) );
+            }
+            UpdateState( m_iStartPos );
+            m_iStartPos++;
+            iPushed++;
+        }
+        auto tPushEnd = clock_t::now();
+        double dFrameUs = std::chrono::duration<double, std::micro>(tPushEnd - tPushStart).count();
+        s_iPushed += (long long)iPushed;
+        if ( dFrameUs > s_dMaxFrameUs ) s_dMaxFrameUs = dFrameUs;
+        if ( std::chrono::duration_cast<std::chrono::milliseconds>(tPushEnd - s_tPushLog).count() >= 1000 )
+        {
+            PRE_DbgLog("LIVEPUSH %s ev/s=%lld maxFrameMs=%.1f",
+                Config::GetConfig().GetAudioSettings().bPreRenderAudio ? "pre" : "live",
+                s_iPushed, s_dMaxFrameUs / 1000.0);
+            s_iPushed = 0;
+            s_dMaxFrameUs = 0;
+            s_tPushLog = tPushEnd;
+        }
     }
 
-    // Update root constants
     auto& root_consts = m_pRenderer->GetRootConstants();
     root_consts.deflate = clamp(round(m_fWhiteCX * 0.15f / 2.0f), 1.0f, 3.0f);
     root_consts.notes_y = m_fNotesY;
@@ -347,101 +762,60 @@ GameState::GameError SplashScreen::Logic()
     root_consts.white_cx = m_fWhiteCX;
     root_consts.timespan = TimeSpan;
 
-    // Update fixed size constants
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
     memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
-    // Update track colors
-    // TODO: Only update track colors lazily
     auto* track_colors = m_pRenderer->GetTrackColors();
     for (size_t i = 0; i < min(m_vTrackSettings.size(), MaxTrackColors); i++) {
+        bool bChanged = false;
         for (size_t j = 0; j < 16; j++) {
             auto& src = m_vTrackSettings[i].aChannels[j];
             auto& dst = track_colors[i * 16 + j];
-            dst.primary = src.iPrimaryRGB;
-            dst.dark = src.iDarkRGB;
-            dst.darker = src.iVeryDarkRGB;
+            TrackColor c = { src.iPrimaryRGB, src.iDarkRGB, src.iVeryDarkRGB };
+            if (dst.primary != c.primary || dst.dark != c.dark || dst.darker != c.darker) {
+                dst = c;
+                bChanged = true;
+            }
         }
+        if (bChanged)
+            m_pRenderer->MarkTrackColorsDirty(i);
     }
 
     return Success;
 }
 
-// https://github.com/WojciechMula/simd-search/blob/master/sse-binsearch-block.cpp
 int sse_bin_search(const std::vector<int>& data, int key) {
-
-    const __m128i keys = _mm_set1_epi32(key);
-    __m128i v;
-
-    int limit = data.size() - 1;
-    int a = 0;
-    int b = limit;
-
-    while (a <= b) {
-        const int c = (a + b) / 2;
-
-        if (data[c] == key) {
-            return c;
-        }
-
-        if (key < data[c]) {
-            b = c - 1;
-
-            if (b >= 4) {
-                v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&data[b - 4]));
-                v = _mm_cmpeq_epi32(v, keys);
-                const uint16_t mask = _mm_movemask_epi8(v);
-                if (mask) {
-                    return b - 4 + __builtin_ctz(mask) / 4;
-                }
-            }
-        }
-        else {
-            a = c + 1;
-
-            if (a + 4 < limit) {
-                v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&data[a]));
-                v = _mm_cmpeq_epi32(v, keys);
-                const uint16_t mask = _mm_movemask_epi8(v);
-                if (mask) {
-                    return a + __builtin_ctz(mask) / 4;
-                }
-            }
-        }
-    }
-
+    auto it = std::lower_bound(data.begin(), data.end(), key);
+    if (it != data.end() && *it == key)
+        return static_cast<int>(it - data.begin());
     return -1;
 }
 
 void SplashScreen::UpdateState(int iPos)
 {
-    // Event data
-    MIDIChannelEvent* pEvent = m_vEvents[iPos];
-    if (!pEvent->HasSister()) return;
+    MIDIChannelEvent pEvent = m_vEvents[iPos];
+    if (!m_MIDI.EventHasSister(pEvent)) return;
 
-    MIDIChannelEvent::ChannelEventType eEventType = pEvent->GetChannelEventType();
-    int iNote = pEvent->GetParam1();
-    int iVelocity = pEvent->GetParam2();
+    MIDI::ChannelEventType eEventType = m_MIDI.GetEventChannelEventType(pEvent);
+    int iNote = m_MIDI.GetEventParam1(pEvent);
+    int iVelocity = m_MIDI.GetEventParam2(pEvent);
 
-    int iSisterIdx = pEvent->GetSisterIdx();
+    unsigned iSisterIdx = m_MIDI.GetEventSisterIdx(pEvent);
     auto& note_state = m_vState[iNote];
 
-    // Turn note on
-    if (eEventType == MIDIChannelEvent::NoteOn && iVelocity > 0)
+    if (eEventType == MIDI::NoteOn && iVelocity > 0)
         note_state.push_back(iPos);
     else
     {
-        if (iSisterIdx != -1) {
-            // binary search
-            auto pos = sse_bin_search(note_state, iSisterIdx);
+        if (iSisterIdx != UINT32_MAX) {
+            auto pos = sse_bin_search(note_state, (int)iSisterIdx);
             if (pos != -1)
                 note_state.erase(note_state.begin() + pos);
         }
         else {
-            // slow path, should rarely happen
             vector< int >::iterator it = note_state.begin();
-            MIDIChannelEvent* pSearch = pEvent->GetSister(m_vEvents);
+            MIDIChannelEvent pSearch = m_vEvents[m_MIDI.GetEventSisterIdx(pEvent)];
             while (it != note_state.end())
             {
                 if (m_vEvents[*it] == pSearch) {
@@ -462,13 +836,11 @@ GameState::GameError SplashScreen::Render()
 {
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
 
-    // Clear the backbuffer to a blue color
     m_pRenderer->ClearAndBeginScene( D3DCOLOR_XRGB( 0, 0, 0 ) );
     m_pRenderer->DrawRect( 0.0f, 0.0f, static_cast< float >( m_pRenderer->GetBufferWidth() ),
                            static_cast< float >( m_pRenderer->GetBufferHeight() ), 0x00000000 );
     RenderNotes();
 
-    // Present the backbuffer contents to the display
     m_pRenderer->EndScene();
     m_pRenderer->Present();
     return Success;
@@ -476,24 +848,20 @@ GameState::GameError SplashScreen::Render()
 
 void SplashScreen::RenderGlobals()
 {
-    // Midi info
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
     m_iStartNote = mInfo.iMinNote;
     m_iEndNote = mInfo.iMaxNote;
 
-    // Screen info
     m_fNotesX = 0.0f;
     m_fNotesCX = static_cast< float >( m_pRenderer->GetBufferWidth() );
     m_fNotesY = 0.0f;
     m_fNotesCY = static_cast< float >( m_pRenderer->GetBufferHeight() );
 
-    // Keys info
     m_iAllWhiteKeys = MIDI::WhiteCount( m_iStartNote, m_iEndNote + 1 );
     float fBuffer = ( MIDI::IsSharp( m_iStartNote ) ? SharpRatio / 2.0f : 0.0f ) +
                     ( MIDI::IsSharp( m_iEndNote ) ? SharpRatio / 2.0f : 0.0f );
     m_fWhiteCX = m_fNotesCX / ( m_iAllWhiteKeys + fBuffer );
 
-    // Round down start time. This is only used for rendering purposes
     long long llMicroSecsPP = static_cast< long long >( TimeSpan / m_fNotesCY + 0.5f );
     m_llRndStartTime = m_llStartTime - ( m_llStartTime < 0 ? llMicroSecsPP : 0 );
     m_llRndStartTime = ( m_llRndStartTime / llMicroSecsPP ) * llMicroSecsPP;
@@ -503,15 +871,14 @@ void SplashScreen::RenderGlobals()
 
 void SplashScreen::RenderNotes()
 {
-    // Do we have any notes to render?
     if ( m_iEndPos < 0 || m_iStartPos >= static_cast< int >( m_vEvents.size() ) )
         return;
 
     for (int i = m_iEndPos; i >= m_iStartPos; i--) {
-        MIDIChannelEvent* pEvent = m_vEvents[i];
-        if (pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn &&
-            pEvent->GetParam2() > 0 && pEvent->HasSister() &&
-            MIDI::IsSharp(pEvent->GetParam1())) {
+        MIDIChannelEvent pEvent = m_vEvents[i];
+        if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+            m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent) &&
+            MIDI::IsSharp(m_MIDI.GetEventParam1(pEvent))) {
             RenderNote(pEvent);
         }
     }
@@ -524,11 +891,11 @@ void SplashScreen::RenderNotes()
     }
 
     for (int i = m_iEndPos; i >= m_iStartPos; i--) {
-        MIDIChannelEvent* pEvent = m_vEvents[i];
-        if (pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn &&
-            pEvent->GetParam2() > 0 && pEvent->HasSister())
+        MIDIChannelEvent pEvent = m_vEvents[i];
+        if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+            m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
         {
-            if (!MIDI::IsSharp(pEvent->GetParam1())) {
+            if (!MIDI::IsSharp(m_MIDI.GetEventParam1(pEvent))) {
                 RenderNote(pEvent);
             }
         }
@@ -544,13 +911,13 @@ void SplashScreen::RenderNotes()
     m_pRenderer->RenderBatch();
 }
 
-void SplashScreen::RenderNote(MIDIChannelEvent* pNote)
+void SplashScreen::RenderNote(MIDIChannelEvent pNote)
 {
-    int iNote = pNote->GetParam1();
-    int iTrack = pNote->GetTrack();
-    int iChannel = pNote->GetChannel();
-    long long llNoteStart = pNote->GetAbsMicroSec();
-    long long llNoteEnd = llNoteStart + pNote->GetLength();
+    int iNote = m_MIDI.GetEventParam1(pNote);
+    int iTrack = m_MIDI.GetEventTrack(pNote);
+    int iChannel = m_MIDI.GetEventChannel(pNote);
+    long long llNoteStart = m_MIDI.GetEventTime(pNote);
+    long long llNoteEnd = llNoteStart + m_MIDI.GetEventLength(pNote);
     m_pRenderer->PushNoteData(
         NoteData {
             .key = (uint8_t)iNote,
@@ -582,32 +949,109 @@ float SplashScreen::GetNoteX(int iNote) {
     return notex_table[iNote];
 }
 
-//-----------------------------------------------------------------------------
-// MainScreen GameState object
-//-----------------------------------------------------------------------------
 
 MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, D3D12Renderer *pRenderer ) :
     GameState( hWnd, pRenderer ), m_MIDI( sMIDIFile ), m_eGameMode( eGameMode )
 {
-    // Finish off midi processing
-    if ( !m_MIDI.IsValid() ) return;
-    m_MIDI.ConnectNotes(); // Order's important here
-    m_vEvents.reserve(m_MIDI.GetInfo().iEventCount);
-    m_MIDI.PostProcess(m_vEvents, &m_vProgramChange, &m_vMetaEvents, &m_vTempo, &m_vSignature, &m_vMarkers);
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        PRE_DbgLog("MainScreen ctor: Stop");
+        PRE_MIDIAudio->Stop();
+        m_bAudioStarted = false;
+    }
 
-    // Allocate
+    if ( !m_MIDI.IsValid() ) return;
+    try
+    {
+        m_MIDI.ConnectNotes(); // Order's important here
+        // the memory peak and throws bad_alloc; PostProcess's push_back doubling
+        m_MIDI.PostProcess(m_vEvents, &m_vProgramChange, &m_vMetaEvents, &m_vTempo, &m_vSignature, &m_vMarkers);
+        if (!m_vEvents.empty())
+        {
+            size_t aProbe[] = { 0, 1, 10, 100, 1000, 10000, 100000, 1000000, (size_t)m_vEvents.size() / 16,
+                                (size_t)m_vEvents.size() / 8, (size_t)m_vEvents.size() / 4,
+                                (size_t)m_vEvents.size() / 2, (size_t)(m_vEvents.size() * 3 / 4),
+                                m_vEvents.size() - 1000000, m_vEvents.size() - 1000, m_vEvents.size() - 1 };
+            char buf[512] = {};
+            size_t iLen = 0;
+            for (size_t p : aProbe)
+            {
+                if (p >= m_vEvents.size()) continue;
+                iLen += (size_t)sprintf_s(buf + iLen, sizeof(buf) - iLen, "%zu:%.1fs ", p,
+                    (double)m_MIDI.GetEventTime(m_vEvents[p]) / 1e6);
+            }
+            PRE_DbgLog("EVENTMAP %s", buf);
+            size_t aTypes[8] = {}; // NoteOn, NoteOff, Controller, ProgramChange, PitchBend, NoteAftertouch, ChannelAftertouch, other
+            for (size_t s = 0; s < 200000; s++)
+            {
+                size_t p = (size_t)((unsigned long long)s * m_vEvents.size() / 200000 + 7) % m_vEvents.size();
+                switch (m_MIDI.GetEventChannelEventType(m_vEvents[p]))
+                {
+                case MIDI::NoteOn: aTypes[0]++; break;
+                case MIDI::NoteOff: aTypes[1]++; break;
+                case MIDI::Controller: aTypes[2]++; break;
+                case MIDI::ProgramChange: aTypes[3]++; break;
+                case MIDI::PitchBend: aTypes[4]++; break;
+                case MIDI::NoteAftertouch: aTypes[5]++; break;
+                case MIDI::ChannelAftertouch: aTypes[6]++; break;
+                default: aTypes[7]++; break;
+                }
+            }
+            PRE_DbgLog("EVENTTYPES on=%zu off=%zu cc=%zu prog=%zu bend=%zu atouch=%zu catouch=%zu other=%zu",
+                aTypes[0], aTypes[1], aTypes[2], aTypes[3], aTypes[4], aTypes[5], aTypes[6], aTypes[7]);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        PRE_DbgLog("MainScreen load failed: %s", e.what());
+        return;
+    }
+
     m_vTrackSettings.resize( m_MIDI.GetInfo().iNumTracks );
     for (auto note_state : m_vState)
         note_state.reserve(m_MIDI.GetInfo().iNumTracks * 16);
 
-    // Initialize
     InitColors();
     InitState();
 
     g_LoadingProgress.stage = MIDILoadingProgress::Stage::Done;
 }
 
-// Display colors
+void MainScreen::Discard()
+{
+    m_bDiscarded = true;
+
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        PRE_DbgLog("Discard: Stop prerender");
+        PRE_MIDIAudio->Stop();
+    }
+    CustomAudioStop();
+
+    PRE_DbgLog("Discard: freeing song data (events=%zu)", m_vEvents.size());
+    m_MIDI.clear();
+    m_MIDI.ReleaseOwnedData();
+    vector<MIDIChannelEvent>().swap(m_vEvents);
+    vector<MIDIMetaEvent*>().swap(m_vMetaEvents);
+    eventvec_t().swap(m_vNoteOns);
+    eventvec_t().swap(m_vNonNotes);
+    eventvec_t().swap(m_vProgramChange);
+    eventvec_t().swap(m_vTempo);
+    eventvec_t().swap(m_vSignature);
+    eventvec_t().swap(m_vMarkers);
+    for (int i = 0; i < 128; i++)
+    {
+        vector<int>().swap(m_vState[i]);
+        vector<thread_work_t>().swap(m_vThreadWork[i]);
+    }
+    vector<TrackSettings>().swap(m_vTrackSettings);
+    m_sMarker.clear();
+    m_sCurBackground.clear();
+    m_dNPSNotes.clear();
+    m_vImageData.clear();
+    PRE_DbgLog("Discard: done");
+}
+
 void MainScreen::InitColors()
 {
     static Config& config = Config::GetConfig();
@@ -620,7 +1064,6 @@ void MainScreen::InitColors()
     m_csKBSharp.SetColor( 0x00404040, 0.5f, 0.0f );
 }
 
-// Init state vars. Only those which validate the date.
 void MainScreen::InitState()
 {
     static Config &config = Config::GetConfig();
@@ -632,12 +1075,18 @@ void MainScreen::InitState()
     m_iStartPos = 0;
     m_iEndPos = -1;
     m_llStartTime = GetMinTime();
+    m_llDisplayTime = m_llStartTime;
+    m_fKeysTransition = 0.0f;
     m_bTrackPos = m_bTrackZoom = false;
     m_fTempZoomX = 1.0f;
     m_fTempOffsetX = m_fTempOffsetY = 0.0f;
     m_dFPS = 0.0;
     m_iFPSCount = 0;
     m_llFPSTime = 0;
+    m_llFrameMaxLate = 0;
+    m_ullFrameLateCount = 0;
+    m_llMaxLateMicros = 0;
+    m_ullLateEvents = 0;
     m_dSpeed = -1.0; // Forces a speed reset upon first call to Logic
 
     m_fZoomX = cView.GetZoomX();
@@ -648,7 +1097,6 @@ void MainScreen::InitState()
     double dNSpeed = cPlayback.GetNSpeed();
     m_llTimeSpan = static_cast< long long >( 3.0 * dNSpeed * 1000000 );
 
-    // m_Timer will be initialized *later*
     m_RealTimer.Init(false);
 
     m_bDumpFrames = cViz.bDumpFrames;
@@ -846,8 +1294,8 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     else
                     {
                         cView.SetZoomMove( true, true );
-                        return Success;
                     }
+                    return Success;
                 case ID_VIEW_CANCELMOVEANDZOOM:
                     cView.SetZoomMove( false, true );
                     m_bTrackPos = m_bTrackZoom = false;
@@ -863,10 +1311,18 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     m_fTempOffsetY = 0.0f;
                     m_fTempZoomX = 1.0f;
                     return Success;
+                case ID_UPDATE_TRACKCOLORS:
+                {
+                    const VisualSettings& cVisual = config.GetVisualSettings();
+                    SetChannelSettings(
+                        vector< bool >(),
+                        vector< bool >(),
+                        vector< unsigned >( cVisual.colors, cVisual.colors + sizeof( cVisual.colors ) / sizeof( cVisual.colors[0] ) ) );
+                    return Success;
+                }
             }
             break;
         }
-        // These are doubled from MainProcs.cpp. Allows to get rid of the Ctrl requirement for accellerators
         case WM_KEYDOWN:
         {
             bool bCtrl = GetKeyState( VK_CONTROL ) < 0;
@@ -987,6 +1443,13 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
 
 GameState::GameError MainScreen::Logic( void )
 {
+    if (m_bDiscarded)
+    {
+        // Song data is freed; keep the ImGui loading modal animating while the
+        // UI thread parses the next file.
+        m_pRenderer->ImGuiStartFrame();
+        return Success;
+    }
     // Start new ImGui frame
     m_pRenderer->ImGuiStartFrame();
 
@@ -995,13 +1458,35 @@ GameState::GameError MainScreen::Logic( void )
     static const ViewSettings &cView = config.GetViewSettings();
     static const VisualSettings &cVisual = config.GetVisualSettings();
     static const VideoSettings &cVideo = config.GetVideoSettings();
+    static const AudioSettings &cAudio = config.GetAudioSettings();
     static const VizSettings &cViz = config.GetVizSettings();
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
+
+    // Custom audio (user-provided wav/mp3/ogg) fully bypasses the prerender; the
+    // MIDI device is skipped too so the file is the only audible track.
+    const bool bCustomAudio = m_bUseCustomAudio && !m_sCustomAudioPath.empty();
+    {
+        static bool s_bBranchLogged = false;
+        if (!s_bBranchLogged)
+        {
+            s_bBranchLogged = true;
+            PRE_DbgLog("Logic: bCustomAudio=%d bPreAudio=%d bLiveAudio=%d prerenderCfg=%d path='%ls' firstNote=%.2f", (int)bCustomAudio, (int)(!bCustomAudio && cAudio.bPreRenderAudio), (int)(!bCustomAudio && !cAudio.bPreRenderAudio), (int)cAudio.bPreRenderAudio, m_sCustomAudioPath.c_str(), (double)mInfo.llFirstNote / 1e6);
+        }
+    }
+    const bool bPreAudio = !bCustomAudio && cAudio.bPreRenderAudio;
+    const bool bLiveAudio = !bCustomAudio && !bPreAudio;
 
     // people are probably going to yell at me if you can't change the bar color during playback
     m_csKBRed.SetColor(cViz.iBarColor, 0.5f);
 
-    // Detect changes in state
+    if (cViz.bKDMAPI != m_OutDevice.IsKDMAPI()) {
+        if (cViz.bKDMAPI)
+            m_OutDevice.OpenKDMAPI();
+        else if (cAudio.iOutDevice >= 0)
+            m_OutDevice.Open(cAudio.iOutDevice);
+        m_OutDevice.Reset();
+    }
+
     bool bPaused = cPlayback.GetPaused();
     double dSpeed = cPlayback.GetSpeed();
     double dNSpeed = cPlayback.GetNSpeed();
@@ -1024,6 +1509,7 @@ GameState::GameError MainScreen::Logic( void )
     m_fZoomX = cView.GetZoomX();
     if ( !m_bZoomMove ) m_bTrackPos = m_bTrackZoom = false;
     m_eKeysShown = cVisual.eKeysShown;
+    m_eTransitionSpeed = cVisual.eTransitionSpeed;
     m_iStartNote = min( cVisual.iFirstKey, cVisual.iLastKey );
     m_iEndNote = max( cVisual.iFirstKey, cVisual.iLastKey );
     m_bShowFPS = cVideo.bShowFPS;
@@ -1059,25 +1545,82 @@ GameState::GameError MainScreen::Logic( void )
     m_Timer.Start();
     m_RealTimer.Start();
 
-    // Compute FPS every half a second
+    {
+        static auto s_tPlayLog = std::chrono::steady_clock::now();
+        auto tNowPlay = std::chrono::steady_clock::now();
+        if ( std::chrono::duration_cast<std::chrono::milliseconds>(tNowPlay - s_tPlayLog).count() >= 1000 )
+        {
+            s_tPlayLog = tNowPlay;
+            char buf[192];
+            long long llMidTime = -1;
+            if (m_vEvents.size() > 0)
+                llMidTime = m_MIDI.GetEventTime(m_vEvents[m_vEvents.size() / 2]);
+            sprintf_s(buf, "play:paused=%d start=%.3fs disp=%.3fs max=%.3fs events=%zu startpos=%lld endpos=%lld midtime=%.3fs",
+                (int)m_bPaused, (double)m_llStartTime / 1e6, (double)m_llDisplayTime / 1e6,
+                (double)llMaxTime / 1e6, m_vEvents.size(), (long long)m_iStartPos, (long long)m_iEndPos,
+                (double)llMidTime / 1e6);
+            HeartbeatLog(buf);
+        }
+    }
+
     m_llFPSTime += llRealElapsed;
     m_iFPSCount++;
     if ( m_llFPSTime >= 500000 )
     {
         m_dFPS = m_iFPSCount / ( m_llFPSTime / 1000000.0 );
-        m_llFPSTime = m_iFPSCount = 0;
+        m_llMaxLateMicros = max( m_llMaxLateMicros, m_llFrameMaxLate );
+        m_ullLateEvents += m_ullFrameLateCount;
+        m_llFPSTime = m_iFPSCount = m_llFrameMaxLate = 0;
+        m_ullFrameLateCount = 0;
     }
 
-    // If we just paused, kill the music. SetVolume is better than AllNotesOff
     if ( ( bPausedChanged || bMuteChanged ) && ( m_bPaused || m_bMute ) )
         m_OutDevice.AllNotesOff();
 
-    // Figure out start and end times for display
     long long llOldStartTime = m_llStartTime;
-    long long llNextStartTime = m_llStartTime + static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
+    long long llNextStartTime = 0;
+    if ( bPreAudio )
+        llNextStartTime = m_llStartTime + static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
+    else
+        llNextStartTime = m_llStartTime + static_cast< long long >( min( llElapsed * m_dSpeed, 100000.0 ) + 0.5 );
 
     if ( !m_bPaused && m_llStartTime < llMaxTime )
-        m_llStartTime = llNextStartTime;
+    {
+        // advance to a fixed slew would break speed changes; instead cap the
+        const long long kDeadZone = 20000;   // ignore drift smaller than 20ms
+        const long long kMaxCatchUp = 10000; // extra catch-up at most 10ms per frame
+        if ( bPreAudio && config.GetAudioSettings().bPreStutterOnLag
+             && m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->IsAudioStarted() )
+        {
+            long long llAudioTime = (long long)( PRE_MIDIAudio->GetPlayerTime() * 1000000.0 );
+            if ( llAudioTime >= 0 && llAudioTime <= llMaxTime )
+            {
+                long long llAhead = llAudioTime - llNextStartTime;
+                if ( llAhead > kDeadZone )
+                {
+                    llNextStartTime += min( llAhead - kDeadZone, kMaxCatchUp );
+                }
+                else if ( llAhead < -kDeadZone )
+                {
+                    llNextStartTime = min( llNextStartTime, llAudioTime + kDeadZone );
+                }
+                m_llStartTime = llNextStartTime;
+            }
+            else
+            {
+                m_llStartTime = llNextStartTime;
+            }
+        }
+        else
+        {
+            m_llStartTime = llNextStartTime;
+        }
+    }
+    if ( !m_bPaused && m_llStartTime < llMaxTime
+         && bPreAudio )
+        m_llDisplayTime += static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
+    else
+        m_llDisplayTime = m_llStartTime;
     m_iStartTick = GetCurrentTick( m_llStartTime );
     long long llEndTime = 0;
     if (m_bTickMode)
@@ -1087,53 +1630,107 @@ GameState::GameError MainScreen::Logic( void )
 
     RenderGlobals();
 
-    // Advance end position
     auto iEventCount = (int64_t)m_vEvents.size();
     if (m_bTickMode) {
-        while (m_iEndPos + 1 < iEventCount && m_vEvents[m_iEndPos + 1]->GetAbsT() < llEndTime)
+        while (m_iEndPos + 1 < iEventCount && m_MIDI.GetEventAbsT(m_vEvents[m_iEndPos + 1]) < llEndTime)
             m_iEndPos++;
     } else {
-        while (m_iEndPos + 1 < iEventCount && m_vEvents[m_iEndPos + 1]->GetAbsMicroSec() < llEndTime)
+        while (m_iEndPos + 1 < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iEndPos + 1]) < llEndTime)
             m_iEndPos++;
     }
 
-    // Only want to advance start positions when unpaused becuase advancing startpos "consumes" the events
+    // Pre-rendered audio mode drives the playback clock; skip the MIDI device.
+    // With custom audio the user's file replaces the prerender entirely.
+    if (bCustomAudio)
+    {
+        if (PRE_MIDIAudio)
+        {
+            SDL_PauseAudio(1); // silence any leftover prerender/SDL output
+            static bool s_bPausedLogged = false;
+            if (!s_bPausedLogged) { s_bPausedLogged = true; PRE_DbgLog("CUSTOM: SDL paused"); }
+        }
+        CustomAudioUpdate(m_sCustomAudioPath, m_llStartTime, mInfo.llFirstNote, m_bPaused, m_bMute, m_dVolume);
+    }
+    else
+        UpdatePreRenderAudio(m_vEvents, m_MIDI, m_llStartTime, m_iStartPos, m_bAudioStarted);
+
     if ( !m_bPaused )
     {
-        // Advance start position updating initial state as we pass stale events
-        // Also PLAYS THE MUSIC
         long long notes_played = 0;
         long long events_processed = 0;
+        float fCorruptor = GetCorruptorAmount();
+        m_pRenderer->m_fLastCorruption = fCorruptor;
         for (auto& work : m_vThreadWork)
             work.clear();
-        while ( m_iStartPos < iEventCount && m_vEvents[m_iStartPos]->GetAbsMicroSec() <= m_llStartTime )
+        while ( m_iStartPos < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iStartPos]) <= m_llStartTime )
         {
-            MIDIChannelEvent *pEvent = m_vEvents[m_iStartPos];
-            if (pEvent->GetChannelEventType() != MIDIChannelEvent::NoteOn) {
-                if (pEvent->GetChannelEventType() == MIDIChannelEvent::ProgramChange && pEvent->GetChannel() != MIDI::Drums && config.m_bPianoOverride)
-                    pEvent->SetParam1(0);
-                if (pEvent->GetChannelEventType() == MIDIChannelEvent::PitchBend)
-                    m_pBends[pEvent->GetChannel()] = (notex_table[1] - notex_table[0]) * (((short)(((pEvent->GetParam2() << 7) | pEvent->GetParam1()) - 8192)) / (8192.0f / 12.0f));
-                m_OutDevice.PlayEvent(pEvent->GetEventCode(), pEvent->GetParam1(), pEvent->GetParam2());
+            MIDIChannelEvent pEvent = m_vEvents[m_iStartPos];
+
+            int iCorruptPitch = m_MIDI.GetEventParam1(pEvent);
+            int iCorruptValue = m_MIDI.GetEventParam2(pEvent);
+            uint64_t hCorrupt = 0;
+            switch (m_MIDI.GetEventChannelEventType(pEvent))
+            {
+            case MIDI::NoteOn:
+            case MIDI::NoteOff:
+                hCorrupt = CorruptSeed(pEvent, m_MIDI.EventHasSister(pEvent) ? m_vEvents[m_MIDI.GetEventSisterIdx(pEvent)] : UINT32_MAX);
+                iCorruptPitch = CorruptPitch(fCorruptor, hCorrupt, iCorruptPitch);
+                break;
+            case MIDI::Controller:
+            case MIDI::ProgramChange:
+                hCorrupt = CorruptSeed(pEvent, UINT32_MAX);
+                iCorruptPitch = CorruptValue(fCorruptor, hCorrupt, iCorruptPitch);
+                break;
+            case MIDI::PitchBend:
+                hCorrupt = CorruptSeed(pEvent, UINT32_MAX);
+                iCorruptValue = CorruptPitchBend(fCorruptor, hCorrupt,
+                    (m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent));
+                break;
+            case MIDI::NoteAftertouch:
+            case MIDI::ChannelAftertouch:
+                hCorrupt = CorruptSeed(pEvent, UINT32_MAX);
+                iCorruptPitch = CorruptPitch(fCorruptor, hCorrupt, iCorruptPitch);
+                iCorruptValue = CorruptValue(fCorruptor, hCorrupt, iCorruptValue);
+                break;
             }
-            else if (!m_bMute && (!m_bAnyChannelMuted || !m_vTrackSettings[pEvent->GetTrack()].aChannels[pEvent->GetChannel()].bMuted)) {
-                m_OutDevice.PlayEvent(pEvent->GetEventCode(), pEvent->GetParam1(),
-                    static_cast<int>(pEvent->GetParam2() * dVolumeCorrect + 0.5));
+
+            if (m_MIDI.GetEventChannelEventType(pEvent) != MIDI::NoteOn) {
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::ProgramChange &&
+                    m_MIDI.GetEventChannel(pEvent) != MIDI::Drums && config.m_bPianoOverride)
+                    iCorruptPitch = 0; // keep the piano override intact
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::PitchBend) {
+                    m_pBends[m_MIDI.GetEventChannel(pEvent)] = (notex_table[1] - notex_table[0]) *
+                        (((short)(iCorruptValue - 8192)) / (8192.0f / 12.0f));
+                    if (bLiveAudio)
+                        m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptValue & 0x7F, iCorruptValue >> 7);
+                }
+                else if (bLiveAudio)
+                    m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch, iCorruptValue);
+            }
+            else if (!m_bMute && (!m_bAnyChannelMuted || !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted)) {
+                if (bLiveAudio)
+                    m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch,
+                        static_cast<int>(CorruptVelocity(fCorruptor, hCorrupt, m_MIDI.GetEventParam2(pEvent)) * dVolumeCorrect + 0.5));
                 notes_played++;
             }
-            if ((pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn || pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOff)
-                && pEvent->GetParam1() < 128 && pEvent->HasSister())
+            if ((m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn || m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOff)
+                && iCorruptPitch < 128 && m_MIDI.EventHasSister(pEvent))
             {
-                m_vThreadWork[pEvent->GetParam1()].push_back({
+                m_vThreadWork[iCorruptPitch].push_back({
                     .idx = (unsigned)m_iStartPos,
-                    .sister_idx = (pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn && pEvent->GetParam2() > 0) ? ~0 : pEvent->GetSisterIdx(),
+                    .sister_idx = (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0) ? ~0 : m_MIDI.GetEventSisterIdx(pEvent),
                 });
             }
             m_iStartPos++;
             events_processed++;
+
+            long long llLateness = m_llStartTime - m_MIDI.GetEventTime(pEvent);
+            if (llLateness > m_llFrameMaxLate)
+                m_llFrameMaxLate = llLateness;
+            if (llLateness > 100000)
+                m_ullFrameLateCount++;
         }
 
-        // Only parallelize after an events threshold is hit for this frame
         if (events_processed < 131072) {
             for (int i = 0; i < 128; i++) {
                 for (const auto& work : m_vThreadWork[i])
@@ -1147,7 +1744,6 @@ GameState::GameError MainScreen::Logic( void )
             });
         }
         
-        // Update NPS
         if (cViz.bNerdStats) {
             for (; !m_dNPSNotes.empty(); m_dNPSNotes.pop_front()) {
                 if (std::get<0>(m_dNPSNotes.front()) >= m_llStartTime - 1000000)
@@ -1160,14 +1756,12 @@ GameState::GameError MainScreen::Logic( void )
 
     AdvanceIterators( m_llStartTime, false );
 
-    // Update the position slider
     long long llFirstTime = GetMinTime();
     long long llLastTime = GetMaxTime();
     long long llOldPos = ( ( llOldStartTime - llFirstTime ) * 1000 ) / ( llLastTime - llFirstTime );
     long long llNewPos = ( ( m_llStartTime - llFirstTime ) * 1000 ) / ( llLastTime - llFirstTime );
     if ( llOldPos != llNewPos ) cPlayback.SetPosition( static_cast< int >( llNewPos ) );
 
-    // Song's over
     if (!m_bPaused && m_llStartTime >= llMaxTime) {
         if (m_bDumpFrames)
             CloseHandle(m_hVideoPipe);
@@ -1177,7 +1771,6 @@ GameState::GameError MainScreen::Logic( void )
     if (m_Timer.m_bManualTimer)
         m_Timer.IncrementFrame();
 
-    // Update root constants
     auto& root_consts = m_pRenderer->GetRootConstants();
     root_consts.deflate = clamp(round(m_fWhiteCX * 0.15f / 2.0f), 1.0f, 3.0f);
     root_consts.notes_y = m_fNotesY;
@@ -1185,7 +1778,6 @@ GameState::GameError MainScreen::Logic( void )
     root_consts.white_cx = m_fWhiteCX;
     root_consts.timespan = (float)m_llTimeSpan;
 
-    // Update fixed size constants
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
     if (cViz.bVisualizePitchBends)
@@ -1193,17 +1785,20 @@ GameState::GameError MainScreen::Logic( void )
     else
         memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
-    // Update track colors
-    // TODO: Only update track colors lazily
     auto* track_colors = m_pRenderer->GetTrackColors();
     for (size_t i = 0; i < min(m_vTrackSettings.size(), MaxTrackColors); i++) {
+        bool bChanged = false;
         for (size_t j = 0; j < 16; j++) {
             auto& src = m_vTrackSettings[i].aChannels[j];
             auto& dst = track_colors[i * 16 + j];
-            dst.primary = src.iPrimaryRGB;
-            dst.dark = src.iDarkRGB;
-            dst.darker = src.bHidden ? 0xFFFFFFFF : src.iVeryDarkRGB; // Hack to signal hidden track without checking on CPU
+            TrackColor c = { src.iPrimaryRGB, src.iDarkRGB, src.bHidden ? 0xFFFFFFFF : src.iVeryDarkRGB }; // Hack to signal hidden track without checking on CPU
+            if (dst.primary != c.primary || dst.dark != c.dark || dst.darker != c.darker) {
+                dst = c;
+                bChanged = true;
+            }
         }
+        if (bChanged)
+            m_pRenderer->MarkTrackColorsDirty(i);
     }
 
     return Success;
@@ -1216,7 +1811,6 @@ void MainScreen::UpdateState(int key, const thread_work_t& work)
         note_state.push_back(work.idx);
         m_pNoteState[key] = work.idx;
     } else {
-        // binary search
         auto pos = sse_bin_search(note_state, work.sister_idx);
         if (pos != -1)
             note_state.erase(note_state.begin() + pos);
@@ -1230,65 +1824,75 @@ void MainScreen::UpdateState(int key, const thread_work_t& work)
 
 void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
 {
-    // Reset NPS
     m_dNPSNotes.clear();
 
-    // Kill the music!
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        PRE_DbgLog("JumpTo: reset start t=%.2f r=%.2f w=%.2f", (double)llStartTime / 1e6, (double)PRE_MIDIAudio->GetPlayerTime(), (double)PRE_MIDIAudio->GetBufferSeconds());
+        m_bAudioStarted = false;
+    }
+
     m_OutDevice.AllNotesOff();
 
-    // Start time. Piece of cake!
     long long llFirstTime = GetMinTime();
     long long llLastTime = GetMaxTime();
     m_llStartTime = min(max(llStartTime, llFirstTime), llLastTime);
+    m_llDisplayTime = m_llStartTime;
+    if (m_llStartTime <= llFirstTime)
+        m_fKeysTransition = 0.0f;
     long long llEndTime = m_llStartTime + m_llTimeSpan;
 
-    // Start position and current state: hard!
     auto itBegin = m_vEvents.begin();
     auto itEnd = m_vEvents.end();
-    // Want lower bound to minimize simultaneous complexity
-    auto itMiddle = lower_bound(itBegin, itEnd, llStartTime, [&](MIDIChannelEvent* lhs, const long long rhs) {
-        return lhs->GetAbsMicroSec() < rhs;
+    auto itMiddle = lower_bound(itBegin, itEnd, llStartTime, [&](MIDIChannelEvent lhs, const long long rhs) {
+        return m_MIDI.GetEventTime(lhs) < rhs;
     });
 
-    // Start position
     m_iStartPos = (long long)m_vEvents.size();
     if (itMiddle != itEnd && itMiddle - m_vEvents.begin() < m_iStartPos)
         m_iStartPos = itMiddle - m_vEvents.begin();
 
-    // Need to scan up to the next note on event
     for (; itMiddle != itEnd; itMiddle++) {
-        if ((*itMiddle)->GetChannelEventType() == MIDIChannelEvent::NoteOn && (*itMiddle)->GetParam2() > 0)
+        if (m_MIDI.GetEventChannelEventType(*itMiddle) == MIDI::NoteOn && m_MIDI.GetEventParam2(*itMiddle) > 0)
             break;
     }
 
-    // Find the notes that occur simultaneously with the previous note on
     for (auto& note_state : m_vState)
         note_state.clear();
     memset(m_pNoteState, -1, sizeof(m_pNoteState));
     if (itMiddle != itBegin)
     {
-        // Need to scan down to the last note on event
         auto itPrev = itMiddle - 1;
         for (; itPrev != itBegin; itPrev--) {
-            if ((*itPrev)->GetChannelEventType() == MIDIChannelEvent::NoteOn && (*itPrev)->GetParam2() > 0)
+            if (m_MIDI.GetEventChannelEventType(*itPrev) == MIDI::NoteOn && m_MIDI.GetEventParam2(*itPrev) > 0)
                 break;
         }
 
         unsigned iFound = 0;
-        unsigned iSimultaneous = (*itPrev)->GetSimultaneous() + 1;
-        for (std::vector<MIDIChannelEvent*>::reverse_iterator it(itMiddle); iFound < iSimultaneous && it != m_vEvents.rend(); ++it)
+
+        auto itClusterEnd = itMiddle;
+        long long llClusterTime = m_MIDI.GetEventTime(*itClusterEnd);
+        while (itClusterEnd + 1 != itEnd && m_MIDI.GetEventTime(*(itClusterEnd + 1)) == llClusterTime)
+            itClusterEnd++;
+
+        unsigned iSimultaneous = m_MIDI.GetEventSimult(*itPrev) + 1;
+        for (std::vector<MIDIChannelEvent>::reverse_iterator it(itClusterEnd + 1); iFound < iSimultaneous && it != m_vEvents.rend(); ++it)
         {
             auto idx = m_vEvents.size() - 1 - (it - m_vEvents.rbegin());
-            MIDIChannelEvent* pEvent = m_vEvents[idx];
-            if (pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn && pEvent->GetParam2() > 0 && pEvent->HasSister()) {
-                MIDIChannelEvent* pSister = pEvent->GetSister(m_vEvents);
-                if (pSister->GetAbsMicroSec() > (*itPrev)->GetAbsMicroSec()) // > because itMiddle is the max for its time
+            MIDIChannelEvent pEvent = m_vEvents[idx];
+            if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
+                MIDIChannelEvent pSister = m_vEvents[m_MIDI.GetEventSisterIdx(pEvent)];
+                if (m_MIDI.GetEventTime(pSister) > m_MIDI.GetEventTime(*itPrev)) // > because itMiddle is the max for its time
                     iFound++;
-                if (pSister->GetAbsMicroSec() > llStartTime) // > because we don't care about simultaneous ending notes
+                if (m_MIDI.GetEventTime(pSister) > llStartTime) // > because we don't care about simultaneous ending notes
                 {
-                    (m_vState[pEvent->GetParam1()]).push_back(idx);
-                    if (m_pNoteState[pEvent->GetParam1()] < 0)
-                        m_pNoteState[pEvent->GetParam1()] = idx;
+                    if (m_MIDI.GetEventTime(pEvent) >= llStartTime)
+                        continue;
+                    int iCorruptPitch = CorruptPitch(GetCorruptorAmount(),
+                        CorruptSeed(pEvent, pSister), m_MIDI.GetEventParam1(pEvent));
+                    (m_vState[iCorruptPitch]).push_back(idx);
+                    if (m_pNoteState[iCorruptPitch] < 0)
+                        m_pNoteState[iCorruptPitch] = idx;
                 }
             }
         }
@@ -1296,13 +1900,11 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
             reverse(note_state.begin(), note_state.end());
     }
 
-    // End position: a little tricky. Same as logic code. Only needed for paused jumping.
     m_iEndPos = m_iStartPos - 1;
     auto iEventCount = (long long)m_vEvents.size();
-    while (m_iEndPos + 1 < iEventCount && m_vEvents[m_iEndPos + 1]->GetAbsMicroSec() < llEndTime)
+    while (m_iEndPos + 1 < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iEndPos + 1]) < llEndTime)
         m_iEndPos++;
 
-    // Input position, iterators, tick
     eventvec_t::const_iterator itOldProgramChange = m_itNextProgramChange;
     AdvanceIterators(llStartTime, true);
     PlaySkippedEvents(itOldProgramChange);
@@ -1316,57 +1918,61 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
     }
 }
 
-// Plays skipped program change and controller events. Only plays the one's needed.
-// Linear search assumes a small number of events in the file. Better than 128 maps :/
 void MainScreen::PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange)
 {
     if (itOldProgramChange == m_itNextProgramChange)
         return;
 
-    // Lookup tables to see if we've got an event for a given control or program. faster than map or hash_map.
     bool aControl[16][128], aProgram[16], aPitchBend[16];
     bool bPianoOverride = Config::GetConfig().m_bPianoOverride;
     memset(aControl, 0, sizeof(aControl));
     memset(aProgram, 0, sizeof(aProgram));
     memset(aPitchBend, 0, sizeof(aPitchBend));
 
-    // Go from one before the next to the beginning backwards. iterators are so verbose :/
-    vector< MIDIChannelEvent* > vControl;
+    vector< MIDIChannelEvent > vControl;
     eventvec_t::const_reverse_iterator itBegin = eventvec_t::const_reverse_iterator(m_itNextProgramChange);
     eventvec_t::const_reverse_iterator itEnd = m_vProgramChange.rend();
     if (itOldProgramChange < m_itNextProgramChange) itEnd = eventvec_t::const_reverse_iterator(itOldProgramChange);
 
+    float fCorrupt = GetCorruptorAmount();
     for (eventvec_t::const_reverse_iterator it = itBegin; it != itEnd; ++it)
     {
-        MIDIChannelEvent* pEvent = m_vEvents[it->second];
-        // Order matters because some events affect others, thus store for later use
-        if (pEvent->GetChannelEventType() == MIDIChannelEvent::Controller &&
-            !aControl[pEvent->GetChannel()][pEvent->GetParam1()])
+        MIDIChannelEvent pEvent = m_vEvents[it->second];
+        if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::Controller &&
+            !aControl[m_MIDI.GetEventChannel(pEvent)][m_MIDI.GetEventParam1(pEvent)])
         {
-            aControl[pEvent->GetChannel()][pEvent->GetParam1()] = true;
+            aControl[m_MIDI.GetEventChannel(pEvent)][m_MIDI.GetEventParam1(pEvent)] = true;
             vControl.push_back(m_vEvents[it->second]);
         }
-        // Order doesn't matter. Just play as you go by.
-        else if (pEvent->GetChannelEventType() == MIDIChannelEvent::ProgramChange &&
-            !aProgram[pEvent->GetChannel()])
+        else if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::ProgramChange &&
+            !aProgram[m_MIDI.GetEventChannel(pEvent)])
         {
-            aProgram[pEvent->GetChannel()] = true;
-            if (pEvent->GetChannel() != MIDI::Drums && bPianoOverride)
-                pEvent->SetParam1(0);
-            m_OutDevice.PlayEvent(pEvent->GetEventCode(), pEvent->GetParam1(), pEvent->GetParam2());
+            aProgram[m_MIDI.GetEventChannel(pEvent)] = true;
+            int iProgram = m_MIDI.GetEventParam1(pEvent);
+            if (m_MIDI.GetEventChannel(pEvent) != MIDI::Drums && bPianoOverride)
+                iProgram = 0;
+            else
+                iProgram = CorruptValue(fCorrupt, CorruptSeed(pEvent, UINT32_MAX), iProgram);
+            m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iProgram, m_MIDI.GetEventParam2(pEvent));
         }
-        else if (pEvent->GetChannelEventType() == MIDIChannelEvent::PitchBend &&
-            !aPitchBend[pEvent->GetChannel()])
+        else if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::PitchBend &&
+            !aPitchBend[m_MIDI.GetEventChannel(pEvent)])
         {
-            aPitchBend[pEvent->GetChannel()] = true;
-            m_pBends[pEvent->GetChannel()] = (notex_table[1] - notex_table[0]) * (((short)(((pEvent->GetParam2() << 7) | pEvent->GetParam1()) - 8192)) / (8192.0f / 12.0f));
-            m_OutDevice.PlayEvent(pEvent->GetEventCode(), pEvent->GetParam1(), pEvent->GetParam2());
+            aPitchBend[m_MIDI.GetEventChannel(pEvent)] = true;
+            int iBend = CorruptPitchBend(fCorrupt, CorruptSeed(pEvent, UINT32_MAX),
+                (m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent));
+            m_pBends[m_MIDI.GetEventChannel(pEvent)] = (notex_table[1] - notex_table[0]) *
+                (((short)(iBend - 8192)) / (8192.0f / 12.0f));
+            m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iBend & 0x7F, iBend >> 7);
         }
     }
 
-    // Finally play the controller events. vControl is in reverse time order
-    for (vector< MIDIChannelEvent* >::reverse_iterator it = vControl.rbegin(); it != vControl.rend(); ++it)
-        m_OutDevice.PlayEvent((*it)->GetEventCode(), (*it)->GetParam1(), (*it)->GetParam2());
+    for (vector< MIDIChannelEvent >::reverse_iterator it = vControl.rbegin(); it != vControl.rend(); ++it)
+    {
+        MIDIChannelEvent pEvent = *it;
+        m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent),
+            CorruptValue(fCorrupt, CorruptSeed(pEvent, UINT32_MAX), m_MIDI.GetEventParam2(pEvent)));
+    }
 }
 
 void MainScreen::ApplyMarker(unsigned char* data, size_t size) {
@@ -1383,7 +1989,6 @@ void MainScreen::ApplyMarker(unsigned char* data, size_t size) {
         temp_str[size] = '\0';
         
         if (codepages[viz.eMarkerEncoding] != CP_UTF8) {
-            // Yes, I have to convert to wide and then back to UTF-8...
             auto wide_len = MultiByteToWideChar(codepages[viz.eMarkerEncoding], 0, temp_str, size + 1, NULL, 0);
             auto wide_temp_str = new WCHAR[wide_len];
             MultiByteToWideChar(codepages[viz.eMarkerEncoding], 0, temp_str, size + 1, wide_temp_str, wide_len);
@@ -1399,7 +2004,6 @@ void MainScreen::ApplyMarker(unsigned char* data, size_t size) {
             m_sMarker = temp_str;
         }
 
-        // blacklist common "unset marker" stuff
         if (m_sMarker == "Setup" || m_sMarker == "Start")
             m_sMarker = std::string();
 
@@ -1409,7 +2013,6 @@ void MainScreen::ApplyMarker(unsigned char* data, size_t size) {
     }
 }
 
-// Advance program change, tempo, and signature
 void MainScreen::AdvanceIterators( long long llTime, bool bIsJump )
 {
     if ( bIsJump )
@@ -1499,7 +2102,6 @@ void MainScreen::AdvanceIterators( long long llTime, bool bIsJump )
     }
 }
 
-// Might change the value of itCurrent
 MIDIMetaEvent* MainScreen::GetPrevious( eventvec_t::const_iterator &itCurrent,
                                         const eventvec_t &vEventMap, int iDataLen )
 {
@@ -1520,7 +2122,6 @@ MIDIMetaEvent* MainScreen::GetPrevious( eventvec_t::const_iterator &itCurrent,
     return NULL;
 }
 
-// Gets the tick corresponding to llStartTime using current tempo
 int  MainScreen::GetCurrentTick( long long llStartTime )
 {
     return GetCurrentTick( llStartTime, m_iLastTempoTick, m_llLastTempoTime, m_iMicroSecsPerBeat );
@@ -1539,7 +2140,6 @@ int  MainScreen::GetCurrentTick( long long llStartTime, int iLastTempoTick, long
     return -1;
 }
 
-// Gets the time corresponding to the tick
 long long MainScreen::GetTickTime( int iTick )
 {
     return GetTickTime( iTick, m_iLastTempoTick, m_llLastTempoTime, m_iMicroSecsPerBeat );
@@ -1551,11 +2151,10 @@ long long MainScreen::GetTickTime( int iTick, int iLastTempoTick, long long llLa
     if ( !( iDivision & 0x8000 ) )
         return llLastTempoTime + ( static_cast< long long >( iMicroSecsPerBeat ) * ( iTick - iLastTempoTick ) ) / iDivision;
     //else
-    //    return llLastTempoTime + ( 1000000LL * ( iTick - iLastTempoTick ) ) / iTicksPerSecond;
+    // return llLastTempoTime + ( 1000000LL * ( iTick - iLastTempoTick ) ) / iTicksPerSecond;
     return -1;
 }
 
-// Rounds up to the nearest beat
 int MainScreen::GetBeat( int iTick, int iBeatType, int iLastSignatureTick )
 {
     int iDivision = m_MIDI.GetInfo().iDivision;
@@ -1573,7 +2172,6 @@ int MainScreen::GetBeat( int iTick, int iBeatType, int iLastSignatureTick )
     return -1;
 }
 
-// Rounds up to the nearest beat
 int MainScreen::GetBeatTick( int iTick, int iBeatType, int iLastSignatureTick )
 {
     int iDivision = m_MIDI.GetInfo().iDivision;
@@ -1588,37 +2186,111 @@ const float MainScreen::KeyRatio = 0.1775f;
 
 GameState::GameError MainScreen::Render() 
 {
+    if (m_bDiscarded)
+    {
+        // Minimal frame: clear + present the loading modal. Keeps the GPU busy
+        // (less idle -> fewer TDR windows) with no song data touched.
+        m_pRenderer->ClearAndBeginScene(0x00000000);
+        m_pRenderer->EndScene();
+        m_pRenderer->Present();
+        return Success;
+    }
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
 
-    // Update background if it changed
     static Config& config = Config::GetConfig();
     static const VizSettings& cViz = config.GetVizSettings();
     if (cViz.sBackground != m_sCurBackground || cViz.sBackground.empty()) {
         m_bBackgroundLoaded = cViz.sBackground.empty() ? false : m_pRenderer->LoadBackgroundBitmap(cViz.sBackground);
         m_sCurBackground = cViz.sBackground;
+        m_fLastBGBlur = -1.0f;
+    }
+    if (m_bBackgroundLoaded && cViz.fBGBlur != m_fLastBGBlur) {
+        m_pRenderer->SetBackgroundBlur(cViz.fBGBlur);
+        m_fLastBGBlur = cViz.fBGBlur;
     }
 
-    m_pRenderer->ClearAndBeginScene( 0x00000000 );
-    RenderLines();
-    RenderNotes();
-    if ( m_bShowKB )
-        RenderKeys();
-    RenderBorder();
-    RenderText();
+    {
+        static int s_frameLog = 0;
+        static double tClear = 0, tLines = 0, tNotes = 0, tRest = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        m_pRenderer->ClearAndBeginScene( 0x00000000 );
+        auto t0b = std::chrono::steady_clock::now();
+        RenderLines();
+        auto t1 = std::chrono::steady_clock::now();
+        RenderNotes();
+        auto t2 = std::chrono::steady_clock::now();
+        if ( m_bShowKB )
+            RenderKeys();
+        RenderBorder();
+        RenderText();
+        auto t3 = std::chrono::steady_clock::now();
+        tClear += std::chrono::duration<double, std::milli>(t0b - t0).count();
+        tLines += std::chrono::duration<double, std::milli>(t1 - t0b).count();
+        tNotes += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        tRest += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        if ((s_frameLog++ & 127) == 127) {
+            char buf[128];
+            sprintf_s(buf, "r:clear=%.2f lines=%.2f notes=%.2f rest=%.2f",
+                tClear / 128.0, tLines / 128.0, tNotes / 128.0, tRest / 128.0);
+            HeartbeatLog(buf);
+            tClear = tLines = tNotes = tRest = 0;
+        }
+    }
 
-    // Present the backbuffer contents to the display
-    m_pRenderer->EndScene(m_bBackgroundLoaded);
-    m_pRenderer->Present();
+    m_pRenderer->SetStripKeyboardColors(
+        m_csKBWhite.iPrimaryRGB, m_csKBWhite.iDarkRGB, m_csKBWhite.iVeryDarkRGB,
+        m_csKBSharp.iPrimaryRGB, m_csKBSharp.iDarkRGB, m_csKBSharp.iVeryDarkRGB,
+        m_csKBBackground.iPrimaryRGB, m_csKBBackground.iDarkRGB);
 
-    // Dump frame!!!!
+    {
+        DWORD pressedKeys[128] = {};
+        DWORD ribbonColors[128] = {};
+        for (int i = 0; i < 128; i++) {
+            if (m_pNoteState[i] != -1) {
+                MIDIChannelEvent pEvent = (m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX);
+                if (pEvent != UINT32_MAX) {
+                    const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                    const int iChannel = m_MIDI.GetEventChannel(pEvent);
+                    const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
+                    pressedKeys[i] = cs.iPrimaryRGB;
+                    ribbonColors[i] = cs.iPrimaryRGB;
+                }
+            }
+        }
+        m_pRenderer->SetStripPressedKeys(pressedKeys, ribbonColors);
+    }
+
+    m_pRenderer->DrawPianoRollStripKeyboard();
+
+    m_pRenderer->SetPlaybackPosition((float)((double)(m_llDisplayTime - GetMinTime()) / (double)(GetMaxTime() - GetMinTime())));
+    m_pRenderer->SetPianoRollView(m_iStartNote, m_iEndNote,
+        (float)((double)(m_llStartTime - m_llRndStartTime) / (double)m_llTimeSpan));
+
+    {
+        static int s_endLog = 0;
+        static double tStrip = 0, tEnd = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        m_pRenderer->DrawPianoRollStripKeyboard();
+        auto t1 = std::chrono::steady_clock::now();
+        m_pRenderer->EndScene(m_bBackgroundLoaded);
+        auto t2 = std::chrono::steady_clock::now();
+        m_pRenderer->Present();
+        auto t3 = std::chrono::steady_clock::now();
+        tStrip += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        tEnd += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        if ((s_endLog++ & 127) == 127) {
+            char buf[96];
+            sprintf_s(buf, "r:strip=%.2f present=%.2f", tStrip / 128.0, tEnd / 128.0);
+            HeartbeatLog(buf);
+            tStrip = tEnd = 0;
+        }
+    }
+
     if (m_bDumpFrames) {
-        // Get the current frame
         auto* frame = m_pRenderer->Screenshot();
 
-        // Write to pipe
         WriteFile(m_hVideoPipe, frame, static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4), nullptr, nullptr);
 
-        // Show dump speed on the title bar
         const std::wstring& name = m_MIDI.GetInfo().sFilename;
         TCHAR sTitle[1024];
         _stprintf_s(sTitle, TEXT("%ws (%.1lf%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), (m_dFPS / m_Timer.m_dFramerate) * 100.0);
@@ -1627,11 +2299,8 @@ GameState::GameError MainScreen::Render()
     return Success;
 }
 
-// These used to be created as local variables inside each Render* function, but too much copying of code :/
-// Depends on m_llStartTime, m_llTimeSpan, m_eKeysShown, m_iStartNote, m_iEndNote
 void MainScreen::RenderGlobals()
 {
-    // Midi info
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
     if ( m_eKeysShown == VisualSettings::All )
     {
@@ -1643,18 +2312,65 @@ void MainScreen::RenderGlobals()
         m_iStartNote = mInfo.iMinNote;
         m_iEndNote = mInfo.iMaxNote;
     }
+    else if ( m_eKeysShown == VisualSettings::Transition )
+    {
+        const int iBaseStart = MIDI::A0;
+        const int iBaseEnd = MIDI::C8;
 
-    // Screen X info
+        if ( m_fKeysTransition < 1.0f )
+        {
+            int iRangeMin = iBaseStart;
+            int iRangeMax = iBaseEnd;
+            for ( size_t i = 0; i < 128; i++ )
+                for ( vector<int>::const_iterator it = m_vState[i].begin(); it != m_vState[i].end(); it++ )
+                {
+                    const int iNote = m_MIDI.GetEventParam1(m_vEvents[*it]);
+                    iRangeMin = min( iRangeMin, iNote );
+                    iRangeMax = max( iRangeMax, iNote );
+                }
+            for ( long long i = m_iStartPos; i <= m_iEndPos; i++ )
+            {
+                const MIDIChannelEvent pEvent = m_vEvents[i];
+                if ( m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0 )
+                {
+                    const int iNote = m_MIDI.GetEventParam1(pEvent);
+                    iRangeMin = min( iRangeMin, iNote );
+                    iRangeMax = max( iRangeMax, iNote );
+                }
+            }
+
+            static bool s_bOutOfRangeTriggered = false;
+            if ( m_fKeysTransition == 0.0f ) s_bOutOfRangeTriggered = false;
+            if ( iRangeMin < iBaseStart || iRangeMax > iBaseEnd )
+                s_bOutOfRangeTriggered = true;
+
+            if ( s_bOutOfRangeTriggered )
+            {
+                const float fDuration = ( m_eTransitionSpeed == VisualSettings::SmoothFast || m_eTransitionSpeed == VisualSettings::LinearFast ) ? 2.0f : 3.0f;
+                const float fDelta = min( max( ( float )( m_Timer.GetMicroSecs() ) / 1000000.0f, 1.0f / 60.0f ), 0.25f );
+                static float s_fLinearProgress = 0.0f;
+                if ( m_fKeysTransition == 0.0f ) s_fLinearProgress = 0.0f;
+
+                s_fLinearProgress = min( 1.0f, s_fLinearProgress + fDelta / fDuration );
+                if ( m_eTransitionSpeed == VisualSettings::SmoothSlow || m_eTransitionSpeed == VisualSettings::SmoothFast )
+                    m_fKeysTransition = s_fLinearProgress * s_fLinearProgress * ( 3.0f - 2.0f * s_fLinearProgress );
+                else
+                    m_fKeysTransition = s_fLinearProgress;
+            }
+        }
+
+        m_iStartNote = ( int )floor( ( float )iBaseStart * ( 1.0f - m_fKeysTransition ) + 0.5f );
+        m_iEndNote = ( int )floor( ( float )iBaseEnd * ( 1.0f - m_fKeysTransition ) + 127.0f * m_fKeysTransition + 0.5f );
+    }
+
     m_fNotesX = m_fOffsetX + m_fTempOffsetX;
     m_fNotesCX = m_pRenderer->GetBufferWidth() * m_fZoomX * m_fTempZoomX;
 
-    // Keys info
     m_iAllWhiteKeys = MIDI::WhiteCount( m_iStartNote, m_iEndNote + 1 );
     float fBuffer = ( MIDI::IsSharp( m_iStartNote ) ? SharpRatio / 2.0f : 0.0f ) +
                     ( MIDI::IsSharp( m_iEndNote ) ? SharpRatio / 2.0f : 0.0f );
     m_fWhiteCX = m_fNotesCX / ( m_iAllWhiteKeys + fBuffer );
 
-    // Screen Y info
     m_fNotesY = m_fOffsetY + m_fTempOffsetY;
     if ( !m_bShowKB )
         m_fNotesCY = static_cast< float >( m_pRenderer->GetBufferHeight() );
@@ -1662,12 +2378,10 @@ void MainScreen::RenderGlobals()
     {
         float fMaxKeyCY = m_pRenderer->GetBufferHeight() * KBPercent;
         float fIdealKeyCY = m_fWhiteCX / KeyRatio;
-        // .95 for the top vs near. 2.0 for the spacer. .93 for the transition and the red. ESTIMATE.
         fIdealKeyCY = ( fIdealKeyCY / 0.95f + 2.0f ) / 0.93f;
         m_fNotesCY = floor( m_pRenderer->GetBufferHeight() - min( fIdealKeyCY, fMaxKeyCY ) + 0.5f );
     }
 
-    // Round down start time. This is only used for rendering purposes
     if (m_bTickMode) {
         m_llRndStartTime = m_iStartTick;
     } else {
@@ -1687,7 +2401,6 @@ void MainScreen::RenderLines()
 
     m_pRenderer->DrawRect( m_fNotesX, m_fNotesY, m_fNotesCX, m_fNotesCY, m_csBackground.iPrimaryRGB );
 
-    // Vertical lines
     for ( int i = m_iStartNote + 1; i <= m_iEndNote; i++ )
         if ( !MIDI::IsSharp( i - 1 ) && !MIDI::IsSharp( i ) )
         {
@@ -1699,35 +2412,30 @@ void MainScreen::RenderLines()
                 m_csBackground.iDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iDarkRGB );
         }
 
-    // Horizontal (Hard!)
+    if (!m_MIDI.IsValid())
+        return;
     int iDivision = m_MIDI.GetInfo().iDivision;
-    // fuck this lmao
     if ( !( iDivision & 0x8000 ) )
     {
-        // Copy time state vars
         int iCurrTick = m_iStartTick - 1;
         long long llEndTime = (m_bTickMode ? m_iStartTick : m_llStartTime) + m_llTimeSpan;
 
-        // Copy tempo state vars
         uint32_t iLastTempoTick = m_iLastTempoTick;
         uint32_t iMicroSecsPerBeat = m_iMicroSecsPerBeat;
         long long llLastTempoTime = m_llLastTempoTime;
         eventvec_t::const_iterator itNextTempo = m_itNextTempo;
 
-        // Copy signature state vars
         int iLastSignatureTick = m_iLastSignatureTick;
         int iBeatsPerMeasure = m_iBeatsPerMeasure;
         int iBeatType = m_iBeatType;
         eventvec_t::const_iterator itNextSignature = m_itNextSignature;
 
-        // Compute initial next beat tick and next beat time
         long long llNextBeatTime = 0;
         int iNextBeatTick = 0;
         do
         {
             iNextBeatTick = GetBeatTick( iCurrTick + 1, iBeatType, iLastSignatureTick );
 
-            // Next beat crosses the next tempo event. handle the event and recalculate next beat time
             while ( itNextTempo != m_vTempo.end() && m_vMetaEvents[itNextTempo->second]->GetDataLen() == 3 &&
                     iNextBeatTick > m_vMetaEvents[itNextTempo->second]->GetAbsT() )
             {
@@ -1748,7 +2456,6 @@ void MainScreen::RenderLines()
                 ++itNextSignature;
             }
 
-            // Finally render the beat or measure
             int iNextBeat = GetBeat( iNextBeatTick, iBeatType, iLastSignatureTick );
             bool bIsMeasure = !( ( iNextBeat < 0 ? -iNextBeat : iNextBeat ) % iBeatsPerMeasure );
             llNextBeatTime = GetTickTime( iNextBeatTick, iLastTempoTick, llLastTempoTime, iMicroSecsPerBeat ); 
@@ -1761,24 +2468,41 @@ void MainScreen::RenderLines()
             iCurrTick = iNextBeatTick;
         }
         while ((m_bTickMode ? iNextBeatTick : llNextBeatTime) <= llEndTime );
-        // hopefully no race condition?
     }
+}
+
+float MainScreen::GetCorruptorAmount() const
+{
+    if (!m_pRenderer->m_bCorruptorRamp)
+        return m_pRenderer->m_fCorruption;
+
+    double dMin = (double)GetMinTime();
+    double dMax = (double)GetMaxTime();
+    if (dMax <= dMin)
+        return 1.0f;
+
+    double dRamp = ((double)m_llStartTime - dMin) / (dMax - dMin);
+    dRamp = min(max(dRamp, 0.0), 1.0);
+    return (float)dRamp;
 }
 
 void MainScreen::RenderNotes()
 {
-    // Do we have any notes to render?
-    if ( m_iEndPos < 0 || m_iStartPos >= (int64_t)m_vEvents.size() )
-        return;
+    const int64_t eventCount = (int64_t)m_vEvents.size();
+    const bool hasStrip = Config::GetConfig().GetVizSettings().bDualPianoRoll;
 
-    // Ensure that any rects rendered after this point render over the notes
+    if ( m_iEndPos < 0 || m_iStartPos >= eventCount )
+    {
+        if (!hasStrip)
+            return;
+    }
+
     m_pRenderer->SplitRect();
 
     for (auto i = m_iEndPos; i >= m_iStartPos; i--) {
-        MIDIChannelEvent* pEvent = m_vEvents[i];
-        if (pEvent->GetChannelEventType() == MIDIChannelEvent::NoteOn &&
-            pEvent->GetParam2() > 0 && pEvent->HasSister() /* &&
-            ((m_aSkipRender[pEvent->GetParam1() / 64] >> (pEvent->GetParam1() & 63)) & 1) == 0 */) {
+        MIDIChannelEvent pEvent = m_vEvents[i];
+        if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+            m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
             RenderNote(pEvent);
         }
     }
@@ -1786,49 +2510,81 @@ void MainScreen::RenderNotes()
     for (size_t i = 0; i < 128; i++) {
         for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
             RenderNote(m_vEvents[*it]);
-            /*
-            if ((m_aSkipRender[i / 64] >> (i & 63)) & 1)
-                break;
-            */
+        }
+    }
+
+    if (hasStrip) {
+        const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan(
+            (float)m_llTimeSpan, m_fNotesCY);
+        const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
+
+
+        {
+            int64_t hi = max<int64_t>(m_iStartPos, 0);
+            while (hi < eventCount) {
+                MIDIChannelEvent pEvent = m_vEvents[hi];
+                const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
+                if (eventTime >= stripEnd)
+                    break;
+                hi++;
+            }
+            for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); i--) {
+                MIDIChannelEvent pEvent = m_vEvents[i];
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                    m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
+                    RenderPianoRollStripNote(pEvent);
+                }
+            }
+        }
+
+        for (size_t i = 0; i < 128; i++) {
+            for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
+                RenderPianoRollStripNote(m_vEvents[*it]);
+            }
         }
     }
 
     m_pRenderer->RenderBatch(true);
 }
 
-void MainScreen::RenderNote(const MIDIChannelEvent* pNote)
+NoteData MainScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
 {
-    int iNote = pNote->GetParam1();
-    int iTrack = pNote->GetTrack();
-    int iChannel = pNote->GetChannel();
-    long long llNoteStart = pNote->GetAbsMicroSec();
-    long long llNoteEnd = llNoteStart + pNote->GetLength();
+    int iNote = m_MIDI.GetEventParam1(pNote);
+    int iTrack = m_MIDI.GetEventTrack(pNote);
+    int iChannel = m_MIDI.GetEventChannel(pNote);
+    long long llNoteStart = m_MIDI.GetEventTime(pNote);
+    long long llNoteLength = m_MIDI.GetEventLength(pNote);
     if (m_bTickMode) {
-        llNoteStart = pNote->GetAbsT();
-        llNoteEnd = pNote->GetSister(m_vEvents)->GetAbsT();
+        llNoteStart = m_MIDI.GetEventAbsT(pNote);
+        llNoteLength = m_MIDI.GetEventAbsT(m_vEvents[m_MIDI.GetEventSisterIdx(pNote)]) - llNoteStart;
     }
 
-    // If a note is taking up the whole column, we can reasonably assume nothing behind it is visible
-    /*
-    if (llNoteStart < m_llRndStartTime && llNoteEnd > m_llRndStartTime + m_llTimeSpan)
-        m_aSkipRender[iNote / 64] |= (1uLL << (iNote & 63));
-    */
+    CorruptNote(GetCorruptorAmount(), CorruptSeed(pNote, m_vEvents[m_MIDI.GetEventSisterIdx(pNote)]),
+        iNote, iTrack, iChannel, llNoteStart, llNoteLength, m_llTimeSpan, m_vTrackSettings.size());
 
-    m_pRenderer->PushNoteData(
-        NoteData{
-            .key = (uint8_t)iNote,
-            .channel = (uint8_t)iChannel,
-            .track = (uint16_t)iTrack,
-            .pos = static_cast<float>(llNoteStart - m_llRndStartTime),
-            .length = static_cast<float>(llNoteEnd - llNoteStart),
-        }
-    );
+    return NoteData{
+        .key = (uint8_t)iNote,
+        .channel = (uint8_t)iChannel,
+        .track = (uint16_t)iTrack,
+        .pos = static_cast<float>(llNoteStart - m_llRndStartTime),
+        .length = static_cast<float>(llNoteLength),
+    };
+}
+
+void MainScreen::RenderNote(const MIDIChannelEvent pNote)
+{
+    m_pRenderer->PushNoteData(BuildRenderNoteData(pNote));
+}
+
+void MainScreen::RenderPianoRollStripNote(const MIDIChannelEvent pNote)
+{
+    m_pRenderer->PushPianoRollStripNoteData(BuildRenderNoteData(pNote));
 }
 
 void MainScreen::GenNoteXTable() {
-    int min_key = min(max(0, m_iStartNote), 127);
-    int max_key = min(max(0, m_iEndNote), 127);
-    for (int i = min_key; i <= max_key; i++) {
+    const float fEdgeLeft = m_fNotesX;
+    const float fEdgeRight = m_fNotesX + m_fNotesCX - m_fWhiteCX;
+    for (int i = 0; i <= 127; i++) {
         int iWhiteKeys = MIDI::WhiteCount(m_iStartNote, i);
         float fStartX = (MIDI::IsSharp(m_iStartNote) - MIDI::IsSharp(i)) * SharpRatio / 2.0f;
         if (MIDI::IsSharp(i))
@@ -1837,7 +2593,8 @@ void MainScreen::GenNoteXTable() {
             if (eNote == MIDI::CS || eNote == MIDI::FS) fStartX -= SharpRatio / 5.0f;
             else if (eNote == MIDI::AS || eNote == MIDI::DS) fStartX += SharpRatio / 5.0f;
         }
-        notex_table[i] = m_fNotesX + m_fWhiteCX * (iWhiteKeys + fStartX);
+        const float fX = m_fNotesX + m_fWhiteCX * (iWhiteKeys + fStartX);
+        notex_table[i] = i < m_iStartNote ? fEdgeLeft : (i > m_iEndNote ? fEdgeRight : fX);
     }
 }
 
@@ -1847,7 +2604,6 @@ float MainScreen::GetNoteX(int iNote) {
 
 void MainScreen::RenderKeys()
 {
-    // Screen info
     float fKeysY = m_fNotesY + m_fNotesCY;
     float fKeysCY = m_pRenderer->GetBufferHeight() - m_fNotesCY;
 
@@ -1859,7 +2615,16 @@ void MainScreen::RenderKeys()
     float fTopCY = floor( ( fKeysCY - fSpacerCY - fRedCY - fTransitionCY ) * 0.95f + 0.5f );
     float fNearCY = fKeysCY - fSpacerCY - fRedCY - fTransitionCY - fTopCY;
 
-    // Draw the background
+    m_pRenderer->SetRibbonArea(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY);
+
+    const bool bBloom = Config::GetConfig().GetVizSettings().bBloom;
+    auto darken32 = [](DWORD c, float f) -> DWORD {
+        DWORD r = (DWORD)(((c >> 16) & 0xFF) * f);
+        DWORD g = (DWORD)(((c >> 8) & 0xFF) * f);
+        DWORD b = (DWORD)((c & 0xFF) * f);
+        return (c & 0xFF000000) | (min(r, 255u) << 16) | (min(g, 255u) << 8) | min(b, 255u);
+    };
+    float kb = bBloom ? 0.25f : 1.0f;
     if (m_bBackgroundLoaded) {
         auto dark = 0x80000000;
         auto very_dark = 0x00000000;
@@ -1867,19 +2632,22 @@ void MainScreen::RenderKeys()
         m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fTransitionCY,
             0xFF000000, 0xFF000000, very_dark, very_dark);
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY,
-            m_csKBRed.iDarkRGB, m_csKBRed.iDarkRGB, m_csKBRed.iPrimaryRGB, m_csKBRed.iPrimaryRGB);
+            darken32(m_csKBRed.iDarkRGB, kb), darken32(m_csKBRed.iDarkRGB, kb),
+            darken32(m_csKBRed.iPrimaryRGB, kb), darken32(m_csKBRed.iPrimaryRGB, kb));
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY + fRedCY, m_fNotesCX, fSpacerCY, dark);
     } else {
-        m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fKeysCY, m_csKBBackground.iVeryDarkRGB);
+        m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fKeysCY, darken32(m_csKBBackground.iVeryDarkRGB, kb));
         m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fTransitionCY,
-            m_csBackground.iPrimaryRGB, m_csBackground.iPrimaryRGB, m_csKBBackground.iVeryDarkRGB, m_csKBBackground.iVeryDarkRGB);
+            darken32(m_csBackground.iPrimaryRGB, kb), darken32(m_csBackground.iPrimaryRGB, kb),
+            darken32(m_csKBBackground.iVeryDarkRGB, kb), darken32(m_csKBBackground.iVeryDarkRGB, kb));
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY,
-            m_csKBRed.iDarkRGB, m_csKBRed.iDarkRGB, m_csKBRed.iPrimaryRGB, m_csKBRed.iPrimaryRGB);
+            darken32(m_csKBRed.iDarkRGB, kb), darken32(m_csKBRed.iDarkRGB, kb),
+            darken32(m_csKBRed.iPrimaryRGB, kb), darken32(m_csKBRed.iPrimaryRGB, kb));
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY + fRedCY, m_fNotesCX, fSpacerCY,
-            m_csKBBackground.iDarkRGB, m_csKBBackground.iDarkRGB, m_csKBBackground.iDarkRGB, m_csKBBackground.iDarkRGB);
+            darken32(m_csKBBackground.iDarkRGB, kb), darken32(m_csKBBackground.iDarkRGB, kb),
+            darken32(m_csKBBackground.iDarkRGB, kb), darken32(m_csKBBackground.iDarkRGB, kb));
     }
 
-    // Keys info
     float fKeyGap = max( 1.0f, floor( m_fWhiteCX * 0.05f + 0.5f ) );
     float fKeyGap1 = fKeyGap - floor( fKeyGap / 2.0f + 0.5f );
 
@@ -1888,7 +2656,50 @@ void MainScreen::RenderKeys()
     float fStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * ( SharpRatio / 2.0f - 1.0f ) : 0.0f );
     float fSharpCY = fTopCY * 0.67f;
 
-    // Draw the white keys
+    if (Config::GetConfig().GetVizSettings().bColoredRibbon) {
+        float fRibX = m_fNotesX + fStartX;
+        float fRibY = fKeysY + fTransitionCY;
+        for ( int i = iStartRender; i <= iEndRender; i++ )
+            if ( !MIDI::IsSharp( i ) )
+            {
+                if ( m_pNoteState[i] != -1 )
+                {
+                    MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                    const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                    const int iChannel = m_MIDI.GetEventChannel(pEvent);
+                    const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
+                    m_pRenderer->DrawRect( fRibX, fRibY, m_fWhiteCX, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                }
+                fRibX += m_fWhiteCX;
+            }
+        iStartRender = ( m_iStartNote != MIDI::A0 && !MIDI::IsSharp( m_iStartNote ) && m_iStartNote > 0 && MIDI::IsSharp( m_iStartNote - 1 ) ? m_iStartNote - 1 : m_iStartNote );
+        iEndRender = ( m_iEndNote != MIDI::C8 && !MIDI::IsSharp( m_iEndNote ) && m_iEndNote < 127 && MIDI::IsSharp( m_iEndNote + 1 ) ? m_iEndNote + 1 : m_iEndNote );
+        float fSharpStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * SharpRatio / 2.0f : 0.0f );
+        fRibX = m_fNotesX + fSharpStartX;
+        for ( int i = iStartRender; i <= iEndRender; i++ )
+            if ( !MIDI::IsSharp( i ) )
+                fRibX += m_fWhiteCX;
+            else
+            {
+                if ( m_pNoteState[i] != -1 )
+                {
+                    MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                    const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                    const int iChannel = m_MIDI.GetEventChannel(pEvent);
+                    const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
+                    float fNudgeX = 0.0;
+                    MIDI::Note eNote = MIDI::NoteVal( i );
+                    if ( eNote == MIDI::CS || eNote == MIDI::FS ) fNudgeX = -SharpRatio / 5.0f;
+                    else if ( eNote == MIDI::AS || eNote == MIDI::DS ) fNudgeX = SharpRatio / 5.0f;
+                    const float cx = m_fWhiteCX * SharpRatio;
+                    const float x = fRibX - m_fWhiteCX * ( SharpRatio / 2.0f - fNudgeX );
+                    m_pRenderer->DrawRect( x, fRibY, cx, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                }
+            }
+        iStartRender = ( MIDI::IsSharp( m_iStartNote ) ? m_iStartNote - 1 : m_iStartNote );
+        iEndRender = ( MIDI::IsSharp( m_iEndNote ) ? m_iEndNote + 1 : m_iEndNote );
+    }
+
     float fCurX = m_fNotesX + fStartX;
     float fCurY = fKeysY + fTransitionCY + fRedCY + fSpacerCY;
     for ( int i = iStartRender; i <= iEndRender; i++ )
@@ -1896,26 +2707,29 @@ void MainScreen::RenderKeys()
         {
             if ( m_pNoteState[i] == -1 )
             {
+                DWORD kbPrimary = darken32(m_csKBWhite.iPrimaryRGB, kb);
+                DWORD kbDark = darken32(m_csKBWhite.iDarkRGB, kb);
+                DWORD kbVeryDark = darken32(m_csKBWhite.iVeryDarkRGB, kb);
                 m_pRenderer->DrawRect( fCurX + fKeyGap1 , fCurY, m_fWhiteCX - fKeyGap, fTopCY + fNearCY,
-                    m_csKBWhite.iDarkRGB, m_csKBWhite.iDarkRGB, m_csKBWhite.iPrimaryRGB, m_csKBWhite.iPrimaryRGB );
+                    kbDark, kbDark, kbPrimary, kbPrimary );
                 m_pRenderer->DrawRect( fCurX + fKeyGap1 , fCurY + fTopCY, m_fWhiteCX - fKeyGap, fNearCY,
-                    m_csKBWhite.iDarkRGB, m_csKBWhite.iDarkRGB, m_csKBWhite.iVeryDarkRGB, m_csKBWhite.iVeryDarkRGB );
+                    kbDark, kbDark, kbVeryDark, kbVeryDark );
                 m_pRenderer->DrawRect( fCurX + fKeyGap1, fCurY + fTopCY, m_fWhiteCX - fKeyGap, 2.0f,
-                    m_csKBBackground.iDarkRGB, m_csKBBackground.iDarkRGB, m_csKBWhite.iVeryDarkRGB, m_csKBWhite.iVeryDarkRGB );
+                    m_csKBBackground.iDarkRGB, m_csKBBackground.iDarkRGB, kbVeryDark, kbVeryDark );
 
                 if ( i == MIDI::C4 )
                 {
                     float fMXGap = floor( m_fWhiteCX * 0.25f + 0.5f );
                     float fMCX = m_fWhiteCX - fMXGap * 2.0f - fKeyGap;
                     float fMY = max( fCurY + fTopCY - fMCX - 5.0f, fCurY + fSharpCY + 5.0f );
-                    m_pRenderer->DrawRect( fCurX + fKeyGap1 + fMXGap, fMY, fMCX, fCurY + fTopCY - 5.0f - fMY, m_csKBWhite.iDarkRGB );
+                    m_pRenderer->DrawRect( fCurX + fKeyGap1 + fMXGap, fMY, fMCX, fCurY + fTopCY - 5.0f - fMY, kbDark );
                 }
             }
             else
             {
-                const MIDIChannelEvent *pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : NULL );
-                const int iTrack = pEvent->GetTrack() % MaxTrackColors;
-                const int iChannel = pEvent->GetChannel();
+                MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                const int iChannel = m_MIDI.GetEventChannel(pEvent);
 
                 ChannelSettings &csKBWhite = m_vTrackSettings[iTrack].aChannels[iChannel];
                 m_pRenderer->DrawRect( fCurX + fKeyGap1 , fCurY, m_fWhiteCX - fKeyGap, fTopCY + fNearCY - 2.0f,
@@ -1931,12 +2745,12 @@ void MainScreen::RenderKeys()
                 }
             }
             m_pRenderer->DrawRect( floor( fCurX + fKeyGap1 + m_fWhiteCX - fKeyGap + 0.5f ), fCurY, fKeyGap, fTopCY + fNearCY,
-                m_csKBBackground.iVeryDarkRGB, m_csKBBackground.iPrimaryRGB, m_csKBBackground.iPrimaryRGB, m_csKBBackground.iVeryDarkRGB );
+                darken32(m_csKBBackground.iVeryDarkRGB, kb), darken32(m_csKBBackground.iPrimaryRGB, kb),
+                darken32(m_csKBBackground.iPrimaryRGB, kb), darken32(m_csKBBackground.iVeryDarkRGB, kb) );
 
             fCurX += m_fWhiteCX;
         }
 
-    // Draw the sharps
     iStartRender = ( m_iStartNote != MIDI::A0 && !MIDI::IsSharp( m_iStartNote ) && m_iStartNote > 0 && MIDI::IsSharp( m_iStartNote - 1 ) ? m_iStartNote - 1 : m_iStartNote );
     iEndRender = ( m_iEndNote != MIDI::C8 && !MIDI::IsSharp( m_iEndNote ) && m_iEndNote < 127 && MIDI::IsSharp( m_iEndNote + 1 ) ? m_iEndNote + 1 : m_iEndNote );
     fStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * SharpRatio / 2.0f : 0.0f );
@@ -1961,35 +2775,38 @@ void MainScreen::RenderKeys()
 
             if ( m_pNoteState[i] == -1 )
             {
+                DWORD ksPrimary = darken32(m_csKBSharp.iPrimaryRGB, kb);
+                DWORD ksDark = darken32(m_csKBSharp.iDarkRGB, kb);
+                DWORD ksVeryDark = darken32(m_csKBSharp.iVeryDarkRGB, kb);
                 m_pRenderer->DrawSkew( fSharpTopX1, fCurY + fSharpCY - fNearCY,
                                        fSharpTopX2, fCurY + fSharpCY - fNearCY,
                                        x + cx, fCurY + fSharpCY, x, fCurY + fSharpCY,
-                                       m_csKBSharp.iPrimaryRGB, m_csKBSharp.iPrimaryRGB, m_csKBSharp.iVeryDarkRGB, m_csKBSharp.iVeryDarkRGB );
+                                       ksPrimary, ksPrimary, ksVeryDark, ksVeryDark );
                 m_pRenderer->DrawSkew( fSharpTopX1, fCurY - fNearCY,
                                        fSharpTopX1, fCurY + fSharpCY - fNearCY,
                                        x, fCurY + fSharpCY, x, fCurY,
-                                       m_csKBSharp.iPrimaryRGB, m_csKBSharp.iPrimaryRGB, m_csKBSharp.iVeryDarkRGB, m_csKBSharp.iVeryDarkRGB );
+                                       ksPrimary, ksPrimary, ksVeryDark, ksVeryDark );
                 m_pRenderer->DrawSkew( fSharpTopX2, fCurY + fSharpCY - fNearCY,
                                        fSharpTopX2, fCurY - fNearCY,
                                        x + cx, fCurY, x + cx, fCurY + fSharpCY,
-                                       m_csKBSharp.iPrimaryRGB, m_csKBSharp.iPrimaryRGB, m_csKBSharp.iVeryDarkRGB, m_csKBSharp.iVeryDarkRGB );
-                m_pRenderer->DrawRect( fSharpTopX1, fCurY - fNearCY, fSharpTopX2 - fSharpTopX1, fSharpCY, m_csKBSharp.iVeryDarkRGB );
+                                       ksPrimary, ksPrimary, ksVeryDark, ksVeryDark );
+                m_pRenderer->DrawRect( fSharpTopX1, fCurY - fNearCY, fSharpTopX2 - fSharpTopX1, fSharpCY, ksVeryDark );
                 m_pRenderer->DrawSkew( fSharpTopX1, fCurY - fNearCY,
                                        fSharpTopX2, fCurY - fNearCY,
                                        fSharpTopX2, fCurY - fNearCY + fSharpCY * 0.45f,
                                        fSharpTopX1, fCurY - fNearCY + fSharpCY * 0.35f,
-                                       m_csKBSharp.iDarkRGB, m_csKBSharp.iDarkRGB, m_csKBSharp.iPrimaryRGB, m_csKBSharp.iPrimaryRGB );
+                                       ksDark, ksDark, ksPrimary, ksPrimary );
                 m_pRenderer->DrawSkew( fSharpTopX1, fCurY - fNearCY + fSharpCY * 0.35f,
                                        fSharpTopX2, fCurY - fNearCY + fSharpCY * 0.45f,
                                        fSharpTopX2, fCurY - fNearCY + fSharpCY * 0.65f,
                                        fSharpTopX1, fCurY - fNearCY + fSharpCY * 0.55f,
-                                       m_csKBSharp.iPrimaryRGB, m_csKBSharp.iPrimaryRGB, m_csKBSharp.iVeryDarkRGB, m_csKBSharp.iVeryDarkRGB );
+                                       ksPrimary, ksPrimary, ksVeryDark, ksVeryDark );
             }
             else
             {
-                const MIDIChannelEvent *pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : NULL );
-                const int iTrack = pEvent->GetTrack() % MaxTrackColors;
-                const int iChannel = pEvent->GetChannel();
+                MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                const int iChannel = m_MIDI.GetEventChannel(pEvent);
 
                 const float fNewNear = fNearCY * 0.25f;
 
@@ -2052,11 +2869,13 @@ void MainScreen::RenderText()
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
 
-    int iLines = 2;
+    int iLines = IsFreePlay() ? 1 : 2;
     if (m_bShowFPS && !m_bDumpFrames)
         iLines++;
     if (viz.bNerdStats)
-        iLines += 2;
+        iLines += 7;
+    if (viz.bNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+        iLines += 3;
     if (m_Timer.m_bManualTimer && !m_bDumpFrames)
         iLines++;
 
@@ -2078,7 +2897,7 @@ void MainScreen::RenderText()
     m_pRenderer->EndText();
 }
 
-void MainScreen::RenderStatusLine(int line, float width, const char* left, const char* format, ...) {
+void MainScreen::RenderStatusLine(int line, float width, float yOffset, float rightEdge, const char* left, const char* format, ...) {
     va_list varargs;
     va_start(varargs, format);
 
@@ -2087,8 +2906,9 @@ void MainScreen::RenderStatusLine(int line, float width, const char* left, const
     vsnprintf_s(buf, sizeof(buf), format, varargs);
 
     auto draw_list = m_pRenderer->GetDrawList();
-    ImVec2 left_pos = ImVec2(m_pRenderer->GetBufferWidth() - width + 6 * scale, (3 + line * 16) * scale);
-    ImVec2 right_pos = ImVec2(m_pRenderer->GetBufferWidth() - ImGui::CalcTextSize(buf).x - 6 * scale, (3 + line * 16) * scale);
+    float y = yOffset + (3 + line * 16) * scale;
+    ImVec2 left_pos = ImVec2(rightEdge - width + 6 * scale, y);
+    ImVec2 right_pos = ImVec2(rightEdge - ImGui::CalcTextSize(buf).x - 6 * scale, y);
     draw_list->AddText(ImVec2(left_pos.x + 2, left_pos.y + 1), 0xFF404040, left);
     draw_list->AddText(ImVec2(left_pos.x, left_pos.y), 0xFFFFFFFF, left);
     draw_list->AddText(ImVec2(right_pos.x + 2, right_pos.y + 1), 0xFF404040, buf);
@@ -2102,46 +2922,149 @@ void MainScreen::RenderStatus(int lines)
     // Time
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
-    const MIDI::MIDIInfo& mInfo = m_MIDI.GetInfo();
-    auto starttime = ((m_llStartTime >= 0) ? m_llStartTime : -m_llStartTime);
+    const bool bFreePlay = IsFreePlay();
+    long long llTotalMicroSecs = 0;
+    if (!bFreePlay)
+        llTotalMicroSecs = m_MIDI.GetInfo().llTotalMicroSecs;
+    auto starttime = ((m_llDisplayTime >= 0) ? m_llDisplayTime : -m_llDisplayTime);
 
     auto min = starttime / 60000000;
     auto sec = (starttime % 60000000) / 1000000;
     auto cs = (starttime % 1000000) / 100000;
-    auto tmin = mInfo.llTotalMicroSecs / 60000000;
-    auto tsec = (mInfo.llTotalMicroSecs % 60000000) / 1000000;
-    auto tcs = (mInfo.llTotalMicroSecs % 1000000) / 100000;
-    auto tempo = 60000000.0 / m_iMicroSecsPerBeat;
+    auto tmin = llTotalMicroSecs / 60000000;
+    auto tsec = (llTotalMicroSecs % 60000000) / 1000000;
+    auto tcs = (llTotalMicroSecs % 1000000) / 100000;
 
     char time_buf[1024] = {};
-    snprintf(time_buf, sizeof(time_buf) - 1,
-        "%s%lld:%02lld.%lld / %lld:%02lld.%lld",
-        m_llStartTime >= 0 ? "" : "-",
-        min, sec, cs,
-        tmin, tsec, tcs);
+    if (bFreePlay)
+        snprintf(time_buf, sizeof(time_buf) - 1,
+            "%s%lld:%02lld.%lld",
+            m_llDisplayTime >= 0 ? "" : "-",
+            min, sec, cs);
+    else
+        snprintf(time_buf, sizeof(time_buf) - 1,
+            "%s%lld:%02lld.%lld / %lld:%02lld.%lld",
+            m_llDisplayTime >= 0 ? "" : "-",
+            min, sec, cs,
+            tmin, tsec, tcs);
     float width = max(156 * viz.fUIScale, ImGui::CalcTextSize("Time:").x + ImGui::CalcTextSize(time_buf).x + 24.0f * viz.fUIScale);
     int cur_line = 0;
-    m_pRenderer->GetDrawList()->AddRectFilled(
-        ImVec2(m_pRenderer->GetBufferWidth() - width, 0.0f),
-        ImVec2(m_pRenderer->GetBufferWidth(), (6 + 16 * lines) * viz.fUIScale),
-        0x80000000
+    const float contentTop = ImGui::GetFrameHeight() + 35.0f;
+    float toolbarBottom = contentTop + 10.0f;
+    if (viz.bDualPianoRoll) {
+        const float stripH = max(190.0f, min((float)m_pRenderer->GetBufferHeight() * 0.45f,
+            (float)m_pRenderer->GetBufferHeight() * 0.28f));
+        toolbarBottom = 20.0f + 35.0f + stripH + 10.0f;
+    }
+    float overlayH = (6 + 16 * lines) * viz.fUIScale;
+    float bh = (float)m_pRenderer->GetBufferHeight();
+    const float statusRight = (float)m_pRenderer->GetBufferWidth() - 10.0f;
+    const float statusLeft = statusRight - width;
+    const float blurPad = 10.0f;
+    const float blurLeft = max(0.0f, statusLeft - blurPad);
+    const float blurTop = max(0.0f, toolbarBottom - blurPad);
+    const float blurRight = min((float)m_pRenderer->GetBufferWidth(), statusRight + blurPad);
+    const float blurBottom = min((float)m_pRenderer->GetBufferHeight(), toolbarBottom + overlayH + blurPad);
+    const ImTextureID blurTexture = (ImTextureID)m_pRenderer->GetBlurTextureID();
+    auto uv = [=](const ImVec2& p) {
+        return ImVec2(p.x / (float)m_pRenderer->GetBufferWidth(), p.y / bh);
+    };
+    auto addGradientImageQuad = [&](const ImVec2& p1, const ImVec2& p2,
+                                    const ImVec2& p3, const ImVec2& p4,
+                                    ImU32 c1, ImU32 c2, ImU32 c3, ImU32 c4) {
+        if (!blurTexture)
+            return;
+        auto drawList = m_pRenderer->GetDrawList();
+        drawList->PushTextureID(blurTexture);
+        drawList->PrimReserve(6, 6);
+        drawList->PrimVtx(p1, uv(p1), c1);
+        drawList->PrimVtx(p2, uv(p2), c2);
+        drawList->PrimVtx(p3, uv(p3), c3);
+        drawList->PrimVtx(p1, uv(p1), c1);
+        drawList->PrimVtx(p3, uv(p3), c3);
+        drawList->PrimVtx(p4, uv(p4), c4);
+        drawList->PopTextureID();
+    };
+    const ImU32 blurOpaque = IM_COL32(255, 255, 255, 255);
+    const ImU32 blurTransparent = IM_COL32(255, 255, 255, 0);
+
+    m_pRenderer->GetDrawList()->AddImage(
+        blurTexture,
+        ImVec2(statusLeft, toolbarBottom),
+        ImVec2(statusRight, toolbarBottom + overlayH),
+        uv(ImVec2(statusLeft, toolbarBottom)),
+        uv(ImVec2(statusRight, toolbarBottom + overlayH))
     );
 
-    RenderStatusLine(cur_line++, width, "Time:", time_buf);
-    RenderStatusLine(cur_line++, width, "Tempo:", "%.3lf bpm", tempo);
+    addGradientImageQuad(
+        ImVec2(statusLeft, blurTop), ImVec2(statusRight, blurTop),
+        ImVec2(statusRight, toolbarBottom), ImVec2(statusLeft, toolbarBottom),
+        blurTransparent, blurTransparent, blurOpaque, blurOpaque);
+    addGradientImageQuad(
+        ImVec2(statusLeft, toolbarBottom + overlayH), ImVec2(statusRight, toolbarBottom + overlayH),
+        ImVec2(statusRight, blurBottom), ImVec2(statusLeft, blurBottom),
+        blurOpaque, blurOpaque, blurTransparent, blurTransparent);
 
-    // Framerate
+    addGradientImageQuad(
+        ImVec2(blurLeft, toolbarBottom), ImVec2(statusLeft, toolbarBottom),
+        ImVec2(statusLeft, toolbarBottom + overlayH), ImVec2(blurLeft, toolbarBottom + overlayH),
+        blurTransparent, blurOpaque, blurOpaque, blurTransparent);
+    addGradientImageQuad(
+        ImVec2(statusRight, toolbarBottom), ImVec2(blurRight, toolbarBottom),
+        ImVec2(blurRight, toolbarBottom + overlayH), ImVec2(statusRight, toolbarBottom + overlayH),
+        blurOpaque, blurTransparent, blurTransparent, blurOpaque);
+
+    addGradientImageQuad(
+        ImVec2(blurLeft, blurTop), ImVec2(statusLeft, blurTop),
+        ImVec2(statusLeft, toolbarBottom), ImVec2(blurLeft, toolbarBottom),
+        blurTransparent, blurTransparent, blurOpaque, blurTransparent);
+    addGradientImageQuad(
+        ImVec2(statusRight, blurTop), ImVec2(blurRight, blurTop),
+        ImVec2(blurRight, toolbarBottom), ImVec2(statusRight, toolbarBottom),
+        blurTransparent, blurTransparent, blurTransparent, blurOpaque);
+    addGradientImageQuad(
+        ImVec2(blurLeft, toolbarBottom + overlayH), ImVec2(statusLeft, toolbarBottom + overlayH),
+        ImVec2(statusLeft, blurBottom), ImVec2(blurLeft, blurBottom),
+        blurTransparent, blurOpaque, blurTransparent, blurTransparent);
+    addGradientImageQuad(
+        ImVec2(statusRight, toolbarBottom + overlayH), ImVec2(blurRight, toolbarBottom + overlayH),
+        ImVec2(blurRight, blurBottom), ImVec2(statusRight, blurBottom),
+        blurOpaque, blurTransparent, blurTransparent, blurTransparent);
+
+    m_pRenderer->GetDrawList()->AddRectFilled(
+        ImVec2(statusLeft, toolbarBottom),
+        ImVec2(statusRight, toolbarBottom + overlayH),
+        0x40000000
+    );
+
+    RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Time:", time_buf);
+    if (!bFreePlay)
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Tempo:", "%.3lf bpm", 60000000.0 / m_iMicroSecsPerBeat);
+
     if (m_bShowFPS && !m_bDumpFrames)
-        RenderStatusLine(cur_line++, width, "FPS:", "%.1lf", m_dFPS);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "FPS:", "%.1lf", m_dFPS);
 
-    // Nerd stats
     if (viz.bNerdStats) {
         long long nps = 0;
         for (size_t i = 0; i < m_dNPSNotes.size(); i++)
             nps += std::get<1>(m_dNPSNotes[i]);
 
-        RenderStatusLine(cur_line++, width, "NPS:", "%lld", nps);
-        RenderStatusLine(cur_line++, width, "Rendered:", "%llu", m_pRenderer->GetRenderedNotesCount());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "NPS:", "%lld", nps);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Rendered:", "%llu", m_pRenderer->GetRenderedNotesCount());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "File notes:", "%llu", m_MIDI.GetInfo().iNoteCount);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "MIDI sent:", "%llu", m_OutDevice.GetEventsSent());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "MIDI failed:", "%llu", m_OutDevice.GetSendFailures());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "MaxLate:", "%lld ms", m_llMaxLateMicros / 1000);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Late evts:", "%llu", m_ullLateEvents);
+    }
+
+    if (viz.bNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    {
+        char buf[64] = {};
+        snprintf(buf, sizeof(buf) - 1, "%6.1f ms", PRE_MIDIAudio->GetBufferSeconds() * 1000.0);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Buffer:", buf);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Underruns:", "%llu", PRE_MIDIAudio->GetBufferUnderruns());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Voices:", "%d", PRE_MIDIAudio->m_iDefaultVoices);
     }
 }
 
@@ -2173,4 +3096,819 @@ void MainScreen::RenderMessage(LPRECT prcMsg, TCHAR* sMsg)
     m_pRenderer->DrawText(sMsg, eFontSize, &rcMsg, 0, 0xFF404040);
     OffsetRect(&rcMsg, -2, -2);
     m_pRenderer->DrawText(sMsg, eFontSize, &rcMsg, 0, 0xFFFFFFFF);
+}
+
+
+FreePlayScreen::FreePlayScreen(HWND hWnd, D3D12Renderer* pRenderer)
+    : MainScreen(L"", GameState::Practice, hWnd, pRenderer)
+{
+    InitColors();
+
+    m_vTrackSettings.resize(MaxTrackColors);
+    for (int i = 0; i < MaxTrackColors; i++)
+        m_vFreeSlots.push_back(i);
+
+    static Config& config = Config::GetConfig();
+    static const VisualSettings& cVisual = config.GetVisualSettings();
+    static const PlaybackSettings& cPlayback = config.GetPlaybackSettings();
+    static const ViewSettings& cView = config.GetViewSettings();
+    m_iStartNote = min(cVisual.iFirstKey, cVisual.iLastKey);
+    m_iEndNote = max(cVisual.iFirstKey, cVisual.iLastKey);
+    m_eKeysShown = cVisual.eKeysShown;
+
+    m_dSpeed = 1.0;
+    m_bPaused = false;
+    m_llTimeSpan = 3000000LL; // 3 seconds visible
+    m_llStartTime = 0;
+    m_llDisplayTime = 0;
+    m_llRndStartTime = 0;
+    m_iStartPos = 0;
+    m_iEndPos = -1;
+    m_iStartTick = 0;
+
+    memset(m_pNoteState, -1, sizeof(m_pNoteState));
+    m_dFPS = 0;
+    m_iFPSCount = 0;
+    m_llFPSTime = 0;
+    m_bShowFPS = false;
+    m_bShowKB = true;
+    m_fZoomX = cView.GetZoomX();
+    m_fOffsetX = cView.GetOffsetX();
+    m_fOffsetY = cView.GetOffsetY();
+    m_fTempZoomX = 1.0f;
+    m_fTempOffsetX = m_fTempOffsetY = 0.0f;
+    m_bTrackPos = m_bTrackZoom = false;
+    m_bPaused = false;
+    m_bMute = cPlayback.GetMute();
+    m_dVolume = cPlayback.GetVolume();
+    m_eKeysShown = cVisual.eKeysShown;
+
+    m_csKBRed.SetColor(config.GetVizSettings().iBarColor, 0.5f);
+}
+
+GameState::GameError FreePlayScreen::Init()
+{
+    static Config& config = Config::GetConfig();
+    static const AudioSettings& cAudio = config.GetAudioSettings();
+    static const VizSettings& cViz = config.GetVizSettings();
+
+    if (cViz.bKDMAPI)
+        m_OutDevice.OpenKDMAPI();
+    else
+        m_OutDevice.Open(cAudio.iOutDevice);
+
+    m_Timer.Init(false);
+    m_RealTimer.Init(false);
+    m_llFreePlayLastFrame = m_RealTimer.GetMicroSecs();
+
+    m_vLoops.clear();
+    m_vRecordingEvents.clear();
+    m_bRecording = false;
+    m_bCountdown = false;
+    m_iLoopCounter = 0;
+    for (int i = 0; i < 128; i++) m_iChordEvent[i] = -1;
+
+    return Success;
+}
+
+int FreePlayScreen::NoteFromMousePos(int mx, int my) const
+{
+    float fKeysY = m_fNotesY + m_fNotesCY;
+    if ((float)my < fKeysY)
+        return -1;
+
+    float fKeysCY = (float)m_pRenderer->GetBufferHeight() - m_fNotesCY;
+    float fTransitionCY = max(3.0f, floor(fKeysCY * 0.02f + 0.5f));
+    float fRedCY = floor(fKeysCY * 0.05f + 0.5f);
+    float fSpacerCY = 2.0f;
+    float fCurY = fKeysY + fTransitionCY + fRedCY + fSpacerCY;
+    float fTopCY = floor((fKeysCY - fSpacerCY - fRedCY - fTransitionCY) * 0.95f + 0.5f);
+    float fNearCY = fKeysCY - fSpacerCY - fRedCY - fTransitionCY - fTopCY;
+    float fSharpCY = fTopCY * 0.67f;
+
+    float fStartX = (MIDI::IsSharp(m_iStartNote) ? m_fWhiteCX * SharpRatio / 2.0f : 0.0f);
+    float fCurX = m_fNotesX + fStartX;
+    for (int i = m_iStartNote; i <= m_iEndNote; i++) {
+        if (!MIDI::IsSharp(i)) {
+            fCurX += m_fWhiteCX;
+        } else {
+            float fNudgeX = 0.0;
+            MIDI::Note eNote = MIDI::NoteVal(i);
+            if (eNote == MIDI::CS || eNote == MIDI::FS) fNudgeX = -SharpRatio / 5.0f;
+            else if (eNote == MIDI::AS || eNote == MIDI::DS) fNudgeX = SharpRatio / 5.0f;
+            float cx = m_fWhiteCX * SharpRatio;
+            float x = fCurX - m_fWhiteCX * (SharpRatio / 2.0f - fNudgeX);
+            if ((float)mx >= x && (float)mx < x + cx &&
+                (float)my >= fCurY - fNearCY && (float)my < fCurY + fSharpCY)
+                return i;
+        }
+    }
+
+    fCurX = m_fNotesX;
+    for (int i = m_iStartNote; i <= m_iEndNote; i++) {
+        if (!MIDI::IsSharp(i)) {
+            if ((float)mx >= fCurX && (float)mx < fCurX + m_fWhiteCX && (float)my >= fCurY)
+                return i;
+            fCurX += m_fWhiteCX;
+        }
+    }
+
+    return -1;
+}
+
+void FreePlayScreen::NoteOn(int note, int velocity, long long llStamp)
+{
+    int iRange = max(1, min(128, m_iFreePlayRange));
+    bool bHit[128] = {};
+    int iStart = note - (iRange - 1) / 2;
+    for (int i = 0; i < iRange; i++) {
+        int n = iStart + i;
+        if (n < 0 || n >= 128) continue;
+        NoteOnSingle(n, velocity, llStamp);
+        m_iChordEvent[n] = (int)m_vEvents.size() - 1;
+        bHit[n] = true;
+    }
+    if (m_bMirrorKeys) {
+        iStart = (127 - note) - (iRange - 1) / 2;
+        for (int i = 0; i < iRange; i++) {
+            int n = iStart + i;
+            if (n < 0 || n >= 128 || bHit[n]) continue;
+            NoteOnSingle(n, velocity, llStamp);
+            m_iChordEvent[n] = (int)m_vEvents.size() - 1;
+        }
+    }
+    if (m_bRainbow) m_iRainbowOffset++;
+}
+
+void FreePlayScreen::NoteOnSingle(int note, int velocity, long long llStamp)
+{
+    m_OutDevice.PlayEvent(0x90, (unsigned char)note, (unsigned char)velocity);
+
+    const long long ts = llStamp >= 0 ? llStamp : m_llFreePlayTime;
+
+    int slot;
+    if (m_vFreeSlots.empty()) {
+        slot = -1;
+        while (!m_dReleaseOrder.empty()) {
+            int cand = m_dReleaseOrder.front();
+            m_dReleaseOrder.pop_front();
+            if (m_mReleasedNotes.find(cand) != m_mReleasedNotes.end()) {
+                slot = cand;
+                break;
+            }
+        }
+        if (slot >= 0) {
+            int nOld = m_MIDI.GetEventParam1(m_vEvents[slot]);
+            auto& st = m_vState[nOld];
+            st.erase(std::remove(st.begin(), st.end(), slot), st.end());
+            m_mReleasedNotes.erase(slot);
+            slot = m_MIDI.GetEventTrack(m_vEvents[slot]);
+        }
+        else slot = 0; // all notes held; should not happen at 65536 slots
+    }
+    else { slot = m_vFreeSlots.back(); m_vFreeSlots.pop_back(); }
+    unsigned int ulColor;
+    if (m_bPlaybackColorPinned) {
+        ulColor = m_uPlaybackColor;
+    } else if (m_bRainbow) {
+        int iHue = (int)fmod((note + m_iRainbowOffset) * (360.0 / 128.0), 360.0);
+        int r2, g2, b2;
+        Util::HSVtoRGB(iHue, 100, 100, r2, g2, b2);
+        ulColor = (0x00 << 24) | (b2 << 16) | (g2 << 8) | r2;
+    } else {
+        unsigned int r = (unsigned int)(m_fFreePlayColor[0] * 255.0f);
+        unsigned int g = (unsigned int)(m_fFreePlayColor[1] * 255.0f);
+        unsigned int b = (unsigned int)(m_fFreePlayColor[2] * 255.0f);
+        ulColor = (0x00 << 24) | (b << 16) | (g << 8) | r;
+    }
+    m_vTrackSettings[slot].aChannels[0].SetColor(ulColor, 0.6f, 0.2f);
+    m_pRenderer->MarkTrackColorsDirty(slot);
+
+    m_pNoteState[note] = (int)m_vEvents.size();
+
+    MIDIChannelEvent pEvent = m_MIDI.AppendChannelEvent(0, 0);
+    m_MIDI.SetEventTrack(pEvent, (unsigned short)slot);
+    m_MIDI.SetEventChannel(pEvent, 0);
+    m_MIDI.SetEventParam1(pEvent, (unsigned char)note);
+    m_MIDI.SetEventParam2(pEvent, (unsigned char)velocity);
+    m_MIDI.SetEventTime(pEvent, ts);
+    m_MIDI.SetEventSisterIdx(pEvent, UINT32_MAX);
+    m_vEvents.push_back(pEvent);
+
+    m_vState[note].push_back((int)m_vEvents.size() - 1);
+    m_vThreadWork[note].push_back({ .idx = (unsigned)(m_vEvents.size() - 1), .sister_idx = UINT32_MAX });
+
+    if (m_bRecording && !m_bPlayback && ts >= m_llRecordStart)
+        m_vRecordingEvents.push_back({ true, (unsigned char)note, (unsigned char)velocity, ulColor, ts - m_llRecordStart });
+
+    m_iFreePlayNoteCount++;
+}
+
+void FreePlayScreen::NoteOff(int note, bool bStretch, long long llStamp)
+{
+    int iRange = max(1, min(128, m_iFreePlayRange));
+    bool bHit[128] = {};
+    int iStart = note - (iRange - 1) / 2;
+    for (int i = 0; i < iRange; i++) {
+        int n = iStart + i;
+        if (n < 0 || n >= 128) continue;
+        NoteOffSingle(n, bStretch, llStamp);
+        bHit[n] = true;
+    }
+    if (m_bMirrorKeys) {
+        iStart = (127 - note) - (iRange - 1) / 2;
+        for (int i = 0; i < iRange; i++) {
+            int n = iStart + i;
+            if (n < 0 || n >= 128 || bHit[n]) continue;
+            NoteOffSingle(n, bStretch, llStamp);
+        }
+    }
+}
+
+void FreePlayScreen::ChordRelease(bool bStretch, long long llStamp)
+{
+    for (int n = 0; n < 128; n++) {
+        if (m_iChordEvent[n] >= 0) {
+            NoteOffSingle(n, bStretch, llStamp, m_iChordEvent[n]);
+            m_iChordEvent[n] = -1;
+        }
+    }
+}
+
+void FreePlayScreen::SlideTo(int note)
+{
+    const int iRange = max(1, min(128, m_iFreePlayRange));
+    bool bNew[128] = {};
+    int iStart = note - (iRange - 1) / 2;
+    for (int i = 0; i < iRange; i++) {
+        int n = iStart + i;
+        if (n >= 0 && n < 128) bNew[n] = true;
+    }
+    if (m_bMirrorKeys) {
+        iStart = (127 - note) - (iRange - 1) / 2;
+        for (int i = 0; i < iRange; i++) {
+            int n = iStart + i;
+            if (n >= 0 && n < 128) bNew[n] = true;
+        }
+    }
+    for (int n = 0; n < 128; n++) {
+        if (!bNew[n] && m_iChordEvent[n] >= 0) {
+            NoteOffSingle(n, false, -1, m_iChordEvent[n]);
+            m_iChordEvent[n] = -1;
+        }
+    }
+    for (int n = 0; n < 128; n++) {
+        if (bNew[n] && m_iChordEvent[n] < 0) {
+            m_iChordEvent[n] = (int)m_vEvents.size();
+            NoteOnSingle(n, 100);
+        }
+    }
+}
+
+void FreePlayScreen::NoteOffSingle(int note, bool bStretch, long long llStamp, int iSpecificIdx)
+{
+    const long long llRel = llStamp >= 0 ? llStamp : m_llFreePlayTime;
+    if (m_bRecording && !m_bPlayback && llRel >= m_llRecordStart)
+        m_vRecordingEvents.push_back({ false, (unsigned char)note, 0, 0, llRel - m_llRecordStart });
+
+    if (iSpecificIdx >= 0) {
+        auto& state = m_vState[note];
+        auto it = std::find(state.begin(), state.end(), iSpecificIdx);
+        if (it == state.end()) {
+            m_pNoteState[note] = -1; // already released by something else
+            return;
+        }
+        if (!state.empty() && state.back() == iSpecificIdx)
+            m_OutDevice.PlayEvent(0x80, (unsigned char)note, 0);
+
+        int idx = iSpecificIdx;
+        MIDIChannelEvent pEvent = m_vEvents[idx];
+        long long length = llRel - m_MIDI.GetEventTime(pEvent);
+        if (length < 5000) length = 5000;
+        m_MIDI.SetEventLength(pEvent, (unsigned)length);
+
+        m_mReleasedNotes[idx] = { llRel, length };
+        m_dReleaseOrder.push_back(idx);
+
+        MIDIChannelEvent pOff = m_MIDI.AppendChannelEvent(0, 0);
+        m_MIDI.SetEventTrack(pOff, m_MIDI.GetEventTrack(pEvent));
+        m_MIDI.SetEventChannel(pOff, 0);
+        m_MIDI.SetEventParam1(pOff, (unsigned char)note);
+        m_MIDI.SetEventParam2(pOff, 0);
+        m_MIDI.SetEventTime(pOff, llRel);
+        m_MIDI.SetEventSisterIdx(pOff, (unsigned)idx);
+        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)m_vEvents.size());
+        m_vEvents.push_back(pOff);
+
+        // it scrolls off; the scroll-off cleanup reclaims it later.
+        m_pNoteState[note] = -1;
+        return;
+    }
+
+    m_OutDevice.PlayEvent(0x80, (unsigned char)note, 0);
+
+    if (!m_vState[note].empty()) {
+        int idx = m_vState[note].back();
+        MIDIChannelEvent pEvent = m_vEvents[idx];
+        long long length = llRel - m_MIDI.GetEventTime(pEvent);
+        if (bStretch && m_fRepeaterNPS > 1.0f) {
+            length = (long long)(1000000.0 / m_fRepeaterNPS);
+        }
+        else if (length < 5000) length = 5000;
+        m_MIDI.SetEventLength(pEvent, (unsigned)length);
+
+        m_mReleasedNotes[idx] = { llRel, length };
+        m_dReleaseOrder.push_back(idx);
+
+        MIDIChannelEvent pOff = m_MIDI.AppendChannelEvent(0, 0);
+        m_MIDI.SetEventTrack(pOff, m_MIDI.GetEventTrack(pEvent));
+        m_MIDI.SetEventChannel(pOff, 0);
+        m_MIDI.SetEventParam1(pOff, (unsigned char)note);
+        m_MIDI.SetEventParam2(pOff, 0);
+        m_MIDI.SetEventTime(pOff, llRel);
+        m_MIDI.SetEventSisterIdx(pOff, (unsigned)idx);
+        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)m_vEvents.size());
+        m_vEvents.push_back(pOff);
+
+    }
+
+    m_pNoteState[note] = -1;
+}
+
+void FreePlayScreen::StartLoopRecording()
+{
+    if (m_bRecording || m_bCountdown) return;
+    m_bCountdown = true;
+    m_llCountdownStart = m_llFreePlayTime;
+    m_vRecordingEvents.clear();
+}
+
+void FreePlayScreen::StopLoopRecording()
+{
+    if (!m_bRecording) return;
+    m_bRecording = false;
+
+    const long long dur = max(1LL, m_llRecordDuration);
+
+    std::vector<LoopEvent> events;
+    std::map<int, std::deque<std::tuple<long long, unsigned char, unsigned int>>> pending; // note -> (time, velocity, color)
+    std::sort(m_vRecordingEvents.begin(), m_vRecordingEvents.end(),
+        [](const LoopEvent& a, const LoopEvent& b) {
+            if (a.time != b.time) return a.time < b.time;
+            return a.isOn && !b.isOn; // note-ons before offs at the same instant
+        });
+    for (auto& e : m_vRecordingEvents) {
+        if (e.isOn) {
+            pending[e.note].push_back({ e.time, e.velocity, e.color });
+        } else {
+            auto& v = pending[e.note];
+            if (v.empty()) continue; // off with no on (note was held before recording)
+            // the same instant on the overlapping keys; pairing newest-first
+            auto p = v.front();
+            v.pop_front();
+            events.push_back({ true, e.note, std::get<1>(p), std::get<2>(p), std::get<0>(p) });
+            if (e.time < dur) // offs at the loop boundary are handled by the wrap
+                events.push_back({ false, e.note, 0, 0, e.time });
+        }
+    }
+    for (auto& kv : pending) {
+        for (auto& p : kv.second)
+            events.push_back({ true, (unsigned char)kv.first, std::get<1>(p), std::get<2>(p), std::get<0>(p) });
+    }
+    std::sort(events.begin(), events.end(),
+        [](const LoopEvent& a, const LoopEvent& b) {
+            if (a.time != b.time) return a.time < b.time;
+            return !a.isOn && b.isOn; // offs first: release before the next strike on the same key
+        });
+
+    Loop L;
+    for (int i = 0; i < 128; i++) L.held[i] = -1;
+    if (!events.empty()) {
+        snprintf(L.name, sizeof(L.name), "Loop %d", ++m_iLoopCounter);
+        L.duration = dur;
+        L.events = std::move(events);
+        L.lastTick = m_llFreePlayTime;
+        m_vLoops.push_back(std::move(L));
+    }
+    m_vRecordingEvents.clear();
+}
+
+void FreePlayScreen::TickLooper()
+{
+    if (m_bCountdown) {
+        if (m_llFreePlayTime - m_llCountdownStart >= 3000000LL) {
+            m_bCountdown = false;
+            m_bRecording = true;
+            m_llRecordStart = m_llFreePlayTime;
+        }
+    }
+    if (m_bRecording && m_llFreePlayTime - m_llRecordStart >= m_llRecordDuration)
+        StopLoopRecording();
+
+    const long long tick = m_llFreePlayTime;
+    m_bPlayback = true;
+    for (auto& L : m_vLoops) {
+        if (!L.playing || L.duration <= 0 || L.events.empty()) continue;
+        if (L.lastTick == 0) { L.lastTick = tick; L.playhead = 0; }
+        long long elapsed = tick - L.lastTick;
+        L.lastTick = tick;
+        if (elapsed <= 0) continue;
+        L.playhead += elapsed;
+
+        int guard = 0;
+        while (L.playhead >= L.duration && guard++ < 100000) {
+            L.playhead -= L.duration;
+            for (int n = 0; n < 128; n++) {
+                if (L.held[n] >= 0) {
+                    NoteOffSingle(n, false, -1, L.held[n]);
+                    L.held[n] = -1;
+                }
+            }
+            L.nextEvent = 0;
+        }
+        while (L.nextEvent < (int)L.events.size() && L.events[L.nextEvent].time <= L.playhead) {
+            const LoopEvent& e = L.events[L.nextEvent++];
+            if (e.isOn) {
+                m_bPlaybackColorPinned = true;
+                m_uPlaybackColor = L.bColorOverride ? L.uColorOverride : e.color;
+                int v = max(1, min(127, (int)(e.velocity * L.velocity)));
+                int iIdx = (int)m_vEvents.size(); // the event NoteOnSingle is about to push
+                NoteOnSingle(e.note, v, -1);
+                m_bPlaybackColorPinned = false;
+                L.held[e.note] = iIdx;
+            } else {
+                NoteOffSingle(e.note, false, -1, L.held[e.note]);
+                L.held[e.note] = -1;
+            }
+        }
+    }
+    m_bPlayback = false;
+}
+
+void FreePlayScreen::DeleteLoop(int i)
+{
+    if (i < 0 || i >= (int)m_vLoops.size()) return;
+    m_bPlayback = true;
+    for (int n = 0; n < 128; n++) {
+        if (m_vLoops[i].held[n] >= 0) {
+            NoteOffSingle(n, false, -1, m_vLoops[i].held[n]);
+            m_vLoops[i].held[n] = -1;
+        }
+    }
+    m_bPlayback = false;
+    m_vLoops.erase(m_vLoops.begin() + i);
+}
+
+GameState::GameError FreePlayScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        int mx = (short)LOWORD(lParam);
+        int my = (short)HIWORD(lParam);
+        int note = NoteFromMousePos(mx, my);
+        if (note >= 0 && note < 128) {
+            m_bMouseDown = true;
+            m_iLastClickedNote = note;
+            NoteOn(note, 100);
+        }
+        return Success;
+    }
+    case WM_LBUTTONUP: {
+        if (m_bMouseDown && m_iLastClickedNote >= 0) {
+            ChordRelease();
+            m_bMouseDown = false;
+            m_iLastClickedNote = -1;
+        }
+        return Success;
+    }
+    case WM_MOUSEMOVE: {
+        if (m_bMouseDown) {
+            int mx = (short)LOWORD(lParam);
+            int my = (short)HIWORD(lParam);
+            int note = NoteFromMousePos(mx, my);
+            if (note >= 0 && note < 128 && note != m_iLastClickedNote) {
+                SlideTo(note);
+                m_iLastClickedNote = note;
+            }
+        }
+        return Success;
+    }
+    }
+
+    return MainScreen::MsgProc(hWnd, msg, wParam, lParam);
+}
+
+GameState::GameError FreePlayScreen::Logic()
+{
+    m_pRenderer->ImGuiStartFrame();
+
+    static Config& config = Config::GetConfig();
+    static PlaybackSettings& cPlayback = config.GetPlaybackSettings();
+    static const ViewSettings& cView = config.GetViewSettings();
+    static const VisualSettings& cVisual = config.GetVisualSettings();
+    static const VideoSettings& cVideo = config.GetVideoSettings();
+    static const AudioSettings& cAudio = config.GetAudioSettings();
+    static const VizSettings& cViz = config.GetVizSettings();
+
+    m_csKBRed.SetColor(cViz.iBarColor, 0.5f);
+    m_bPaused = false;
+    m_dSpeed = 1.0;
+    m_dVolume = cPlayback.GetVolume();
+    m_bShowKB = cView.GetKeyboard();
+    m_bZoomMove = cView.GetZoomMove();
+    m_fOffsetX = cView.GetOffsetX();
+    m_fOffsetY = cView.GetOffsetY();
+    m_fZoomX = cView.GetZoomX();
+    m_eKeysShown = cVisual.eKeysShown;
+    m_iStartNote = min(cVisual.iFirstKey, cVisual.iLastKey);
+    m_iEndNote = max(cVisual.iFirstKey, cVisual.iLastKey);
+    m_bShowFPS = cVideo.bShowFPS;
+
+    if (cViz.bKDMAPI != m_OutDevice.IsKDMAPI()) {
+        if (cViz.bKDMAPI)
+            m_OutDevice.OpenKDMAPI();
+        else if (cAudio.iOutDevice >= 0)
+            m_OutDevice.Open(cAudio.iOutDevice);
+        m_OutDevice.Reset();
+    }
+
+    long long llElapsed = m_RealTimer.GetMicroSecs();
+    m_RealTimer.Start();
+    m_llFreePlayTime += llElapsed;
+
+    m_llFPSTime += llElapsed;
+    m_iFPSCount++;
+    if (m_llFPSTime >= 500000) {
+        m_dFPS = m_iFPSCount / (m_llFPSTime / 1000000.0);
+        m_llFPSTime = m_iFPSCount = 0;
+    }
+
+    m_llStartTime = m_llFreePlayTime;
+    m_llDisplayTime = m_llFreePlayTime;
+    m_llTimeSpan = 3000000LL;
+    m_llRndStartTime = m_llFreePlayTime;
+
+    m_fNotesX = m_fOffsetX + m_fTempOffsetX;
+    m_fNotesCX = m_pRenderer->GetBufferWidth() * m_fZoomX * m_fTempZoomX;
+    m_iAllWhiteKeys = MIDI::WhiteCount(m_iStartNote, m_iEndNote + 1);
+    float fBuffer = (MIDI::IsSharp(m_iStartNote) ? SharpRatio / 2.0f : 0.0f) +
+                    (MIDI::IsSharp(m_iEndNote) ? SharpRatio / 2.0f : 0.0f);
+    m_fWhiteCX = m_fNotesCX / (m_iAllWhiteKeys + fBuffer);
+    m_fNotesY = m_fOffsetY + m_fTempOffsetY;
+    if (!m_bShowKB)
+        m_fNotesCY = static_cast<float>(m_pRenderer->GetBufferHeight());
+    else {
+        float fMaxKeyCY = m_pRenderer->GetBufferHeight() * KBPercent;
+        float fIdealKeyCY = m_fWhiteCX / KeyRatio;
+        fIdealKeyCY = (fIdealKeyCY / 0.95f + 2.0f) / 0.93f;
+        m_fNotesCY = floor(m_pRenderer->GetBufferHeight() - min(fIdealKeyCY, fMaxKeyCY) + 0.5f);
+    }
+    GenNoteXTable();
+
+    auto& root_consts = m_pRenderer->GetRootConstants();
+    root_consts.deflate = clamp(round(m_fWhiteCX * 0.15f / 2.0f), 1.0f, 3.0f);
+    root_consts.notes_y = m_fNotesY;
+    root_consts.notes_cy = m_fNotesCY;
+    root_consts.white_cx = m_fWhiteCX;
+    root_consts.timespan = (float)m_llTimeSpan;
+
+    auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
+    memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
+    memset(&fixed_consts.bends, 0, sizeof(float) * 16);
+
+
+    ImGui::SetNextWindowPos(ImVec2(4.0f, 24.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340.0f, 660.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(280.0f, 220.0f), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::SetNextWindowBgAlpha(0.75f);
+
+    if (ImGui::Begin("Free Play Controls")) {
+        ImGui::Text("Note color:");
+        ImGui::SameLine();
+        ImGui::Checkbox("Rainbow", &m_bRainbow);
+        ImGui::ColorPicker4("##fpcolor", m_fFreePlayColor,
+            ImGuiColorEditFlags_NoInputs);
+        ImGui::Separator();
+        ImGui::Text("Note speed:");
+        ImGui::SliderFloat("##fpspeed", &m_fFreePlaySpeed, 0.1f, 4.0f, "%.2fx");
+        ImGui::Separator();
+        ImGui::Text("Repeater:");
+        ImGui::SliderFloat("##fprepeater", &m_fRepeaterNPS, 0.0f, 100000.0f, "%.0f nps",
+            ImGuiSliderFlags_Logarithmic);
+        ImGui::Separator();
+        ImGui::Text("Key range:");
+        ImGui::SliderInt("##fprange", &m_iFreePlayRange, 1, 128, "%d keys");
+        ImGui::SameLine();
+        ImGui::Checkbox("Mirror", &m_bMirrorKeys);
+        ImGui::Separator();
+        ImGui::Button("SLAM", ImVec2(-1.0f, 0.0f));
+        const bool bSlamDown = ImGui::IsItemActive();
+        if (bSlamDown && !m_bSlamHeld) {
+            m_bSlamHeld = true;
+            if (m_fRepeaterNPS > 0.0f) {
+                // interval; make the repeater's first fire immediate instead.
+                m_llRepeaterLast = m_llFreePlayTime -
+                    (long long)(1000000.0 / m_fRepeaterNPS);
+            } else {
+                for (int i = 0; i < 128; i++) {
+                    if (m_pNoteState[i] == -1)
+                        NoteOnSingle(i, 100);
+                }
+            }
+        }
+        if (!bSlamDown && m_bSlamHeld) {
+            m_bSlamHeld = false;
+            for (int i = 0; i < 128; i++)
+                NoteOffSingle(i);
+        }
+        ImGui::Separator();
+        ImGui::Text("Looper:");
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::DragFloat("sec", &m_fRecordSeconds, 0.25f, 0.5f, 120.0f, "%.1f"))
+            m_llRecordDuration = (long long)(m_fRecordSeconds * 1000000.0);
+        ImGui::SameLine();
+        if (ImGui::Button(m_bCountdown ? "Cancel" : (m_bRecording ? "Recording..." : "Record"))) {
+            if (m_bRecording) StopLoopRecording();
+            else if (m_bCountdown) m_bCountdown = false;
+            else StartLoopRecording();
+        }
+        if (m_bCountdown) {
+            double dStart = ceil((3000000LL - (m_llFreePlayTime - m_llCountdownStart)) / 1000000.0);
+            if (dStart < 0.0) dStart = 0.0;
+            ImGui::SameLine();
+            ImGui::Text("starts in %.0f", dStart);
+        } else if (m_bRecording) {
+            ImGui::SameLine();
+            double dLeft = (double)(m_llRecordDuration - (m_llFreePlayTime - m_llRecordStart)) / 1000000.0;
+            if (dLeft < 0.0) dLeft = 0.0;
+            ImGui::Text("%.1fs left", dLeft);
+        }
+        if (ImGui::BeginChild("##looperList", ImVec2(0.0f, 148.0f), true)) {
+            if (m_vLoops.empty()) {
+                ImGui::TextDisabled("No loops yet. Press Record and play some keys.");
+            } else {
+                for (int i = 0; i < (int)m_vLoops.size(); i++) {
+                    ImGui::PushID(i);
+                    Loop& L = m_vLoops[i];
+                    ImGui::SetNextItemWidth(150.0f);
+                    ImGui::InputText("##name", L.name, 64);
+                    ImGui::SameLine();
+                    int iOns = (int)std::count_if(L.events.begin(), L.events.end(),
+                        [](const LoopEvent& e) { return e.isOn; });
+                    ImGui::Text("%d n %.2fs", iOns, L.duration / 1000000.0);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(70.0f);
+                    ImGui::DragFloat("##vel", &L.velocity, 0.05f, 0.0f, 2.0f, "vel %.2f");
+                    ImGui::SameLine();
+                    if (ImGui::ColorEdit3("##col", L.color,
+                        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoLabel)) {
+                        L.bColorOverride = true;
+                        unsigned int r = (unsigned int)(L.color[0] * 255.0f);
+                        unsigned int g = (unsigned int)(L.color[1] * 255.0f);
+                        unsigned int b = (unsigned int)(L.color[2] * 255.0f);
+                        L.uColorOverride = (0x00 << 24) | (b << 16) | (g << 8) | r;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Delete")) {
+                        DeleteLoop(i);
+                        ImGui::PopID();
+                        continue;
+                    }
+                    ImGui::PopID();
+                }
+            }
+        }
+        ImGui::EndChild();
+        ImGui::End();
+    }
+
+    const bool bHolding = m_bSlamHeld || (m_bMouseDown && m_iLastClickedNote >= 0);
+    if (m_fRepeaterNPS > 0.0f && bHolding) {
+        const long long llPeriod = (long long)(1000000.0 / m_fRepeaterNPS);
+        if (llPeriod > 0) {
+            int iFires = 0;
+            while (m_llFreePlayTime - m_llRepeaterLast >= llPeriod) {
+                m_llRepeaterLast += llPeriod;
+                const long long llStamp = m_llRepeaterLast;
+                if (m_bSlamHeld) {
+                    for (int i = 0; i < 128; i++)
+                        NoteOffSingle(i, true, llStamp);
+                    for (int i = 0; i < 128; i++) {
+                        if (m_pNoteState[i] == -1)
+                            NoteOnSingle(i, 100, llStamp);
+                    }
+                } else {
+                    ChordRelease(true, llStamp);
+                    NoteOn(m_iLastClickedNote, 100, llStamp);
+                }
+                if (++iFires > 10000) break; // safety cap per frame
+            }
+        }
+    } else {
+        m_llRepeaterLast = m_llFreePlayTime;
+    }
+
+    TickLooper();
+
+    for (int n = 0; n < 128; n++) {
+        auto& state = m_vState[n];
+        for (auto it = state.begin(); it != state.end(); ) {
+            auto relIt = m_mReleasedNotes.find(*it);
+            if (relIt != m_mReleasedNotes.end()) {
+                float elapsed = (float)(m_llFreePlayTime - relIt->second.releaseTime);
+                if (elapsed * m_fFreePlaySpeed >= (float)m_llTimeSpan) {
+                    m_vFreeSlots.push_back(m_MIDI.GetEventTrack(m_vEvents[*it]));
+                    m_mReleasedNotes.erase(relIt);
+                    it = state.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+    }
+    while (!m_dReleaseOrder.empty() &&
+        m_mReleasedNotes.find(m_dReleaseOrder.front()) == m_mReleasedNotes.end())
+        m_dReleaseOrder.pop_front();
+
+    m_dNPSNotes.push_back(make_tuple(m_llFreePlayTime, m_iFreePlayNoteCount));
+    m_iFreePlayNoteCount = 0;
+    while (!m_dNPSNotes.empty() && std::get<0>(m_dNPSNotes.front()) < m_llFreePlayTime - 1000000)
+        m_dNPSNotes.pop_front();
+
+    m_pRenderer->ClearAndBeginScene(0xFF000000);
+    RenderLines();
+    m_pRenderer->SplitRect();
+    for (int n = 0; n < 128; n++) {
+        for (auto it = m_vState[n].rbegin(); it != m_vState[n].rend(); it++)
+            RenderNoteIdx(*it);
+    }
+    m_pRenderer->RenderBatch(true);
+    if (m_bShowKB) RenderKeys();
+    RenderBorder();
+    RenderText();
+    m_pRenderer->EndScene(true);
+    m_pRenderer->Present();
+
+    return Success;
+}
+
+NoteData FreePlayScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
+{
+    int idx = -1;
+    int note = m_MIDI.GetEventParam1(pNote);
+    for (int i : m_vState[note]) {
+        if (m_vEvents[i] == pNote) { idx = i; break; }
+    }
+
+    auto relIt = (idx >= 0) ? m_mReleasedNotes.find(idx) : m_mReleasedNotes.end();
+    if (relIt != m_mReleasedNotes.end()) {
+        long long elapsed = m_llFreePlayTime - relIt->second.releaseTime;
+        return NoteData{
+            .key = (uint8_t)note,
+            .channel = 0,
+            .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
+            .pos = static_cast<float>(elapsed) * m_fFreePlaySpeed,
+            .length = static_cast<float>(relIt->second.finalLength) * m_fFreePlaySpeed,
+        };
+    }
+
+    long long llNoteLength = (m_llFreePlayTime - m_MIDI.GetEventTime(pNote)) * (long long)m_fFreePlaySpeed;
+    if (llNoteLength < 5000) llNoteLength = 5000;
+
+    return NoteData{
+        .key = (uint8_t)note,
+        .channel = 0,
+        .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
+        .pos = 0.0f,
+        .length = static_cast<float>(llNoteLength),
+    };
+}
+
+void FreePlayScreen::RenderNoteIdx(int idx)
+{
+    auto relIt = m_mReleasedNotes.find(idx);
+    if (relIt != m_mReleasedNotes.end()) {
+        MIDIChannelEvent pNote = m_vEvents[idx];
+        int note = m_MIDI.GetEventParam1(pNote);
+        long long elapsed = m_llFreePlayTime - relIt->second.releaseTime;
+        m_pRenderer->PushNoteData(NoteData{
+            .key = (uint8_t)note,
+            .channel = 0,
+            .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
+            .pos = static_cast<float>(elapsed) * m_fFreePlaySpeed,
+            .length = static_cast<float>(relIt->second.finalLength) * m_fFreePlaySpeed,
+        });
+    } else {
+        MIDIChannelEvent pNote = m_vEvents[idx];
+        int note = m_MIDI.GetEventParam1(pNote);
+        long long llNoteLength = (m_llFreePlayTime - m_MIDI.GetEventTime(pNote)) * (long long)m_fFreePlaySpeed;
+        if (llNoteLength < 5000) llNoteLength = 5000;
+        m_pRenderer->PushNoteData(NoteData{
+            .key = (uint8_t)note,
+            .channel = 0,
+            .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
+            .pos = 0.0f,
+            .length = static_cast<float>(llNoteLength),
+        });
+    }
 }

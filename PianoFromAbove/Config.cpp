@@ -16,9 +16,7 @@ using namespace std;
 
 #include "Config.h"
 #include "Misc.h"
-//-----------------------------------------------------------------------------
 // Main Config class
-//-----------------------------------------------------------------------------
 
 Config &Config::GetConfig()
 {
@@ -141,13 +139,12 @@ bool Config::SaveConfigValues( TiXmlElement *txRoot )
     return bSaved;
 }
 
-//-----------------------------------------------------------------------------
 // LoadDefaultValues
-//-----------------------------------------------------------------------------
 
 void VisualSettings::LoadDefaultValues()
 {
     this->eKeysShown = All;
+    this->eTransitionSpeed = SmoothSlow;
     this->bAlwaysShowControls = false;
     this->bAssociateFiles = false;
     this->iFirstKey = 0;
@@ -167,6 +164,21 @@ void VisualSettings::LoadDefaultValues()
 void AudioSettings::LoadDefaultValues()
 {
     this->iOutDevice = -1;
+    this->bPreRenderAudio = false;
+    this->sPreSoundfontPath = L"";
+    this->sPreSoundfontDir = L"";
+    this->iPreVoices = 4096;
+    this->dPreFPS = 0.0;
+    this->iPreLMAttack = 10;
+    this->iPreLMRelease = 1000;
+    this->bNoFX = false;
+    this->iPreVelThreshLow = 0;
+    this->iPreVelThreshUpp = 127;
+    this->bPreUnderrunRepeat = false;
+    this->bPreRepeatCustom = false;
+    this->iPreRepeatMs = 250;
+    this->bPreStutterOnLag = true;
+    this->iPreBufferMs = 30000;
     LoadMIDIDevices();
 }
 
@@ -218,11 +230,25 @@ void VizSettings::LoadDefaultValues() {
     this->bNerdStats = false;
     this->sSplashMIDI = L"";
     this->bVisualizePitchBends = false;
+    this->bDualPianoRoll = false;
+    this->bDualRollKeyboard = true;
+    this->bBloom = false;
+    this->fBloomIntensity = 1.0f;
+    this->fBloomBrightness = 1.0f;
+    this->fBloomSpread = 10.0f;
+    this->fRibbonBloomHeight = 60.0f;
+    this->fRibbonBloomIntensity = 1.0f;
+    this->fRibbonBloomBrightness = 1.0f;
+    this->iRibbonBloomSteps = 64;
+    this->fBloomSaturation = 1.2f;
+    this->bColoredRibbon = true;
     this->bDumpFrames = false;
     this->iBarColor = 0x00FF0080;
     this->sBackground = L"";
+    this->fBGBlur = 0.0f;
+    this->fBGOpacity = 1.0f;
     this->bColorLoop = false;
-    this->bKDMAPI = true;
+    this->bKDMAPI = false;
     this->bDisableUI = false;
     this->fUIScale = 1.0f;
     this->sUIFont = L"";
@@ -249,9 +275,7 @@ void AudioSettings::LoadMIDIDevices()
         this->iOutDevice = iNumOutDevs - 1;
 }
 
-//-----------------------------------------------------------------------------
 // LoadConfigValues
-//-----------------------------------------------------------------------------
 
 void VisualSettings::LoadConfigValues( TiXmlElement *txRoot )
 {
@@ -262,12 +286,16 @@ void VisualSettings::LoadConfigValues( TiXmlElement *txRoot )
     int iAttrVal;
     if ( txVisual->QueryIntAttribute( "KeysShown", &iAttrVal ) == TIXML_SUCCESS )
         this->eKeysShown = static_cast< KeysShown >( iAttrVal );
+    if ( this->eKeysShown == Custom )
+        this->eKeysShown = All;
+    if ( txVisual->QueryIntAttribute( "TransitionSpeed", &iAttrVal ) == TIXML_SUCCESS )
+        this->eTransitionSpeed = static_cast< TransitionSpeed >( iAttrVal );
     if ( txVisual->QueryIntAttribute( "AlwaysShowControls", &iAttrVal ) == TIXML_SUCCESS )
         this->bAlwaysShowControls = ( iAttrVal != 0 );
     if ( txVisual->QueryIntAttribute( "AssociateFiles", &iAttrVal ) == TIXML_SUCCESS )
         this->bAssociateFiles = ( iAttrVal != 0 );
 
-    //Colors
+    // Colors
     int r, g, b = 0;
     size_t i = 0;
     TiXmlElement *txColors = txVisual->FirstChildElement( "Colors" );
@@ -301,6 +329,41 @@ void AudioSettings::LoadConfigValues( TiXmlElement *txRoot )
             if ( this->vMIDIOutDevices[i] == this->sDesiredOut )
                 this->iOutDevice = (int)i;
     }
+
+    int iAttrVal = 0;
+    if ( txAudio->QueryIntAttribute( "PreRenderAudio", &iAttrVal ) == TIXML_SUCCESS )
+        this->bPreRenderAudio = (iAttrVal != 0);
+
+    string sPreSoundfontPath;
+    if ( txAudio->QueryStringAttribute( "PreSoundfontPath", &sPreSoundfontPath ) == TIXML_SUCCESS )
+        this->sPreSoundfontPath = Util::StringToWstring( sPreSoundfontPath );
+
+    string sPreSoundfontDir;
+    if ( txAudio->QueryStringAttribute( "PreSoundfontDir", &sPreSoundfontDir ) == TIXML_SUCCESS )
+        this->sPreSoundfontDir = Util::StringToWstring( sPreSoundfontDir );
+
+    txAudio->QueryIntAttribute( "PreAudVoices", &iPreVoices );
+    txAudio->QueryDoubleAttribute( "PreAudFPS", &dPreFPS );
+    txAudio->QueryIntAttribute( "PreAudLimiterAttack", &iPreLMAttack );
+    txAudio->QueryIntAttribute( "PreAudLimiterRelease", &iPreLMRelease );
+    int iAttrVal2 = 0;
+    if ( txAudio->QueryIntAttribute( "PreAudNoFX", &iAttrVal2 ) == TIXML_SUCCESS )
+        this->bNoFX = (iAttrVal2 != 0);
+    txAudio->QueryIntAttribute( "PreAudVelThreshLow", &iPreVelThreshLow );
+    txAudio->QueryIntAttribute( "PReAudVelThreshUpp", &iPreVelThreshUpp );
+    int iAttrVal3 = 0;
+    if ( txAudio->QueryIntAttribute( "PreAudUnderrunRepeat", &iAttrVal3 ) == TIXML_SUCCESS )
+        this->bPreUnderrunRepeat = (iAttrVal3 != 0);
+    int iAttrVal4 = 0;
+    if ( txAudio->QueryIntAttribute( "PreAudRepeatCustom", &iAttrVal4 ) == TIXML_SUCCESS )
+        this->bPreRepeatCustom = (iAttrVal4 != 0);
+    txAudio->QueryIntAttribute( "PreAudRepeatMs", &iPreRepeatMs );
+    int iAttrVal5 = 0;
+    if ( txAudio->QueryIntAttribute( "PreAudStutterOnLag", &iAttrVal5 ) == TIXML_SUCCESS )
+        this->bPreStutterOnLag = (iAttrVal5 != 0);
+    this->iPreBufferMs = 30000;
+    if ( txAudio->QueryIntAttribute( "PreAudBufferMs", &iPreBufferMs ) != TIXML_SUCCESS || iPreBufferMs < 1000 )
+        this->iPreBufferMs = 30000;
 }
 
 void VideoSettings::LoadConfigValues( TiXmlElement *txRoot )
@@ -402,6 +465,30 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bNerdStats = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("VisualizePitchBends", &iAttrVal) == TIXML_SUCCESS)
         bVisualizePitchBends = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)
+        bDualPianoRoll = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("DualRollKeyboard", &iAttrVal) == TIXML_SUCCESS)
+        bDualRollKeyboard = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("Bloom", &iAttrVal) == TIXML_SUCCESS)
+        bBloom = (iAttrVal != 0);
+    txViz->QueryFloatAttribute("BloomIntensity", &fBloomIntensity);
+    fBloomIntensity = max(0.0f, min(fBloomIntensity, 1.0f));
+    txViz->QueryFloatAttribute("BloomBrightness", &fBloomBrightness);
+    fBloomBrightness = max(0.0f, min(fBloomBrightness, 4.0f));
+    txViz->QueryFloatAttribute("BloomSpread", &fBloomSpread);
+    fBloomSpread = max(1.0f, min(fBloomSpread, 30.0f));
+    txViz->QueryFloatAttribute("RibbonBloomHeight", &fRibbonBloomHeight);
+    fRibbonBloomHeight = max(0.0f, min(fRibbonBloomHeight, 300.0f));
+    txViz->QueryFloatAttribute("RibbonBloomIntensity", &fRibbonBloomIntensity);
+    fRibbonBloomIntensity = max(0.0f, min(fRibbonBloomIntensity, 4.0f));
+    txViz->QueryFloatAttribute("RibbonBloomBrightness", &fRibbonBloomBrightness);
+    fRibbonBloomBrightness = max(0.0f, min(fRibbonBloomBrightness, 4.0f));
+    txViz->QueryIntAttribute("RibbonBloomSteps", &iRibbonBloomSteps);
+    iRibbonBloomSteps = max(1, min(iRibbonBloomSteps, 100));
+    txViz->QueryFloatAttribute("BloomSaturation", &fBloomSaturation);
+    fBloomSaturation = max(0.0f, min(fBloomSaturation, 3.0f));
+    if (txViz->QueryIntAttribute("ColoredRibbon", &iAttrVal) == TIXML_SUCCESS)
+        bColoredRibbon = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("DumpFrames", &iAttrVal) == TIXML_SUCCESS)
         bDumpFrames = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("ColorLoop", &iAttrVal) == TIXML_SUCCESS)
@@ -416,6 +503,12 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     sTempStr = "";
     txViz->QueryStringAttribute("Background", &sTempStr);
     sBackground = Util::StringToWstring(sTempStr);
+    txViz->QueryFloatAttribute("BGBlur", &fBGBlur);
+    fBGBlur = max(0.0f, min(fBGBlur, 100.0f));
+    if (std::isnan(fBGBlur)) fBGBlur = 0.0f;
+    txViz->QueryFloatAttribute("BGOpacity", &fBGOpacity);
+    fBGOpacity = max(0.0f, min(fBGOpacity, 1.0f));
+    if (std::isnan(fBGOpacity)) fBGOpacity = 1.0f;
     txViz->QueryIntAttribute("MarkerEncoding", (int*)&eMarkerEncoding);
     eMarkerEncoding = max(MarkerEncoding::CP1252, min(eMarkerEncoding, MarkerEncoding::UTF8));
     txViz->QueryFloatAttribute("UIScale", &fUIScale);
@@ -434,15 +527,14 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
             iBarColor = ((r & 0xFF) << 0) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16);
 }
 
-//-----------------------------------------------------------------------------
 // SaveConfigValues
-//-----------------------------------------------------------------------------
 
 bool VisualSettings::SaveConfigValues( TiXmlElement *txRoot )
 {
     TiXmlElement *txVisual = new TiXmlElement( "Visual" );
     txRoot->LinkEndChild( txVisual );
     txVisual->SetAttribute( "KeysShown", this->eKeysShown );
+    txVisual->SetAttribute( "TransitionSpeed", this->eTransitionSpeed );
     txVisual->SetAttribute( "AlwaysShowControls", this->bAlwaysShowControls );
     txVisual->SetAttribute( "AssociateFiles", this->bAssociateFiles );
     txVisual->SetAttribute( "FirstKey", this->iFirstKey );
@@ -475,6 +567,23 @@ bool AudioSettings::SaveConfigValues( TiXmlElement *txRoot )
 
     if ( this->sDesiredOut.length() > 0 )
         txAudio->SetAttribute( "MIDIOutDevice", Util::WstringToString( this->sDesiredOut ) );
+    txAudio->SetAttribute( "PreRenderAudio", this->bPreRenderAudio );
+    if ( this->sPreSoundfontPath.length() > 0 )
+        txAudio->SetAttribute( "PreSoundfontPath", Util::WstringToString( this->sPreSoundfontPath ) );
+    if ( this->sPreSoundfontDir.length() > 0 )
+        txAudio->SetAttribute( "PreSoundfontDir", Util::WstringToString( this->sPreSoundfontDir ) );
+    txAudio->SetAttribute( "PreAudVoices", iPreVoices );
+    txAudio->SetAttribute( "PreAudFPS", dPreFPS );
+    txAudio->SetAttribute( "PreAudLimiterAttack", iPreLMAttack );
+    txAudio->SetAttribute( "PreAudLimiterRelease", iPreLMRelease );
+    txAudio->SetAttribute( "PreAudNoFX", bNoFX );
+    txAudio->SetAttribute( "PreAudVelThreshLow", iPreVelThreshLow );
+    txAudio->SetAttribute( "PreAudVelThreshUpp", iPreVelThreshUpp );
+    txAudio->SetAttribute( "PreAudUnderrunRepeat", bPreUnderrunRepeat );
+    txAudio->SetAttribute( "PreAudRepeatCustom", bPreRepeatCustom );
+    txAudio->SetAttribute( "PreAudRepeatMs", iPreRepeatMs );
+    txAudio->SetAttribute( "PreAudStutterOnLag", bPreStutterOnLag );
+    txAudio->SetAttribute( "PreAudBufferMs", iPreBufferMs );
 
     return true;
 }
@@ -555,12 +664,26 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("NerdStats", bNerdStats);
     txViz->SetAttribute("SplashMIDI", Util::WstringToString(sSplashMIDI));
     txViz->SetAttribute("VisualizePitchBends", bVisualizePitchBends);
+    txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);
+    txViz->SetAttribute("DualRollKeyboard", bDualRollKeyboard);
+    txViz->SetAttribute("Bloom", bBloom);
+    txViz->SetDoubleAttribute("BloomIntensity", fBloomIntensity);
+    txViz->SetDoubleAttribute("BloomBrightness", fBloomBrightness);
+    txViz->SetDoubleAttribute("BloomSpread", fBloomSpread);
+    txViz->SetDoubleAttribute("RibbonBloomHeight", fRibbonBloomHeight);
+    txViz->SetDoubleAttribute("RibbonBloomIntensity", fRibbonBloomIntensity);
+    txViz->SetDoubleAttribute("RibbonBloomBrightness", fRibbonBloomBrightness);
+    txViz->SetAttribute("RibbonBloomSteps", iRibbonBloomSteps);
+    txViz->SetDoubleAttribute("BloomSaturation", fBloomSaturation);
+    txViz->SetAttribute("ColoredRibbon", bColoredRibbon);
     txViz->SetAttribute("DumpFrames", bDumpFrames);
     txViz->SetAttribute("Background", Util::WstringToString(sBackground));
+    txViz->SetDoubleAttribute("BGBlur", fBGBlur);
+    txViz->SetDoubleAttribute("BGOpacity", fBGOpacity);
     txViz->SetAttribute("ColorLoop", bColorLoop);
     txViz->SetAttribute("KDMAPI", bKDMAPI);
     txViz->SetAttribute("DisableUI", bDisableUI);
-    txViz->SetAttribute("UIScale", fUIScale);
+    txViz->SetDoubleAttribute("UIScale", fUIScale);
     txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));
 
     TiXmlElement* txBarColor = new TiXmlElement("BarColor");

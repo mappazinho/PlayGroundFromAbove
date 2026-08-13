@@ -332,3 +332,29 @@ ASALocalRun/
 
 # MFractors (Xamarin productivity tool) working folder 
 .mfractor/
+
+# ---- Not needed for compilation (kept locally, not uploaded) ----
+# Stray build artifacts
+/PFA-1.1.0viz-AVX2.exe
+resolve.obj
+resolve2.obj
+
+# Runtime-only DLLs (post-build deploy copies them)
+PianoFromAbove/bass.dll
+PianoFromAbove/bassmidi.dll
+PianoFromAbove/SDL2.dll
+PianoFromAbove/sdl2/SDL2.dll
+
+# Runtime content
+PianoFromAbove/Soundfonts/
+/Music/
+
+# Installer / redistributable / legacy DXSDK bootstrap
+/PianoFromAbove.nsi
+/Redist/
+/install-dxsdk.ps1
+
+# Debug tooling and CI config
+/Scripts/
+/azure-pipelines.yml
+/Docs/

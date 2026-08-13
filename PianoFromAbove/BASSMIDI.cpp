@@ -1,0 +1,301 @@
+#include "BASSMIDI.h"
+#include <algorithm>
+#include <vector>
+#include <sstream>
+
+static WAVEFORMATEX m_wfWaveFormatStatic = WAVEFORMATEX{};
+static BASS_MIDI_FONTEX* m_bmFontArr = (BASS_MIDI_FONTEX*)malloc(sizeof(BASS_MIDI_FONTEX));
+static std::mutex sfLock;
+static std::mutex m_bmMutex;
+
+void BASSMIDI::InitBASS(WAVEFORMATEX format) {
+	m_wfWaveFormatStatic = format;
+	BASS_Free();
+	if (!BASS_Init(0, m_wfWaveFormatStatic.nSamplesPerSec, BASS_DEVICE_NOSPEAKER, NULL, NULL))
+		MessageBoxW(NULL, L"BASSMIDI failed to initialize, proceeding without audio.\0", L"BASSMIDI Error", MB_ICONERROR);
+}
+
+BASSMIDI::BASSMIDI(int voices, bool nofx = true) {
+	m_hsHandle = BASS_MIDI_StreamCreate(16,
+		BASS_SAMPLE_FLOAT |
+		BASS_STREAM_DECODE |
+		BASS_MIDI_SINCINTER |
+		BASS_MIDI_NOTEOFF1 |
+		0x800000,
+		m_wfWaveFormatStatic.nSamplesPerSec);
+
+	if (m_hsHandle == -1)
+	{
+		int err = BASS_ErrorGetCode();
+		MessageBoxW(NULL, L"BASSMIDI Handle failed to load!\0", L"Error\0", MB_ICONERROR);
+	}
+
+	BASS_ChannelSetAttribute(m_hsHandle, BASS_ATTRIB_MIDI_VOICES, voices);
+	BASS_ChannelSetAttribute(m_hsHandle, BASS_ATTRIB_SRC, 3);
+	BASS_ChannelSetAttribute(m_hsHandle, BASS_ATTRIB_MIDI_CHANS, 16);
+	//BASS_SetConfig(BASS_CONFIG_FLOATDSP, TRUE);
+
+	if (nofx) BASS_ChannelFlags(m_hsHandle, BASS_MIDI_NOFX, BASS_MIDI_NOFX);
+
+	{
+		sfLock.lock();
+		BASS_MIDI_StreamSetFonts(m_hsHandle, m_bmFontArr, 1);
+		sfLock.unlock();
+	}
+	
+}
+
+static bool IsSoundfontFile(const std::wstring& filename)
+{
+	if (filename.length() < 4) return false;
+	std::wstring lower = filename;
+	for (auto& c : lower) c = towlower(c);
+	if (lower.substr(lower.length() - 4) == L".sf2") return true;
+	if (lower.substr(lower.length() - 4) == L".sf3") return true;
+	if (lower.substr(lower.length() - 4) == L".sfz") return true;
+	if (lower.length() >= 8 && lower.substr(lower.length() - 8) == L".sf2pack") return true;
+	return false;
+}
+
+std::vector<std::wstring> BASSMIDI::EnumerateSoundfonts(const std::wstring& dir)
+{
+	std::vector<std::wstring> results;
+	if (dir.empty()) return results;
+	std::wstring searchPattern = dir;
+	if (searchPattern.back() != L'\\' && searchPattern.back() != L'/')
+		searchPattern += L"\\";
+	std::wstring pattern = searchPattern + L"*.*";
+
+	WIN32_FIND_DATAW fd;
+	HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+	if (hFind != INVALID_HANDLE_VALUE)
+	{
+		do
+		{
+			if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+			{
+				if (IsSoundfontFile(fd.cFileName))
+				{
+					results.push_back(searchPattern + fd.cFileName);
+				}
+			}
+		} while (FindNextFileW(hFind, &fd));
+		FindClose(hFind);
+	}
+	return results;
+}
+
+static std::wstring FindFirstSoundfontInDir(const std::wstring& dir)
+{
+	std::vector<std::wstring> sfs = BASSMIDI::EnumerateSoundfonts(dir);
+	if (!sfs.empty()) return sfs[0];
+	return L"";
+}
+
+std::wstring BASSMIDI::ResolveSoundfontPath(const std::wstring& path, const std::wstring& dir)
+{
+ // 1. Check explicit file path if provided
+	if (!path.empty())
+	{
+		DWORD attr = GetFileAttributesW(path.c_str());
+		if (attr != INVALID_FILE_ATTRIBUTES)
+		{
+			if (attr & FILE_ATTRIBUTE_DIRECTORY)
+			{
+				std::wstring sfInDir = FindFirstSoundfontInDir(path);
+				if (!sfInDir.empty()) return sfInDir;
+			}
+			else
+			{
+				return path; // Valid soundfont file path
+			}
+		}
+	}
+
+ // 2. Check explicit directory if provided
+	if (!dir.empty())
+	{
+		std::wstring sfInDir = FindFirstSoundfontInDir(dir);
+		if (!sfInDir.empty()) return sfInDir;
+	}
+
+ // 3. Auto-detect from ExeDir/Soundfonts/ or ExeDir/
+	WCHAR wchExe[MAX_PATH];
+	GetModuleFileNameW(NULL, wchExe, MAX_PATH);
+	std::wstring exeDir = std::wstring(wchExe);
+	size_t pos = exeDir.find_last_of(L"\\/");
+	if (pos != std::wstring::npos)
+		exeDir = exeDir.substr(0, pos + 1);
+
+ // Check ExeDir/Soundfonts/
+	std::wstring sfInSoundfontsDir = FindFirstSoundfontInDir(exeDir + L"Soundfonts");
+	if (!sfInSoundfontsDir.empty()) return sfInSoundfontsDir;
+
+ // Check ExeDir/
+	std::wstring sfInExeDir = FindFirstSoundfontInDir(exeDir);
+	if (!sfInExeDir.empty()) return sfInExeDir;
+
+	return path;
+}
+
+// only one soundfont because i'm lazy lmfao
+void BASSMIDI::FreeSoundfont()
+{
+	if (m_bmFontArr != NULL)
+	{
+		BASS_MIDI_FontFree((*m_bmFontArr).font);
+		free(m_bmFontArr); // i forgot this for the entire lifetime of this mod. damn
+		m_bmFontArr = NULL;
+	}
+}
+
+void BASSMIDI::LoadSoundfont(const wchar_t* path)
+{
+	std::wstring resolvedPath = ResolveSoundfontPath(path ? path : L"");
+	{
+		sfLock.lock();
+		FreeSoundfont();
+		BASS_MIDI_FONTEX* fonts = (BASS_MIDI_FONTEX*)malloc(sizeof(BASS_MIDI_FONTEX));
+
+		HSOUNDFONT font = 0;
+		if (!resolvedPath.empty())
+		{
+			font = BASS_MIDI_FontInit(resolvedPath.c_str(), 0);
+		}
+
+		if (font != 0)
+		{
+			fonts[0].font = font;
+			fonts[0].spreset = -1;
+			fonts[0].sbank = -1;
+			fonts[0].dpreset = -1;
+			fonts[0].dbank = 0;
+			fonts[0].dbanklsb = 0;
+
+			BASS_MIDI_FontLoad(font, -1, -1);
+		}
+		else
+		{
+			if (!resolvedPath.empty())
+			{
+				std::wstringstream err;
+				err << L"Soundfont failed to load from: " << resolvedPath << L"\nErr Code: " << BASS_ErrorGetCode() << L"\0";
+				MessageBoxW(NULL, err.str().c_str(), L"Soundfont Load Error", MB_ICONWARNING);
+			}
+		}
+
+		m_bmFontArr = fonts;
+		sfLock.unlock();
+	}
+}
+
+bool BASSMIDI::WriteBass(int buflen, unsigned long *progress)
+{
+	buflen <<= 3;
+	unsigned char* buf;
+
+	DWORD ret = BASS_ChannelGetData(m_hsHandle, &buf, buflen);
+	if (ret > 0)
+	{
+		(*progress) += (unsigned int)ret;
+		return true;
+	}
+	else
+	{
+		int err = BASS_ErrorGetCode();
+		return false;
+	}
+}
+
+float* BASSMIDI::WriteFloatArray(int buflen, unsigned long* progress)
+{
+	unsigned char* buf = (unsigned char*)malloc(buflen * 4 * sizeof(unsigned char));
+	float* flt = (float*)malloc(buflen * sizeof(float));
+
+	DWORD ret = BASS_ChannelGetData(m_hsHandle, &buf, buflen * 4);
+	if (ret > 0) {
+		(*progress) += (unsigned int)ret;
+		memcpy(flt, buf, sizeof(buf));
+		return flt;
+	}
+	else
+	{
+		int err = BASS_ErrorGetCode();
+		return nullptr;
+	}
+}
+
+int BASSMIDI::KShortMessage(int dwParam1, int sampleoffset)
+{
+	if ((unsigned char)dwParam1 == 0xFF) return 1;
+
+	unsigned char cmd = (unsigned char)dwParam1;
+
+	BASS_MIDI_EVENT ev;
+
+	if (cmd < 0xA0)
+	{
+
+		ev.event = MIDI_EVENT_NOTE;
+		ev.param = cmd < 0x90 ? (unsigned char)(dwParam1 >> 8) : (unsigned short)(dwParam1 >> 8);
+		ev.chan = (int)dwParam1 & 0xF;
+		ev.tick = 0;
+		ev.pos = sampleoffset << 3;
+	}
+	else if (cmd < 0xB0)
+	{
+		ev.event = MIDI_EVENT_KEYPRES;
+		ev.param = (unsigned short)dwParam1 >> 8;
+		ev.chan = (int)dwParam1 & 0xF;
+		ev.tick = 0;
+		ev.pos = sampleoffset << 3;
+	}
+	else if (cmd < 0xC0)
+	{
+  // TODO
+		return 0;
+	}
+	else if (cmd < 0xD0)
+	{
+		ev.event = MIDI_EVENT_PROGRAM;
+		ev.param = (unsigned char)(dwParam1 >> 8);
+		ev.chan = (int)dwParam1 & 0xF;
+		ev.tick = 0;
+		ev.pos = sampleoffset << 3;
+	}
+	else if (cmd < 0xE0)
+	{
+		ev.event = MIDI_EVENT_CHANPRES;
+		ev.param = (unsigned char)(dwParam1 >> 8);
+		ev.chan = (int)dwParam1 & 0xF;
+		ev.tick = 0;
+		ev.pos = sampleoffset << 3;
+	}
+	else if (cmd == 0xF0)
+	{
+		ev.event = MIDI_EVENT_PITCH;
+		ev.param = (int)((unsigned char)(dwParam1 >> 16) | ((dwParam1 & 0x7F00) >> 1));
+		ev.chan = (int)dwParam1 & 0xF;
+		ev.tick = 0;
+		ev.pos = sampleoffset << 3;
+	}
+	else return 0;
+
+	BASS_MIDI_EVENT evs[1] = { ev };
+
+	BassStreamEvents(evs);
+
+	return 0;
+}
+
+DWORD BASSMIDI::Read(float* buffer, int offset, int count) {
+	DWORD size = count * sizeof(float);
+	DWORD ret = BASS_ChannelGetData(m_hsHandle, buffer + offset, size | BASS_DATA_FLOAT);
+
+	if (ret == 0)
+	{
+		int err = BASS_ErrorGetCode();
+		MessageBox(NULL, L"Error\0", L"Error\0", MB_ICONERROR);
+	}
+	return ret / 4;
+}

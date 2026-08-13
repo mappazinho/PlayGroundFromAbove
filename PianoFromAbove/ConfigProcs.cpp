@@ -12,6 +12,7 @@
 #include <Uxtheme.h>
 #include <Vsstyle.h>
 #include <Dbt.h>
+#include <commdlg.h>
 
 #include "ConfigProcs.h"
 #include "MainProcs.h"
@@ -19,6 +20,7 @@
 #include "resource.h"
 
 #include "GameState.h"
+#include "MIDIPreRenderPlayer.h"
 
 VOID DoPreferences( HWND hWndOwner )
 {
@@ -102,7 +104,7 @@ INT_PTR WINAPI VisualProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     EnableWindow( GetDlgItem( hWnd, IDC_THROUGH ), TRUE );
                     EnableWindow( GetDlgItem( hWnd, IDC_LASTKEY ), TRUE );
                     return TRUE;
-                case IDC_SHOWALLKEYS: case IDC_SHOWSONGKEYS:
+                case IDC_SHOWALLKEYS: case IDC_SHOWSONGKEYS: case IDC_SHOWTRANSITIONKEYS:
                     EnableWindow( GetDlgItem( hWnd, IDC_FIRSTKEY ), FALSE );
                     EnableWindow( GetDlgItem( hWnd, IDC_THROUGH ), FALSE );
                     EnableWindow( GetDlgItem( hWnd, IDC_LASTKEY ), FALSE );
@@ -167,6 +169,7 @@ INT_PTR WINAPI VisualProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     cVisual.eKeysShown = ( IsDlgButtonChecked( hWnd, IDC_SHOWALLKEYS ) == BST_CHECKED ? cVisual.All : 
                                            IsDlgButtonChecked( hWnd, IDC_SHOWSONGKEYS ) == BST_CHECKED ? cVisual.Song :
                                            IsDlgButtonChecked( hWnd, IDC_SHOWCUSTOMKEYS ) == BST_CHECKED ? cVisual.Custom :
+                                           IsDlgButtonChecked( hWnd, IDC_SHOWTRANSITIONKEYS ) == BST_CHECKED ? cVisual.Transition :
                                            cVisual.Song );
                     cVisual.bAlwaysShowControls = ( IsDlgButtonChecked( hWnd, IDC_SHOWCONTROLS ) == BST_CHECKED );
                     cVisual.bAssociateFiles = ( IsDlgButtonChecked( hWnd, IDC_ASSOCIATEFILES ) == BST_CHECKED );
@@ -198,8 +201,7 @@ VOID SetVisualProc( HWND hWnd, const VisualSettings &cVisual, const VizSettings&
     HWND hWndFirstKey = GetDlgItem( hWnd, IDC_FIRSTKEY );
     HWND hWndLastKey = GetDlgItem( hWnd, IDC_LASTKEY );
 
-    // Set values
-    CheckRadioButton( hWnd, IDC_SHOWALLKEYS, IDC_SHOWCUSTOMKEYS, IDC_SHOWALLKEYS + cVisual.eKeysShown );
+    CheckRadioButton( hWnd, IDC_SHOWALLKEYS, IDC_SHOWTRANSITIONKEYS, IDC_SHOWALLKEYS + cVisual.eKeysShown );
     CheckDlgButton( hWnd, IDC_SHOWCONTROLS, cVisual.bAlwaysShowControls ? BST_CHECKED : BST_UNCHECKED );
     CheckDlgButton( hWnd, IDC_ASSOCIATEFILES, cVisual.bAssociateFiles ? BST_CHECKED : BST_UNCHECKED );
     SendMessage( hWnd, WM_COMMAND, IDC_SHOWALLKEYS + cVisual.eKeysShown, 0 );
@@ -604,8 +606,8 @@ BOOL GetCustomSettings( MainScreen *pGameState )
 
 INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
 {
-    static const VisualSettings &cVisual = Config::GetConfig().GetVisualSettings();
-    static const VizSettings &cViz = Config::GetConfig().GetVizSettings();
+    const VisualSettings &cVisual = Config::GetConfig().GetVisualSettings();
+    const VizSettings &cViz = Config::GetConfig().GetVizSettings();
     static vector< bool > vMuted, vHidden; // Would rather be part of control, but no subitem lparam available
     static vector< unsigned > vColors;
 
@@ -648,7 +650,11 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     else vColors[i] = Util::RandColor();
                 }
             }
-            
+
+            CheckDlgButton( hWnd, IDC_CHECK2, Config::GetConfig().m_bPianoOverride ? BST_CHECKED : BST_UNCHECKED );
+            EnableWindow( GetDlgItem( hWnd, IDC_AUDIOFILE ), FALSE );
+            EnableWindow( GetDlgItem( hWnd, IDC_BROWSEAUDIO ), FALSE );
+
             // Set up the columns of the list view
             RECT rcTracks;
             GetClientRect( hWndTracks, &rcTracks );
@@ -777,8 +783,8 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                                 return TRUE;
                             case 5:
                             {
-                                static COLORREF acrCustClr[16] = { 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 
-                                                                   0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF }; 
+                                static COLORREF acrCustClr[16] = { 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+                                                                   0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF };
                                 CHOOSECOLOR cc = {};
                                 cc.lStructSize = sizeof( cc );
                                 cc.hwndOwner = hWnd;
@@ -847,13 +853,50 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             int iId = LOWORD( wParam );
             switch ( iId )
             {
+                case IDC_CHECK3:
+                {
+                    bool bEnable = IsDlgButtonChecked( hWnd, IDC_CHECK3 ) == BST_CHECKED;
+                    EnableWindow( GetDlgItem( hWnd, IDC_AUDIOFILE ), bEnable );
+                    EnableWindow( GetDlgItem( hWnd, IDC_BROWSEAUDIO ), bEnable );
+                    return TRUE;
+                }
+                case IDC_BROWSEAUDIO:
+                {
+                    OPENFILENAME ofn = {};
+                    TCHAR sFilename[1024] = { 0 };
+                    ofn.lStructSize = sizeof( OPENFILENAME );
+                    ofn.hwndOwner = hWnd;
+                    ofn.lpstrFilter = TEXT( "Audio Files\0*.wav;*.mp3;*.ogg\0All Files\0*.*\0" );
+                    ofn.lpstrFile = sFilename;
+                    ofn.nMaxFile = sizeof( sFilename ) / sizeof( TCHAR );
+                    ofn.lpstrTitle = TEXT( "Select an audio file for this song" );
+                    ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if ( GetOpenFileName( &ofn ) )
+                        SetWindowText( GetDlgItem( hWnd, IDC_AUDIOFILE ), sFilename );
+                    return TRUE;
+                }
                 case IDOK:
                 {
                     MainScreen *pGameState = ( MainScreen* )GetWindowLongPtr( hWnd, GWLP_USERDATA );
                     pGameState->SetChannelSettings( vMuted, vHidden, vColors );
 
-                    Config::GetConfig().m_bManualTimer = IsDlgButtonChecked(hWnd, IDC_CHECK1);
-                    Config::GetConfig().m_bPianoOverride = IsDlgButtonChecked(hWnd, IDC_CHECK2);
+                    Config::GetConfig().m_bPianoOverride = IsDlgButtonChecked( hWnd, IDC_CHECK2 ) == BST_CHECKED;
+
+                    if ( IsDlgButtonChecked( hWnd, IDC_CHECK3 ) == BST_CHECKED )
+                    {
+                        TCHAR sAudioFile[MAX_PATH] = { 0 };
+                        GetDlgItemText( hWnd, IDC_AUDIOFILE, sAudioFile, MAX_PATH );
+                        if ( sAudioFile[0] == 0 )
+                        {
+                            MessageBox( hWnd, TEXT( "Please choose an audio file first." ), TEXT( "Track Settings" ), MB_OK | MB_ICONWARNING );
+                            return TRUE;
+                        }
+                        pGameState->m_bUseCustomAudio = true;
+                        pGameState->m_sCustomAudioPath = sAudioFile;
+                        PRE_DbgLog( "TrackSettings OK: custom audio enabled, path '%ls'", sAudioFile );
+                    }
+                    else
+                        PRE_DbgLog( "TrackSettings OK: custom audio NOT enabled" );
                 }
                 case IDCANCEL:
 			        EndDialog( hWnd, iId );
@@ -870,3 +913,5 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
 
 	return FALSE;
 }
+
+

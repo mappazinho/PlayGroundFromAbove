@@ -1,7 +1,5 @@
 //{{NO_DEPENDENCIES}}
-// Microsoft Visual C++ generated include file.
-// Used by PianoFromAbove.rc
-//
+// Microsoft Visual C++ generated include file. Used by PianoFromAbove.rc
 #define IDM_MAINMENU                    101
 #define IDD_LIBDLG                      101
 #define IDA_MAINMENU                    103
@@ -40,6 +38,7 @@
 #define IDC_SHOWALLKEYS                 1020
 #define IDC_SHOWSONGKEYS                1021
 #define IDC_SHOWCUSTOMKEYS              1022
+#define IDC_SHOWTRANSITIONKEYS          1023
 #define IDC_LRARROWS                    1023
 #define IDC_LRARROWSSPIN                1024
 #define IDC_UDARROWS                    1025
@@ -100,6 +99,9 @@
 #define IDC_CHECK1                      1096
 #define IDC_LOADINGPROGRESS             1097
 #define IDC_CHECK2                      1097
+#define IDC_AUDIOFILE                   1120
+#define IDC_BROWSEAUDIO                 1121
+#define IDC_CHECK3                      1122
 #define IDC_LOADINGDESC                 1098
 #define IDC_LOADINGNUM                  1099
 #define IDC_STATS                       1102
@@ -203,6 +205,7 @@
 #define ID_Menu40156                    40156
 #define ID_FILE_PRACTICESONGWITHCUSTOMSETTINGS 40157
 #define ID_FILE_PRACTICESONGCUSTOM      40158
+#define ID_FILE_FREEPLAY                40159
 #define ID_PLAY_FASTERNOTES             40159
 #define ID_PLAY_SLOWERNOTE              40160
 #define ID_PLAY_RESET                   40161
@@ -216,9 +219,9 @@
 #define ID_VIEW_SETWINDOWSIZE           40173
 #define ID__UPDATE                      40174
 #define ID_UPDATE                       40175
+#define ID_UPDATE_TRACKCOLORS           40176
 
 // Next default values for new objects
-// 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        161

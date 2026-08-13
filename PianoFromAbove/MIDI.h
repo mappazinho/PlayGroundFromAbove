@@ -19,20 +19,20 @@ using namespace std;
 
 #include "Misc.h"
 
-//Classes defined in this file
+// Classes defined in this file
 class MIDI;
 class MIDITrack;
 class MIDIEvent;
-class MIDIChannelEvent;
 class MIDIMetaEvent;
 class MIDISysExEvent;
 class MIDIPos;
 
-class MIDIOutDevice;
+// the MIDI object (SoA). The handle itself is 4 bytes; before this change every
+typedef uint32_t MIDIChannelEvent;
 
-//
+#define CHANNEL_EVENT_FLAG_PASS_DONE (1u << 24)
 // MIDI File Classes
-//
+
 
 class MIDIPos
 {
@@ -40,8 +40,8 @@ public:
     MIDIPos( MIDI &midi );
     ~MIDIPos();
 
-    int GetNextEvent( int iMicroSecs, MIDIEvent **pEvent );
-    int GetNextEvents( int iMicroSecs, vector< MIDIEvent* > &vEvents );
+    // *pOutMeta left NULL; meta/sysex events with *pOutMeta set and *pOutRow
+    int GetNextEvent( int iMicroSecs, MIDIEvent **pOutMeta, MIDIChannelEvent *pOutRow );
 
     bool IsStandard() const { return m_bIsStandard; }
     int GetTicksPerBeat() const { return m_iTicksPerBeat; }
@@ -51,23 +51,23 @@ public:
     int* m_pTrackTime;
 
 private:
-    // Where are we in the file?
     MIDI &m_MIDI;
-    vector< size_t > m_vTrackPos;
+    vector< size_t > m_vRowPos;
+    vector< size_t > m_vThinPos;
+    vector< size_t > m_vMetaPos;
 
-    // Tempo variables
     bool m_bIsStandard;
     uint32_t m_iTicksPerBeat, m_iMicroSecsPerBeat; // For standard division
     int m_iTicksPerSecond; // For SMPTE division
 
-    // Position variables
     int m_iCurrTick;
     int m_iCurrMicroSec;
+
+    void PrimeTime( size_t iTrack );
 };
 
 typedef vector< pair< long long, int > > eventvec_t;
 
-//Holds MIDI data
 class MIDI
 {
 public:
@@ -84,7 +84,6 @@ public:
     static bool IsSharp( int iNote );
     static int WhiteCount( int iMinNote, int iMaxNote );
 
-    //Generally usefull static parsing functions
     static uint32_t ParseVarNum( const unsigned char *pcData, size_t iMaxSize, uint32_t *piOut );
     static uint32_t Parse32Bit( const unsigned char *pcData, size_t iMaxSize, uint32_t *piOut );
     static uint32_t Parse24Bit( const unsigned char *pcData, size_t iMaxSize, uint32_t *piOut );
@@ -95,19 +94,109 @@ public:
     MIDI( const wstring &sFilename );
     ~MIDI( void );
 
-    // shitty memory pool allocator
-    MIDIChannelEvent* AllocChannelEvent();
+    // Reads + decompresses a file, then parses; wrapped in try/catch by the
+    void InitFromFile( const wstring &sFilename );
+    void InitFromFileCore( const wstring &sFilename ); // one load attempt
 
-    //Parsing functions that load data into the instance
+    MIDIChannelEvent AppendChannelEvent(int iTrack, uint32_t iAbsTicks);
+    size_t GetEventPoolBytes() const;
+    size_t GetEventPoolCount() const;
+
+    // own storage is just {tick, owner, sister, length} and every other
+    enum ChannelEventType { NoteOff = 0x8, NoteOn, NoteAftertouch, Controller, ProgramChange, ChannelAftertouch, PitchBend };
+    static const uint32_t THIN_OWNER_NOTEON_FLAG = 0x80000000u;
+    static const uint32_t THIN_SISTER_PASS_FLAG = 0x80000000u;
+    inline bool IsThinRow(MIDIChannelEvent row) const
+    {
+        return row >= m_iFullRows && row < (MIDIChannelEvent)(m_iFullRows + m_vThinTicks.size());
+    }
+    inline MIDIChannelEvent GetThinOwner(MIDIChannelEvent row) const
+    {
+        return (MIDIChannelEvent)(m_vThinOwners[row - m_iFullRows] & ~THIN_OWNER_NOTEON_FLAG);
+    }
+    inline int64_t GetEventTime(MIDIChannelEvent row) const
+    {
+        if ( IsThinRow(row) )
+        {
+            size_t t = row - m_iFullRows;
+            return m_vTimes[m_vThinOwners[t] & ~THIN_OWNER_NOTEON_FLAG] + m_vThinLengths[t];
+        }
+        return m_vTimes[row];
+    }
+    inline void SetEventTime(MIDIChannelEvent row, int64_t iTime) { if ( !IsThinRow(row) ) m_vTimes[row] = iTime; }
+    inline int GetEventAbsT(MIDIChannelEvent row) const { return IsThinRow(row) ? (int)m_vThinTicks[row - m_iFullRows] : (int)m_vTicks[row]; }
+    inline uint32_t GetEventTicks(MIDIChannelEvent row) const { return IsThinRow(row) ? m_vThinTicks[row - m_iFullRows] : m_vTicks[row]; }
+    inline void SetEventTicks(MIDIChannelEvent row, uint32_t iTicks) { if ( !IsThinRow(row) ) m_vTicks[row] = iTicks; }
+    inline uint32_t GetEventLength(MIDIChannelEvent row) const { return IsThinRow(row) ? m_vThinLengths[row - m_iFullRows] : m_vLengths[row]; }
+    inline void SetEventLength(MIDIChannelEvent row, uint32_t iLength) { if ( IsThinRow(row) ) m_vThinLengths[row - m_iFullRows] = iLength; else m_vLengths[row] = iLength; }
+    inline unsigned GetEventSisterIdx(MIDIChannelEvent row) const { return IsThinRow(row) ? (m_vThinSisters[row - m_iFullRows] & ~THIN_SISTER_PASS_FLAG) : m_vSisters[row]; }
+    inline void SetEventSisterIdx(MIDIChannelEvent row, unsigned iSister)
+    {
+        if ( IsThinRow(row) )
+        {
+            size_t t = row - m_iFullRows;
+            m_vThinSisters[t] = (iSister & ~THIN_SISTER_PASS_FLAG) | (m_vThinSisters[t] & THIN_SISTER_PASS_FLAG);
+        }
+        else
+            m_vSisters[row] = iSister;
+    }
+    inline bool EventHasSister(MIDIChannelEvent row) const { return IsThinRow(row) ? (m_vThinSisters[row - m_iFullRows] & ~THIN_SISTER_PASS_FLAG) != UINT32_MAX : m_vSisters[row] != UINT32_MAX; }
+    inline unsigned GetEventSimult(MIDIChannelEvent row) const { return m_vSimult[IsThinRow(row) ? GetThinOwner(row) : row]; }
+    inline void SetEventSimult(MIDIChannelEvent row, unsigned iSimult) { if ( !IsThinRow(row) ) m_vSimult[row] = static_cast<uint16_t>(min<unsigned>(iSimult, UINT16_MAX)); }
+    inline unsigned short GetEventTrack(MIDIChannelEvent row) const { return m_vEventTrack[IsThinRow(row) ? GetThinOwner(row) : row]; }
+    inline void SetEventTrack(MIDIChannelEvent row, unsigned short iTrack) { if ( !IsThinRow(row) ) m_vEventTrack[row] = iTrack; }
+    inline unsigned char GetEventCode(MIDIChannelEvent row) const { return IsThinRow(row) ? (unsigned char)((GetEventChannelEventType(row) << 4) | GetEventChannel(row)) : (unsigned char)(m_vPack[row] & 0xFF); }
+    inline void SetEventCode(MIDIChannelEvent row, unsigned char iCode) { if ( !IsThinRow(row) ) m_vPack[row] = (m_vPack[row] & 0xFFFFFF00) | iCode; }
+    inline unsigned char GetEventParam1(MIDIChannelEvent row) const { return IsThinRow(row) ? GetEventParam1(GetThinOwner(row)) : (unsigned char)((m_vPack[row] >> 8) & 0xFF); }
+    inline void SetEventParam1(MIDIChannelEvent row, unsigned char iParam) { if ( !IsThinRow(row) ) m_vPack[row] = (m_vPack[row] & 0xFFFF00FF) | ((uint32_t)iParam << 8); }
+    inline unsigned char GetEventParam2(MIDIChannelEvent row) const { return IsThinRow(row) ? 0 : (unsigned char)((m_vPack[row] >> 16) & 0xFF); }
+    inline void SetEventParam2(MIDIChannelEvent row, unsigned char iParam) { if ( !IsThinRow(row) ) m_vPack[row] = (m_vPack[row] & 0xFF00FFFF) | ((uint32_t)iParam << 16); }
+    inline unsigned char GetEventChannel(MIDIChannelEvent row) const { return IsThinRow(row) ? GetEventChannel(GetThinOwner(row)) : (unsigned char)(m_vPack[row] & 0xF); }
+    inline void SetEventChannel(MIDIChannelEvent row, unsigned char iChannel) { SetEventCode(row, (GetEventCode(row) & 0xF0) | iChannel); }
+    inline ChannelEventType GetEventChannelEventType(MIDIChannelEvent row) const
+    {
+        if ( IsThinRow(row) )
+        {
+            size_t t = row - m_iFullRows;
+            return (m_vThinOwners[t] & THIN_OWNER_NOTEON_FLAG) ? NoteOn : NoteOff;
+        }
+        return (ChannelEventType)((m_vPack[row] & 0xFF) >> 4);
+    }
+    inline void SetEventChannelEventType(MIDIChannelEvent row, ChannelEventType eType) { if ( !IsThinRow(row) ) SetEventCode(row, (GetEventCode(row) & 0xF) | ((unsigned char)eType << 4)); }
+    inline bool GetEventPassDone(MIDIChannelEvent row) const { return IsThinRow(row) ? (m_vThinSisters[row - m_iFullRows] & THIN_SISTER_PASS_FLAG) != 0 : (m_vPack[row] & CHANNEL_EVENT_FLAG_PASS_DONE) != 0; }
+    inline void SetEventPassDone(MIDIChannelEvent row, bool bDone)
+    {
+        if ( IsThinRow(row) )
+        {
+            size_t t = row - m_iFullRows;
+            m_vThinSisters[t] = bDone ? (m_vThinSisters[t] | THIN_SISTER_PASS_FLAG) : (m_vThinSisters[t] & ~THIN_SISTER_PASS_FLAG);
+        }
+        else
+            m_vPack[row] = bDone ? (m_vPack[row] | CHANNEL_EVENT_FLAG_PASS_DONE) : (m_vPack[row] & ~CHANNEL_EVENT_FLAG_PASS_DONE);
+    }
+    // Sets the thin row's owner reference (with the NTE type bit); used only
+    inline void SetThinOwner(MIDIChannelEvent row, MIDIChannelEvent iOwner, bool bNoteOn)
+    {
+        m_vThinOwners[row - m_iFullRows] = (uint32_t)iOwner | (bNoteOn ? THIN_OWNER_NOTEON_FLAG : 0);
+    }
+
     size_t ParseMIDI( const unsigned char *pcData, size_t iMaxSize );
+    size_t ParseMIDICore( const unsigned char *pcData, size_t iMaxSize );
     size_t ParseTracks( const unsigned char *pcData, size_t iMaxSize );
+    // phase-2 walk; each worker owns a disjoint row range, so no locking).
+    void SetPoolRow( size_t iRow, uint32_t iTicks, uint32_t iLengths, uint32_t iSisters,
+                     uint32_t iSimult, uint16_t iEventTrack, uint32_t iPack );
+    // walk; each worker owns a disjoint thin range, so no locking). The full row id is iThin + m_iFullRows; the owner references a compacted full row.
+    void SetThinRow( size_t iThin, uint32_t iTicks, uint32_t iOwners, uint32_t iSisters,
+                     uint32_t iLengths );
     size_t ParseEvents( const unsigned char *pcData, size_t iMaxSize );
     bool IsValid() const { return ( m_vTracks.size() > 0 && m_Info.iNoteCount > 0 && m_Info.iDivision > 0 ); }
 
-    void PostProcess(vector<MIDIChannelEvent*>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,
+    void PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,
         vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);
     void ConnectNotes();
     void clear( void );
+    void ReleaseOwnedData( void );
 
     friend class MIDIPos;
     friend class MIDITrack;
@@ -137,31 +226,38 @@ public:
     const vector< MIDITrack* >& GetTracks() const { return m_vTracks; }
 
 private:
-    struct EventPool {
-        MIDIChannelEvent* events;
-        size_t count;
-    };
-
     static void InitArrays();
     static wstring aNoteNames[KEYS + 1];
     static Note aNoteVal[KEYS];
     static bool aIsSharp[KEYS];
     static int aWhiteCount[KEYS + 1];
 
+    unsigned char *m_pcOwnedData = nullptr;
+
     MIDIInfo m_Info;
     vector< MIDITrack* > m_vTracks;
 
-    std::vector<EventPool> event_pools;
+    // are full 30-byte+2 rows; note-offs (and vel-0 NoteOns) that got paired in
+    vector<int64_t>  m_vTimes;   // absolute microsecond time
+    vector<uint32_t> m_vTicks;   // absolute tick time
+    vector<uint32_t> m_vLengths; // note length in microseconds
+    vector<uint32_t> m_vSisters; // merged-list position of the sister; the actual row can be resolved through the game's merged list. UINT32_MAX = none
+    vector<uint16_t> m_vSimult;  // simultaneous notes (uint16: clamped; only ever read on note-on rows)
+    vector<uint16_t> m_vEventTrack; // owning track
+    vector<uint32_t> m_vPack;       // code | param1 << 8 | param2 << 16 | flags << 24
+    vector<uint32_t> m_vThinTicks;   // absolute ticks (needed by the merge walk and GetEventAbsT)
+    vector<uint32_t> m_vThinOwners;  // full row id of the note-on + THIN_OWNER_NOTEON_FLAG
+    vector<uint32_t> m_vThinSisters; // merged-list pos of the sister + THIN_SISTER_PASS_FLAG during PostProcess
+    vector<uint32_t> m_vThinLengths; // note length in microseconds
+    uint32_t m_iFullRows = 0;        // full row count after the fold = thin zone base
 };
 
-//Holds all the event of one MIDI track
 class MIDITrack
 {
 public:
     MIDITrack(MIDI& midi);
     ~MIDITrack( void );
 
-    //Parsing functions that load data into the instance
     size_t ParseTrack( const unsigned char *pcData, size_t iMaxSize, size_t iTrack );
     size_t ParseEvents( const unsigned char *pcData, size_t iMaxSize, size_t iTrack );
     void clear( void );
@@ -190,28 +286,38 @@ public:
         int aProgram[16], iNumChannels;
     };
     const MIDITrackInfo& GetInfo() const { return m_TrackInfo; }
-    void ClearEvents() { m_vEvents.clear(); m_vEvents.shrink_to_fit(); }
 
 private:
     MIDITrackInfo m_TrackInfo;
-    vector< MIDIEvent* > m_vEvents;
+    vector< MIDIEvent* > m_vMetas;     // meta/sysex heap objects (parse order)
     MIDI& m_MIDI;
+    int m_iCurrentEventPos;
+
+    size_t m_iRowStart = 0;
+    size_t m_iRowEnd = 0;
+    size_t m_iThinStart = 0;
+    size_t m_iThinEnd = 0;
+
+public:
+    size_t GetRowStart() const { return m_iRowStart; }
+    size_t GetRowCount() const { return m_iRowEnd - m_iRowStart; }
+    size_t GetThinStart() const { return m_iThinStart; }
+    size_t GetThinEnd() const { return m_iThinEnd; }
+    size_t GetThinCount() const { return m_iThinEnd - m_iThinStart; }
+    size_t GetMetaCount() const { return m_vMetas.size(); }
 };
 
-//Base Event class
-//Should really be a single class with unions for the different events. much faster that way.
-//Might be forced to convert if batch processing is too slow
 class MIDIEvent
 {
 public:
-    //Event types
     enum EventType { ChannelEvent, MetaEvent, SysExEvent, RunningStatus };
     static EventType DecodeEventType( int iEventCode );
 
-    //Parsing functions that load data into the instance
-    static int MakeNextEvent( MIDI& midi, const unsigned char *pcData, size_t iMaxSize, int iTrack, MIDIEvent **pOutEvent );
+    // delta; *piPrevEventCode is the running-status source and is updated to
+    static int MakeNextEvent( MIDI& midi, const unsigned char *pcData, size_t iMaxSize, int iTrack,
+                              uint32_t *piAbsTicks, int *piPrevEventCode, MIDIChannelEvent *pPoolRow,
+                              MIDIEvent **pOutEvent );
 
-    //Accessors
     EventType GetEventType() const { return (EventType)m_eEventType; }
     unsigned char GetEventCode() const { return m_iEventCode; }
     int GetTrack() const { return m_iTrack; }
@@ -226,75 +332,32 @@ public:
     unsigned char m_iEventCode;
 };
 
-//Channel Event: notes and whatnot
-class MIDIChannelEvent : public MIDIEvent
-{
-public:
-    MIDIChannelEvent() : m_iSisterIdx(-1), m_iSimultaneous(0), m_bPassDone(false) { }
-
-    enum ChannelEventType { NoteOff = 0x8, NoteOn, NoteAftertouch, Controller, ProgramChange, ChannelAftertouch, PitchBend };
-    int ParseEvent( const unsigned char *pcData, size_t iMaxSize );
-
-    //Accessors
-    ChannelEventType GetChannelEventType() const { return static_cast<ChannelEventType>(m_iEventCode >> 4); }
-    unsigned char GetChannel() const { return m_cChannel; }
-    unsigned char GetParam1() const { return m_cParam1; }
-    unsigned char GetParam2() const { return m_cParam2; }
-    MIDIChannelEvent *GetSister(const std::vector<MIDIChannelEvent*>& events) const {
-        return m_iSisterIdx == UINT32_MAX ? nullptr : events[m_iSisterIdx];
-    }
-    MIDIChannelEvent *GetSister(const std::vector<MIDIEvent*>& events) const {
-        return m_iSisterIdx == UINT32_MAX ? nullptr : (MIDIChannelEvent*)events[m_iSisterIdx];
-    }
-    unsigned GetSisterIdx() const { return m_iSisterIdx; }
-    unsigned GetSimultaneous() const { return m_iSimultaneous; }
-    unsigned GetLength() const { return m_uLength; }
-    bool GetPassDone() const { return m_bPassDone; }
-
-    void SetChannel(unsigned char channel) { m_cChannel = channel; }
-    void SetParam1(unsigned char param1) { m_cParam1 = param1; }
-    void SetParam2(unsigned char param2) { m_cParam2 = param2; }
-    void SetSisterIdx(unsigned iSisterIdx) { m_iSisterIdx = iSisterIdx; }
-    void SetSimultaneous(int iSimultaneous) { m_iSimultaneous = iSimultaneous; }
-    void SetLength(unsigned length) { m_uLength = length; }
-    void SetPassDone(bool done) { m_bPassDone = done; }
-
-    bool HasSister() const { return m_iSisterIdx != UINT32_MAX; }
-
-private:
-    unsigned m_iSisterIdx;
-    unsigned m_iSimultaneous;
-    unsigned m_uLength;
-    bool m_bPassDone;
-    unsigned char m_cChannel;
-    unsigned char m_cParam1;
-    unsigned char m_cParam2;
-};
-
-//Meta Event: info about the notes and whatnot
 class MIDIMetaEvent : public MIDIEvent
 {
 public:
-    MIDIMetaEvent() : m_pcData( 0 ) { }
-    ~MIDIMetaEvent() { if ( m_pcData ) delete[] m_pcData; }
+    MIDIMetaEvent() : m_eMetaEventType(SequenceNumber), m_iDataLen(0) { }
+    ~MIDIMetaEvent() { if ( m_iDataLen > sizeof(m_aInline) ) delete[] m_pcData; }
 
     enum MetaEventType { SequenceNumber, TextEvent, Copyright, SequenceName, InstrumentName, Lyric, Marker,
                          CuePoint, ChannelPrefix = 0x20, PortPrefix = 0x21, EndOfTrack = 0x2F, SetTempo = 0x51,
                          SMPTEOffset = 0x54, TimeSignature = 0x58, KeySignature = 0x59, Proprietary = 0x7F };
     int ParseEvent( const unsigned char *pcData, size_t iMaxSize );
 
-    //Accessors
     MetaEventType GetMetaEventType() const { return m_eMetaEventType; }
     int GetDataLen() const { return m_iDataLen; }
-    unsigned char *GetData() const { return m_pcData; }
+    unsigned char *GetData() const {
+        return m_iDataLen <= sizeof(m_aInline) ? (unsigned char*)m_aInline : m_pcData;
+    }
 
 private:
     MetaEventType m_eMetaEventType;
     uint32_t m_iDataLen;
-    unsigned char *m_pcData;
+    union {
+        unsigned char* m_pcData;         // heap pointer, only used when escaped the inline
+        unsigned char  m_aInline[8];    // tiny payloads (tempo, time sig, EoT) live here -- no heap alloc
+    };
 };
 
-//SysEx Event: probably to be ignored
 class MIDISysExEvent : public MIDIEvent
 {
 public:
@@ -309,14 +372,11 @@ private:
     bool m_bHasMoreData;
 };
 
-//
-// MIDI Device Classes
-//
 
 class MIDIOutDevice
 {
 public:
-    MIDIOutDevice() : m_bIsOpen(false), m_hMIDIOut( NULL ) { }
+    MIDIOutDevice() : m_bIsOpen(false), m_bIsKDMAPI(false), m_hMIDIOut( NULL ) { }
     virtual ~MIDIOutDevice() { Close(); }
 
     int GetNumDevs() const;
@@ -327,6 +387,9 @@ public:
     void Reset();
 
     bool IsOpen() const { return m_bIsOpen; }
+    bool IsKDMAPI() const { return m_bIsKDMAPI; }
+    unsigned long long GetEventsSent() const { return m_ullEventsSent; }
+    unsigned long long GetSendFailures() const { return m_ullSendFailures; }
     const wstring& GetDevice() const { return m_sDevice; };
 
     void AllNotesOff();
@@ -347,6 +410,8 @@ private:
     void(WINAPI* SendDirectData)(DWORD);
     wstring m_sDevice;
     HMIDIOUT m_hMIDIOut;
+    unsigned long long m_ullEventsSent = 0;
+    unsigned long long m_ullSendFailures = 0;
 };
 
 class MIDILoadingProgress {

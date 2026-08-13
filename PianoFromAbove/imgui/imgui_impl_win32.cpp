@@ -506,6 +506,8 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARA
 {
     if (ImGui::GetCurrentContext() == nullptr)
         return 0;
+    if (ImGui_ImplWin32_GetBackendData() == nullptr)
+        return 0;
 
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplWin32_Data* bd = ImGui_ImplWin32_GetBackendData();

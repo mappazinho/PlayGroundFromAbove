@@ -37,4 +37,7 @@ INT_PTR WINAPI VizProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 BOOL ToggleYN( HWND hWndListview, int iItem );
 
 BOOL GetCustomSettings( MainScreen *pGameState );
+
 INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
+
+

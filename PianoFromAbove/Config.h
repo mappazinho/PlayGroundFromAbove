@@ -21,7 +21,7 @@
 #include "MainProcs.h"
 
 #define APPNAME "Piano From Above"
-#define APPNAMENOSPACES "PianoFromAbove"
+#define APPNAMENOSPACES "PlayGroundFromAbove"
 #define CLASSNAME  TEXT( "PianoFromAbove" )
 #define GFXCLASSNAME  TEXT( "PianoFromAboveGfx" )
 #define POSNCLASSNAME  TEXT( "PianoFromAbovePosCtrl" )
@@ -46,7 +46,8 @@ struct VisualSettings : public ISettings
     void LoadConfigValues( TiXmlElement *txRoot );
     bool SaveConfigValues( TiXmlElement *txRoot );
 
-    enum KeysShown { All, Song, Custom } eKeysShown;
+    enum KeysShown { All, Song, Custom, Transition } eKeysShown;
+    enum TransitionSpeed { SmoothSlow, SmoothFast, LinearSlow, LinearFast } eTransitionSpeed;
     int iFirstKey, iLastKey;
     bool bAlwaysShowControls, bAssociateFiles;
     unsigned int colors[16], iBkgColor;
@@ -62,6 +63,21 @@ struct AudioSettings : public ISettings
     vector< wstring > vMIDIOutDevices;
     int iOutDevice;
     wstring sDesiredOut;
+    bool bPreRenderAudio;
+    wstring sPreSoundfontPath;
+    wstring sPreSoundfontDir;
+    int iPreVoices;
+    double dPreFPS;
+    int iPreLMAttack;
+    int iPreLMRelease;
+    bool bNoFX;
+    int iPreVelThreshLow;
+    int iPreVelThreshUpp;
+    bool bPreUnderrunRepeat;
+    bool bPreRepeatCustom;
+    int iPreRepeatMs;
+    bool bPreStutterOnLag;
+    int iPreBufferMs;
 };
 
 struct VideoSettings : public ISettings
@@ -197,9 +213,23 @@ struct VizSettings : public ISettings {
     bool bNerdStats;
     std::wstring sSplashMIDI;
     bool bVisualizePitchBends;
+    bool bDualPianoRoll;
+    bool bDualRollKeyboard;
+    bool bBloom;
+    float fBloomIntensity;
+    float fBloomBrightness;
+    float fBloomSpread;
+    float fRibbonBloomHeight;
+    float fRibbonBloomIntensity;
+    float fRibbonBloomBrightness;
+    int iRibbonBloomSteps;
+    float fBloomSaturation;
+    bool bColoredRibbon;
     bool bDumpFrames;
     int iBarColor;
     std::wstring sBackground;
+    float fBGBlur;
+    float fBGOpacity;
     bool bColorLoop;
     bool bKDMAPI;
     bool bDisableUI;
@@ -223,9 +253,13 @@ public:
 
     void LoadMIDIDevices() { m_AudioSettings.LoadMIDIDevices(); }
 
+    VisualSettings& GetVisualSettings() { return m_VisualSettings; }
     const VisualSettings& GetVisualSettings() const { return m_VisualSettings; }
+    AudioSettings& GetAudioSettings() { return m_AudioSettings; }
     const AudioSettings& GetAudioSettings() const { return m_AudioSettings; }
+    VideoSettings& GetVideoSettings() { return m_VideoSettings; }
     const VideoSettings& GetVideoSettings() const { return m_VideoSettings; }
+    ControlsSettings& GetControlsSettings() { return m_ControlsSettings; }
     const ControlsSettings& GetControlsSettings() const { return m_ControlsSettings; }
     PlaybackSettings& GetPlaybackSettings() { return m_PlaybackSettings; }
     ViewSettings& GetViewSettings() { return m_ViewSettings; }

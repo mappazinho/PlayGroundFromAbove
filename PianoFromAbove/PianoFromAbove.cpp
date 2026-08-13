@@ -15,14 +15,17 @@
 #include <winhttp.h>
 #include <regex>
 #include <clocale>
+#include <cstdio>
 
 #include "MainProcs.h"
+#include "Globals.h"
 #include "resource.h"
 
 #include "Config.h"
 #include "GameState.h"
 #include "Renderer.h"
 #include "Misc.h"
+#include "MIDIPreRenderPlayer.h"
 
 // Yes, I know you shouldn't store build numbers as doubles
 constexpr double BUILD_VERSION = 20240112;
@@ -30,14 +33,201 @@ constexpr double BUILD_VERSION = 20240112;
 INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdLine, INT nCmdShow );
 DWORD WINAPI GameThread( LPVOID lpParameter );
 
-//-----------------------------------------------------------------------------
 // Global variables
-//-----------------------------------------------------------------------------
 HINSTANCE g_hInstance = NULL;
 HWND g_hWnd = NULL;
-HWND g_hWndBar = NULL;
 HWND g_hWndGfx = NULL;
 bool g_bGfxDestroyed = false;
+GameState* g_pGameState = nullptr;
+
+void HeartbeatLog(const char* tag) {
+    static bool bInit = false;
+    static __int64 nStart = 0;
+    static int nLoopCount = 0;
+    if (!bInit) {
+        bInit = true;
+        nStart = GetTickCount64();
+    }
+    if (strcmp(tag, "loop") == 0 && (nLoopCount++ & 15) != 0)
+        return;
+    __int64 ms = GetTickCount64() - nStart;
+    wchar_t path[MAX_PATH] = {};
+    GetTempPathW(_countof(path), path);
+    wcscat_s(path, L"pfa_heartbeat.log");
+    FILE* f = nullptr;
+    _wfopen_s(&f, path, L"a");
+    if (f) {
+        fprintf(f, "[%6lld.%03d] %s\n", (long long)(ms / 1000), (int)(ms % 1000), tag);
+        fclose(f);
+    }
+}
+
+static const wchar_t* ExceptionCodeString(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:         return L"ACCESS_VIOLATION";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return L"ARRAY_BOUNDS_EXCEEDED";
+    case EXCEPTION_DATATYPE_MISALIGNMENT:    return L"DATATYPE_MISALIGNMENT";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return L"FLT_DIVIDE_BY_ZERO";
+    case EXCEPTION_FLT_OVERFLOW:             return L"FLT_OVERFLOW";
+    case EXCEPTION_FLT_STACK_CHECK:          return L"FLT_STACK_CHECK";
+    case EXCEPTION_FLT_UNDERFLOW:            return L"FLT_UNDERFLOW";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:      return L"ILLEGAL_INSTRUCTION";
+    case EXCEPTION_IN_PAGE_ERROR:            return L"IN_PAGE_ERROR";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:       return L"INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_INT_OVERFLOW:             return L"INT_OVERFLOW";
+    case EXCEPTION_PRIV_INSTRUCTION:         return L"PRIV_INSTRUCTION";
+    case EXCEPTION_STACK_OVERFLOW:           return L"STACK_OVERFLOW";
+    default:                                 return L"UNKNOWN";
+    }
+}
+
+static int WriteCrashLog(EXCEPTION_POINTERS* ep) {
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    CONTEXT* ctx = ep->ContextRecord;
+
+    wchar_t modulePath[MAX_PATH] = L"<unknown>";
+    HMODULE hMod = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)ctx->Rip, &hMod)) {
+        GetModuleFileNameW(hMod, modulePath, MAX_PATH);
+        wchar_t* slash = wcsrchr(modulePath, L'\\');
+        if (slash) wmemmove(modulePath, slash + 1, wcslen(slash + 1) + 1);
+    }
+    const unsigned long long llModBase = hMod ? (unsigned long long)(DWORD_PTR)hMod : 0;
+    const unsigned long long llFaultOffset = ctx->Rip - (DWORD64)hMod;
+
+    typedef USHORT(WINAPI* RtlCaptureStackBackTrace_t)(ULONG, ULONG, PVOID*, PULONG);
+    static RtlCaptureStackBackTrace_t pCaptureStackBackTrace = (RtlCaptureStackBackTrace_t)
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlCaptureStackBackTrace");
+    PVOID pFrames[64] = {};
+    USHORT nFrames = pCaptureStackBackTrace ? pCaptureStackBackTrace(0, 64, pFrames, NULL) : 0;
+    wchar_t stackBuf[8192] = L"";
+    size_t stackLen = 0;
+    for (USHORT i = 0; i < nFrames && stackLen < _countof(stackBuf) - 128; i++) {
+        HMODULE hFrameMod = NULL;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)pFrames[i], &hFrameMod)) {
+            wchar_t frameMod[MAX_PATH] = L"";
+            GetModuleFileNameW(hFrameMod, frameMod, MAX_PATH);
+            wchar_t* fs = wcsrchr(frameMod, L'\\');
+            if (fs) wmemmove(frameMod, fs + 1, wcslen(fs + 1) + 1);
+            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
+                L"  0x%016llX  %s+0x%llX\n",
+                (unsigned long long)(DWORD_PTR)pFrames[i], frameMod,
+                (unsigned long long)(DWORD_PTR)pFrames[i] - (unsigned long long)(DWORD_PTR)hFrameMod);
+        } else {
+            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
+                L"  0x%016llX  <unknown module>\n", (unsigned long long)(DWORD_PTR)pFrames[i]);
+        }
+    }
+
+    wchar_t msg[12288];
+    _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+        L"PlayGroundFromAbove has crashed.\n\n"
+        L"Exception:  0x%08X  (%s)\n"
+        L"Address:    0x%016llX\n"
+        L"Module:     %s\n"
+        L"Module Base: 0x%016llX\n"
+        L"Fault Offset: 0x%08llX\n\n"
+        L"Registers:\n"
+        L"  RAX=%016llX  RBX=%016llX\n"
+        L"  RCX=%016llX  RDX=%016llX\n"
+        L"  RSI=%016llX  RDI=%016llX\n"
+        L"  RSP=%016llX  RBP=%016llX\n"
+        L"  RIP=%016llX  EFLAGS=%08X\n\n"
+        L"Call stack:\n"
+        L"%s"
+        L"\nAbort = Quit, Ignore = Try to continue.",
+        er->ExceptionCode,
+        ExceptionCodeString(er->ExceptionCode),
+        (unsigned long long)ctx->Rip,
+        modulePath,
+        llModBase,
+        llFaultOffset,
+        (unsigned long long)ctx->Rax,
+        (unsigned long long)ctx->Rbx,
+        (unsigned long long)ctx->Rcx,
+        (unsigned long long)ctx->Rdx,
+        (unsigned long long)ctx->Rsi,
+        (unsigned long long)ctx->Rdi,
+        (unsigned long long)ctx->Rsp,
+        (unsigned long long)ctx->Rbp,
+        (unsigned long long)ctx->Rip,
+        ctx->EFlags,
+        stackBuf);
+
+    wchar_t logPath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(logPath, L'\\');
+        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
+        FILE* f = NULL;
+        if (_wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE") == 0 && f) {
+            fwprintf(f, L"%s\n", msg);
+            fclose(f);
+        }
+    }
+
+    int result = MessageBoxW(NULL, msg, L"PlayGroundFromAbove - Crash",
+        MB_ICONERROR | MB_ABORTRETRYIGNORE | MB_TOPMOST | MB_SETFOREGROUND);
+    return (result == IDIGNORE);
+}
+
+static DWORD WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    WriteCrashLog(ep);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static DWORD g_dwGameThreadId = 0;
+
+static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_IN_PAGE_ERROR &&
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_DATATYPE_MISALIGNMENT)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (GetCurrentThreadId() == g_dwGameThreadId)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    wchar_t logPath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(logPath, L'\\');
+        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
+        FILE* f = NULL;
+        if (_wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE") == 0 && f) {
+            fwprintf(f, L"Crash on non-game thread: 0x%08X at 0x%016llX\n",
+                ep->ExceptionRecord->ExceptionCode,
+                (unsigned long long)ep->ContextRecord->Rip);
+            fclose(f);
+        }
+    }
+    WriteCrashLog(ep);
+    TerminateProcess(GetCurrentProcess(), 1);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void __cdecl TerminateHandler() {
+    wchar_t msg[512];
+    _snwprintf_s(msg, _countof(msg), _TRUNCATE,
+        L"PlayGroundFromAbove has encountered a fatal error.\n\n"
+        L"std::terminate() was called (unhandled C++ exception, pure virtual call, etc.).\n"
+        L"The application will now exit.");
+    FILE* f = NULL;
+    wchar_t logPath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(logPath, L'\\');
+        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
+        _wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE");
+        if (f) { fwprintf(f, L"%s\n", msg); fclose(f); }
+    }
+    MessageBoxW(NULL, msg, L"Oh deer..", MB_ICONERROR | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+    TerminateProcess(GetCurrentProcess(), 1);
+}
+
 TSQueue< MSG > g_MsgQueue; // Producer/consumer to hold events for our game thread
 
 DWORD WINAPI UpdateCheckProc(LPVOID) {
@@ -77,12 +267,10 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
                 break;
         } while (expected_len != 0 && recv_len != 0);
 
-        // Who needs a JSON library anyway
         std::regex regex("\"tag_name\":\\s*\"([0-9.]+)\",");
         std::smatch matches;
         
         if (std::regex_search(total, matches, regex)) {
-            // C locale sucks so much
             auto old_locale = std::setlocale(LC_NUMERIC, nullptr);
             std::setlocale(LC_NUMERIC, "C");
             for (size_t i = 1; i < matches.size(); i++) {
@@ -93,9 +281,11 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
                     continue;
                 }
                 if (parsed > BUILD_VERSION) {
-                    auto menu = GetMenu(g_hWnd);
-                    AppendMenu(menu, MF_STRING, ID_UPDATE, L"Update available!");
-                    DrawMenuBar(g_hWnd);
+                    wchar_t title[1024];
+                    GetWindowText(g_hWnd, title, 1024);
+                    wchar_t newTitle[1100];
+                    _snwprintf_s(newTitle, 1100, L"Update available! — %s", title);
+                    SetWindowText(g_hWnd, newTitle);
                     break;
                 }
             }
@@ -110,22 +300,23 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
     return 0;
 }
 
-//-----------------------------------------------------------------------------
-// Name: wWinMain()
-// Desc: The application's entry point
-//-----------------------------------------------------------------------------
-INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR, INT nCmdShow )
+INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdShow )
 {
+    AddVectoredExceptionHandler(1, VectoredCrashHandler);
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        WriteCrashLog(ep);
+        return EXCEPTION_EXECUTE_HANDLER;
+    });
+    std::set_terminate(TerminateHandler);
+
     g_hInstance = hInstance;
     srand( ( unsigned )time( NULL ) );
 
-    // Ensure that the common control DLL is loaded. 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof( INITCOMMONCONTROLSEX );
     icex.dwICC  = ICC_WIN95_CLASSES | ICC_COOL_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icex); 
 
-    // Initialize COM. For the SH* functions
     HRESULT hr = CoInitialize( NULL );
     if ( FAILED( hr ) ) return 1;
 
@@ -141,24 +332,16 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR, INT nCmdShow )
     wc.hCursor = LoadCursor( NULL, IDC_ARROW );
     // Window is only a container... never seen, thus null brush
     wc.hbrBackground = NULL; //( HBRUSH )GetStockObject( NULL_BRUSH );
-    wc.lpszMenuName = MAKEINTRESOURCE( IDM_MAINMENU );
+    wc.lpszMenuName = NULL;
     wc.lpszClassName = CLASSNAME;
     wc.hIconSm = NULL;
     if ( !RegisterClassEx( &wc ) )
         return 1;
 
-    // Register the graphics window class
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = GfxProc;
     wc.lpszMenuName = NULL;
     wc.lpszClassName = GFXCLASSNAME;
-    if ( !RegisterClassEx( &wc ) )
-        return 1;
-
-    // Register the position control window class
-    wc.style = 0;
-    wc.lpfnWndProc = PosnProc;
-    wc.lpszClassName = POSNCLASSNAME;
     if ( !RegisterClassEx( &wc ) )
         return 1;
 
@@ -178,8 +361,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR, INT nCmdShow )
         }
     }
 
-    // Create the application window
-    g_hWnd = CreateWindowEx( 0, CLASSNAME, L"pfavizkhang-dx12 " __DATE__, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, cView.GetMainLeft(), cView.GetMainTop(),
+    g_hWnd = CreateWindowEx( 0, CLASSNAME, L"PlayGroundFromAbove " __DATE__, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, cView.GetMainLeft(), cView.GetMainTop(),
                              cView.GetMainWidth(), cView.GetMainHeight(), NULL, NULL, wc.hInstance, NULL );
     if ( !g_hWnd ) return 1;
 
@@ -188,11 +370,6 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR, INT nCmdShow )
 
     // Creation order (z-order) matters big time for full screen
 
-    // Create the controls rebar
-    g_hWndBar = CreateRebar( g_hWnd );
-    if ( !g_hWndBar ) return 1;
-
-    // Create the graphics window
     g_hWndGfx = CreateWindowEx( 0, GFXCLASSNAME, NULL, WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS,
                                 0, 0, 800, 600, g_hWnd, NULL, wc.hInstance, NULL );
     if ( !g_hWndGfx ) return 1;
@@ -214,81 +391,218 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR, INT nCmdShow )
     SetFocus( g_hWndGfx );
     cPlayback.SetPaused( false, false );
 
-    // Spawn update check thread
+    if ( lpszCmdLine && lpszCmdLine[0] )
+    {
+        int iLen = MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, NULL, 0 );
+        if ( iLen > 1 )
+        {
+            std::wstring wsPath( (size_t)iLen, L'\0' );
+            MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, &wsPath[0], iLen );
+            wsPath.resize( wsPath.size() - 1 ); // drop the trailing NUL
+            while ( !wsPath.empty() && ( wsPath.front() == L'"' || wsPath.front() == L' ' ) )
+                wsPath.erase( wsPath.begin() );
+            while ( !wsPath.empty() && ( wsPath.back() == L'"' || wsPath.back() == L' ' ) )
+                wsPath.pop_back();
+            PlayFile( wsPath, false );
+        }
+    }
+
     CreateThread(NULL, 0, UpdateCheckProc, NULL, 0, NULL);
 
-    // Enter the message loop
     MSG msg = {};
     while( GetMessage( &msg, NULL, 0, 0 ) )
     {
-        if( !TranslateAccelerator( g_hWnd, hAccel, &msg ) &&
-            !IsDialogMessage( g_hWnd, &msg ) )
+        if( !TranslateAccelerator( g_hWnd, hAccel, &msg ) )
         {
             TranslateMessage( &msg );
             DispatchMessage( &msg );
         }
     }
 
-    // Signal the game thread to exit and wait for it
     g_MsgQueue.ForcePush( msg );
     WaitForSingleObject( hThread, INFINITE );
 
-    // Save settings
     config.SaveConfigValues();
 
-    // Clean up
     UnregisterClass( CLASSNAME, wc.hInstance );
     CoUninitialize();
     return 0;
 }
 
-DWORD WINAPI GameThread( LPVOID lpParameter )
-{
-    if ( !g_hWndGfx ) return 0;
+static void RecoverRenderer(D3D12Renderer* pRenderer) {
+    static bool s_bErrorPosted = false;
+    HRESULT res = pRenderer->RecoverDevice(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+    if (FAILED(res)) {
+        if (!s_bErrorPosted) {
+            s_bErrorPosted = true;
+            PostMessage(g_hWnd, WM_COMMAND, ID_GAMEERROR, (LPARAM)GameState::DirectXError);
+        }
+        Sleep(1000);
+    } else {
+        s_bErrorPosted = false;
+    }
+}
 
-    // Initialize Direct3D
+DWORD WINAPI GameThread( LPVOID lpParameter )
+{    if ( !g_hWndGfx ) { delete reinterpret_cast<GameState*>(lpParameter); return 0; }
+    g_dwGameThreadId = GetCurrentThreadId();
+
+    __try {
+
     D3D12Renderer *pRenderer = new D3D12Renderer();
-    auto init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+    std::tuple<HRESULT, const char*> init_res = { E_FAIL, "Init not attempted" };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+        if (SUCCEEDED(std::get<0>(init_res)))
+            break;
+        Sleep(500);
+    }
     if( FAILED(std::get<0>(init_res)) )
     {
         wchar_t msg[1024] = {};
         _snwprintf_s(msg, 1024, L"Fatal error initializing D3D12.\n%S failed with code 0x%x.", std::get<1>(init_res), std::get<0>(init_res));
         MessageBox( g_hWnd, msg, TEXT( "Error" ), MB_OK | MB_ICONEXCLAMATION );
+        delete pRenderer;
+        delete reinterpret_cast<GameState*>(lpParameter);
         PostMessage( g_hWnd, WM_QUIT, 1, 0 );
         return 1;
     }
 
-    // Create the game object
     GameState *pGameState = reinterpret_cast< GameState* >( lpParameter );
     pGameState->SetHWnd( g_hWndGfx );
     pGameState->SetRenderer( pRenderer );
     pGameState->Init();
+    g_pGameState = pGameState;
     GameState::GameError ge;
 
-    // Put the adapter in the window title
     wchar_t buf[1024] = {};
 #ifdef __AVX2__
-    _snwprintf_s(buf, 1024, L"pfavizkhang-dx12 %S (AVX2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
+    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (AVX2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
 #else
-    _snwprintf_s(buf, 1024, L"pfavizkhang-dx12 %S (SSE4.2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
+    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (SSE4.2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
 #endif
     SetWindowTextW(g_hWnd, buf);
 
-    // Event, logic, render...
     MSG msg = {};
+    auto tLastFrame = std::chrono::steady_clock::now();
     while( msg.message != WM_QUIT )
     {
+        {
+            auto tNow = std::chrono::steady_clock::now();
+            double dtS = std::chrono::duration<double>(tNow - tLastFrame).count();
+            tLastFrame = tNow;
+            g_fGameFPS = (float)(dtS > 0.0 ? 1.0 / dtS : 1000.0f);
+        }
+        // WaitForGPU runs; otherwise the fence signal queues up behind hundreds
+        const bool bResetHeld = g_bResetPending;
+        static auto s_tLoopLog = std::chrono::steady_clock::now();
+        auto tNowLoop = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tNowLoop - s_tLoopLog).count() >= 1000)
+        {
+            s_tLoopLog = tNowLoop;
+            HeartbeatLog("loop");
+        }
         while ( g_MsgQueue.Pop( msg ) )
+        {
+            if ( msg.message == WM_COMMAND && LOWORD( msg.wParam ) == ID_PRELOAD_DISCARD )
+            {
+                // A new song is about to load on the UI thread: free the current
+                // song's data here (this thread owns the state) before the parse
+                // starts, so the combined memory peak stays off the TDR cliff.
+                HANDLE hDiscardDone = (HANDLE)msg.lParam;
+                if (pGameState)
+                {
+                    HeartbeatLog("discard:begin");
+                    pGameState->Discard();
+                    HeartbeatLog("discard:done");
+                }
+                if (hDiscardDone)
+                    SetEvent(hDiscardDone);
+                continue;
+            }
+            if ( msg.message == WM_COMMAND && LOWORD( msg.wParam ) == ID_PRELOAD_DRAIN )
+            {
+                // Window transition about to animate: finish all queued GPU work
+                // (including the in-flight frame's present) while the window is
+                // still at its current size, then render nothing until the reset.
+                HeartbeatLog("drain:start");
+                pRenderer->WaitForGPU();
+                HeartbeatLog("drain:done");
+                if (msg.lParam)
+                    SetEvent((HANDLE)msg.lParam);
+                continue;
+            }
+            if ( msg.message == WM_COMMAND && LOWORD( msg.wParam ) == ID_VIEW_RESETDEVICE )
+            {
+                g_bResetPending = false;
+                pGameState->MsgProc( msg.hwnd, msg.message, msg.wParam, msg.lParam );
+                // The swapchain was recreated at the new size on an idle queue;
+                // the transition is over, let frames flow again.
+                g_bInSizeMove = false;
+                g_bSysResize = false;
+                continue;
+            }
             pGameState->MsgProc( msg.hwnd, msg.message, msg.wParam, msg.lParam );
+        }
+
+        if (pRenderer->DeviceLost()) {
+            HeartbeatLog("recover:drain");
+            RecoverRenderer(pRenderer);
+            continue;
+        }
+
+        if (!g_bDisableGates && (g_bInSizeMove || bResetHeld)) {
+            HeartbeatLog("skip:insizemove");
+            Sleep(10);
+            continue;
+        }
 
         if ( ( ge = GameState::ChangeState( pGameState->NextState(), &pGameState ) ) != GameState::Success )
             PostMessage( g_hWnd, WM_COMMAND, ID_GAMEERROR, ge );
-        pGameState->Logic();
-        pGameState->Render();
+        g_pGameState = pGameState;
+        {
+            static auto s_tStateLog = std::chrono::steady_clock::now();
+            auto tNowState = std::chrono::steady_clock::now();
+            if ( std::chrono::duration_cast<std::chrono::milliseconds>(tNowState - s_tStateLog).count() >= 1000 )
+            {
+                s_tStateLog = tNowState;
+                char buf[96];
+                sprintf_s(buf, "state:%s(%p) next=%s", pGameState->DebugName(), (void*)pGameState,
+                          pGameState->NextState() ? pGameState->NextState()->DebugName() : "none");
+                HeartbeatLog(buf);
+            }
+            auto tLogic = std::chrono::steady_clock::now();
+            pGameState->Logic();
+            auto tRender = std::chrono::steady_clock::now();
+            pGameState->Render();
+            auto tEnd = std::chrono::steady_clock::now();
+            static int s_frameLog = 0;
+            static double s_logicMs = 0.0, s_renderMs = 0.0;
+            s_logicMs += std::chrono::duration<double, std::milli>(tRender - tLogic).count();
+            s_renderMs += std::chrono::duration<double, std::milli>(tEnd - tRender).count();
+            if ((s_frameLog++ & 127) == 127) {
+                char buf[96];
+                sprintf_s(buf, "frame:logic=%.2f render=%.2f", s_logicMs / 128.0, s_renderMs / 128.0);
+                HeartbeatLog(buf);
+                s_logicMs = s_renderMs = 0.0;
+            }
+        }
+
+        if (pRenderer->DeviceLost()) {
+            HeartbeatLog("recover:postrender");
+            RecoverRenderer(pRenderer);
+        }
     }
 
+    pRenderer->WaitForGPU();
+
     delete pGameState;
+    g_pGameState = nullptr;
     delete pRenderer;
 
+    } __except([&]() -> int {
+        WriteCrashLog(GetExceptionInformation());
+        return EXCEPTION_EXECUTE_HANDLER;
+    }()) {}
     return 0;
 }

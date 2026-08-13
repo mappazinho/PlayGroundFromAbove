@@ -1,0 +1,648 @@
+#include <Windows.h>
+#include "MIDIAudio.h"
+#include "MIDIPreRenderPlayer.h"
+#include "Config.h"
+#include <functional>
+#include <future>
+#include <fstream>
+
+// global mutable variables... o.o
+static std::atomic_bool stopGenerator = false;
+std::mutex m_maMtx;
+std::atomic<double> g_preVolume = 1.0;
+
+// The ring holds 120s of audio, but the generator must never render the whole ring ahead: a slow synth stretch would silently drain the entire safety margin (the visual clock holds the whole time) and the eventual recovery is one giant backfill burst. Frame counters, NOT the float-counted m_iBufferLength (m_iBufferLength/2 happens to be the whole ring).
+
+// Render in bounded chunks so a single BASS synthesis call can never stall the generator (or a KillLastGenerator join waiting on it) for long, and stopGenerator is honored between chunks.
+static const int kGenWriteChunkFrames = 16384;
+
+AudioBufferStream::AudioBufferStream(MIDIAudio* source)
+{
+	m_maAudioSource = source;
+}
+
+// ------- loudmax stuff -------
+bool reduceHighPitch = false;
+double loudnessL = 1;
+double loudnessR = 1;
+double velocityR = 0;
+double velocityL = 0;
+double strength = 1;
+double minThresh = 0.4;
+double velocityThresh = 1;
+
+int AudioBufferStream::Read(float* buffer, int offset, int count)
+{
+	{
+		m_maMtx.lock();
+		if (m_maAudioSource->m_bPaused || m_maAudioSource->m_bAwaitingReset)
+		{
+			for (int i = 0; i < count; i++)
+			{
+				buffer[i + offset] = 0;
+			}
+			m_maAudioSource->m_bStallActive.store(false);
+			m_maMtx.unlock();
+			return count;
+		}
+
+  // --- Stutter handling ------------------------------------------------ Repeat the last chunk of generated audio instead of dropping out when the generator has not kept up (underrun). The read position does NOT advance while stuttering, so playback is simply held in place.
+		const int kRepeatFrames = m_maAudioSource->m_iRepeatFrames;
+
+		if (m_maAudioSource->m_bUnderrunRepeat)
+		{
+   // Enter the stall the moment a callback can no longer be served fully (nAvail < count/2), NOT only at nAvail <= 0. The normal path zero-fills any shortfall, so with the late trigger the player kept outputting slivers of audio + silence for ~1.5s before the stall finally engaged - that alternating audio/silence is the crackle. The stall guard keeps us from re-resetting m_iRepeatOffset every callback (else we'd never walk through the repeat window).
+			bool bStarving = (long long)m_maAudioSource->m_iBufferWritePos - m_maAudioSource->m_iBufferReadPos < count / 2;
+			if (bStarving && !m_maAudioSource->m_bInUnderrunStall)
+			{
+				m_maAudioSource->m_bInUnderrunStall = true;
+				m_maAudioSource->m_iRepeatOffset = 0;
+    // Anchor the repeat window's END at the LAST GENERATED frame. During an underrun the generator is behind, so the region between writePos and readPos is unwritten silence; anchoring here guarantees we only ever repeat real audio - never the unwritten gap (which caused the clicks).
+				m_maAudioSource->m_iStallAnchor = m_maAudioSource->m_iBufferWritePos;
+				m_maAudioSource->m_ullBufferUnderruns++;
+				PRE_DbgLog("STL+ r=%d w=%d anchor=%d", m_maAudioSource->m_iBufferReadPos, m_maAudioSource->m_iBufferWritePos, m_maAudioSource->m_iStallAnchor);
+			}
+			else if (m_maAudioSource->m_bInUnderrunStall &&
+				(long long)m_maAudioSource->m_iBufferWritePos - m_maAudioSource->m_iBufferReadPos >= kRepeatFrames)
+			{
+    // Exit once a full chunk of playable audio is available again. Because the game's song clock was frozen while the stall was active (m_bStallActive), the read position resumes exactly where the visuals are - a seamless hand-off, no catch-up jump needed. The old behaviour snapped the read head toward the song clock instead, which left it behind the visuals' position whenever the generator was running slower than real time - that is the "audio is delayed after the stutters" complaint.
+				m_maAudioSource->m_bInUnderrunStall = false;
+				PRE_DbgLog("STL- r=%d w=%d anchor=%d off=%d", m_maAudioSource->m_iBufferReadPos, m_maAudioSource->m_iBufferWritePos, m_maAudioSource->m_iStallAnchor, m_maAudioSource->m_iRepeatOffset);
+			}
+		}
+  // Publish stall state so the game thread freezes the song clock while audio is held (audio is the master clock - see m_bStallActive). The freeze only happens when "extend visuals on skip" is enabled: it adds the stall duration to the visuals so audio and visuals resume in the same place, whereas without it the visuals keep running and the audio comes back delayed.
+		m_maAudioSource->m_bStallActive.store(m_maAudioSource->m_bExtendVisualsOnSkip && m_maAudioSource->m_bInUnderrunStall);
+		if (m_maAudioSource->m_bInUnderrunStall)
+		{
+			CopyRepeatTail(m_maAudioSource, buffer, offset, count);
+   // Diagnostic: log every time the repeat walk completes a full chunk
+			// lap (raw counter grows across laps; wrap is done at read time).
+			static int sLastLap = 0;
+			int lap = m_maAudioSource->m_iRepeatOffset / kRepeatFrames;
+			if (lap != sLastLap)
+			{
+				sLastLap = lap;
+				PRE_DbgLog("STL~ lap=%d totalOff=%d r=%d w=%d", lap, m_maAudioSource->m_iRepeatOffset, m_maAudioSource->m_iBufferReadPos, m_maAudioSource->m_iBufferWritePos);
+			}
+			m_maMtx.unlock();
+			return count;
+		}
+
+		int frames = count / 2;
+		const int half = m_maAudioSource->m_iBufferLength / 2;
+		const double speed = m_maAudioSource->m_dReadSpeed;
+		const float* src = m_maAudioSource->m_fAudioBuffer;
+
+		if (fabs(speed - 1.0) < 1e-9)
+		{
+   // Fast path (unchanged behavior): copy whole interleaved frames.
+			int readpos = m_maAudioSource->m_iBufferReadPos % half;
+			if (m_maAudioSource->m_iBufferReadPos + frames > m_maAudioSource->m_iBufferWritePos)
+			{
+				int copyCount = m_maAudioSource->m_iBufferReadPos - (m_maAudioSource->m_iBufferWritePos + frames);
+				if (copyCount > frames) copyCount = frames;
+				if (copyCount > 0) MIDIAudio::WrappedCopy(m_maAudioSource->m_fAudioBuffer, readpos * 2, m_maAudioSource->m_iBufferLength, buffer, offset, copyCount * 2);
+				else
+				{
+					copyCount = 0;
+				}
+				for (int i = copyCount * 2; i < count; i++)
+				{
+					buffer[i + offset] = 0;
+				}
+    // The SDL callback caught up with the generator: count it so the nerd-stats overlay can surface crackle sources. Only counted here when underrun-repeat handling is off; when it's on the stall path above is used.
+				if (!m_maAudioSource->m_bUnderrunRepeat)
+					m_maAudioSource->m_ullBufferUnderruns++;
+			}
+			else
+			{
+				MIDIAudio::WrappedCopy(m_maAudioSource->m_fAudioBuffer, readpos * 2, m_maAudioSource->m_iBufferLength, buffer, offset, count);
+			}
+			m_maAudioSource->m_iBufferReadPos += frames;
+		}
+		else
+		{
+   // Resampled path: hop the virtual playhead over the canonical source by `speed` frames per output frame (linear interp). A speed change applies on the very next callback with no generator restart.
+			double consumed = (double)frames * speed;
+			long long need = (long long)floor(consumed) + 2;
+			int gen = frames;
+			if (m_maAudioSource->m_iBufferReadPos + need > m_maAudioSource->m_iBufferWritePos)
+			{
+				long long avail = m_maAudioSource->m_iBufferWritePos - m_maAudioSource->m_iBufferReadPos;
+				if (avail < 0) avail = 0;
+				gen = (int)((double)avail / speed);
+				if (gen > frames) gen = frames;
+				if (gen < 0) gen = 0;
+				consumed = (double)gen * speed;
+				if (!m_maAudioSource->m_bUnderrunRepeat)
+					m_maAudioSource->m_ullBufferUnderruns++;
+			}
+			for (int o = 0; o < gen; o++)
+			{
+				double p = m_maAudioSource->m_iBufferReadPos + (double)o * speed;
+				int i0 = (int)floor(p);
+				double w = p - (double)i0;
+				int a = (i0 % half) * 2;
+				int b = ((i0 + 1) % half) * 2;
+				buffer[offset + o * 2 + 0] = (float)(src[a + 0] * (1.0 - w) + src[b + 0] * w);
+				buffer[offset + o * 2 + 1] = (float)(src[a + 1] * (1.0 - w) + src[b + 1] * w);
+			}
+			for (int i = gen * 2; i < count; i++)
+			{
+				buffer[i + offset] = 0;
+			}
+			double adv = consumed + m_maAudioSource->m_dReadFraction;
+			int advInt = (int)floor(adv);
+			m_maAudioSource->m_dReadFraction = adv - advInt;
+			m_maAudioSource->m_iBufferReadPos += advInt;
+		}
+
+		m_maAudioSource->lastReadTime = std::chrono::time_point_cast<std::chrono::milliseconds>(
+			std::chrono::system_clock::now()
+		).time_since_epoch();
+		m_maMtx.unlock();
+	}
+	return count;
+}
+
+// Fills the output with the last chunk of GENERATED audio ending at src->m_iStallAnchor (the generator front at stall entry; during an underrun that front sits at/below the read position, and anchoring there guarantees we only ever repeat real audio - never the unwritten silence gap ahead of it). Each successive call advances src->m_iRepeatOffset so the FULL repeat window plays through before wrapping back to the window start. Does NOT modify the read position. Caller holds m_maMtx.
+void AudioBufferStream::CopyRepeatTail(MIDIAudio* src, float* buffer, int offset, int count)
+{
+	const int kFrames = src->m_iRepeatFrames;
+ // Lap-seam crossfade: the repeating window loops; a hard cut back to the window start when the ends don't meet a zero crossing is a click. Fade the first few frames of each pass over the equivalent frames at the window's end, so the loop is seamless.
+	const int kSeamFadeFrames = 64; // ~1.3ms
+	int written = 0; // floats written so far
+	while (written < count)
+	{
+		int endAbs = src->m_iStallAnchor; // absolute frame of window end
+		int startAbs = endAbs - kFrames;  // absolute frame of window start
+		int winFrames = kFrames;
+		if (startAbs < 0)
+		{
+			startAbs = 0;
+			winFrames = endAbs;
+		}
+		if (winFrames <= 0)
+		{
+   // Nothing playable yet (startup); keep the output silence-clean.
+			memset(&buffer[offset + written], 0, (size_t)(count - written) * sizeof(float));
+			break;
+		}
+		int pos = src->m_iRepeatOffset % winFrames; // where in the window we are
+		int takeFrames = winFrames - pos;
+		if (takeFrames * 2 > count - written) takeFrames = (count - written) / 2;
+		if (takeFrames <= 0) break;
+		int srcFloatPos = ((startAbs + pos) % (src->m_iBufferLength / 2)) * 2;
+		MIDIAudio::WrappedCopy(src->m_fAudioBuffer, srcFloatPos, src->m_iBufferLength, buffer, offset + written, takeFrames * 2);
+  // Seam blend on the pass that starts at the window start: cross-fade window[start + i] against the tail of the window (which is what the previous pass just played), read from the ring so it also works when the seam splits across two callbacks.
+		if (pos == 0 && takeFrames >= kSeamFadeFrames && winFrames >= kSeamFadeFrames)
+		{
+			int endPhi = (startAbs + winFrames - kSeamFadeFrames) % (src->m_iBufferLength / 2);
+			int startPhi = startAbs % (src->m_iBufferLength / 2);
+			for (int i = 0; i < kSeamFadeFrames; i++)
+			{
+				int ef = (endPhi + i) % (src->m_iBufferLength / 2);
+				int sf = (startPhi + i) % (src->m_iBufferLength / 2);
+				float w = (float)i / (float)(kSeamFadeFrames - 1); // 0..1
+				int efl = ef * 2, sfl = sf * 2;
+				float aL = src->m_fAudioBuffer[efl + 0];
+				float aR = src->m_fAudioBuffer[efl + 1];
+				float bL = src->m_fAudioBuffer[sfl + 0];
+				float bR = src->m_fAudioBuffer[sfl + 1];
+				buffer[offset + written + i * 2 + 0] = aL * (1.0f - w) + bL * w;
+				buffer[offset + written + i * 2 + 1] = aR * (1.0f - w) + bR * w;
+			}
+		}
+		written += takeFrames * 2;
+		src->m_iRepeatOffset += takeFrames;
+	}
+}
+
+// read with loudmax
+int AudioBufferStream::ReadLM(float* buffer, int offset, int count)
+{
+	double attack = 48000 * m_maAudioSource->m_dAttack;
+	double falloff = 48000 * m_maAudioSource->m_dRelease;
+
+	int read = Read(buffer, offset, count);
+	int end = offset + read;
+
+	if (read % 2 != 0) {}
+	for (int i = offset; i < end; i += 2)
+	{
+		double l = (double)fabs(buffer[i]);
+		double r = (double)fabs(buffer[i + 1]);
+
+		if (loudnessL > l) loudnessL = (loudnessL * falloff + l) / (falloff + 1.0);
+		else loudnessL = (loudnessL * attack + l) / (attack + 1.0);
+
+		if (loudnessR > r) loudnessR = (loudnessR * falloff + r) / (falloff + 1.0);
+		else loudnessR = (loudnessR * attack + r) / (attack + 1.0);
+
+		if (loudnessL < minThresh) loudnessL = minThresh;
+		if (loudnessR < minThresh) loudnessR = minThresh;
+
+		l = buffer[i] / (loudnessL * strength + 2.0 * (1 - strength)) / 2.0;
+		r = buffer[i + 1] / (loudnessR * strength + 2.0 * (1 - strength)) / 2.0;
+
+		if (i != offset)
+		{
+			double dl = std::abs((double)buffer[i] - l);
+			double dr = std::abs((double)buffer[i + 1] - r);
+
+			if (velocityL > dl)
+				velocityL = (velocityL * falloff + dl) / (falloff + 1.0);
+			else
+				velocityL = (velocityL * attack + dl) / (attack + 1.0);
+
+			if (velocityR > dr)
+				velocityR = (velocityR * falloff + dr) / (falloff + 1.0);
+			else
+				velocityR = (velocityR * attack + dr) / (attack + 1.0);
+		}
+
+		if (reduceHighPitch)
+		{
+			if (velocityL > velocityThresh)
+				l = l / velocityL * velocityThresh;
+			if (velocityR > velocityThresh)
+				r = r / velocityR * velocityThresh;
+		}
+
+		*(buffer + i) = (float)(l * g_preVolume);
+		*(buffer + i + 1) = (float)(r * g_preVolume);
+	}
+	return read;
+}
+
+void MIDIAudio::WrappedCopy(float* src, int pos, int srcCount, float *dst, int pos2, int count)
+{
+	if (pos + count > srcCount)
+	{
+		memcpy(dst + pos2, src + pos, (srcCount - pos) * sizeof(float));
+		count -= (srcCount - pos);
+		pos = 0;
+	}
+	memcpy(dst + pos2, src + pos, count * sizeof(float));
+}
+
+MIDIAudio::MIDIAudio(int bufferLength) : m_asAudioStream(this) 
+{
+	m_fAudioBuffer = (float*)malloc(bufferLength * 2 * sizeof(float));
+	memset(m_fAudioBuffer, 0, bufferLength * 2 * sizeof(float));
+	m_iBufferLength = bufferLength * 2;
+	m_asAudioStream = AudioBufferStream(this);
+	m_tGeneratorThread = nullptr;
+}
+
+void MIDIAudio::LoadSoundfont(const wchar_t* path)
+{
+	m_bBass->LoadSoundfont(path);
+}
+
+void MIDIAudio::Reset()
+{
+	memset(m_fAudioBuffer, 0, m_iBufferLength * sizeof(float));
+	m_iBufferWritePos = 0;
+	m_iBufferReadPos = 0;
+	m_dReadFraction = 0.0;
+}
+
+void MIDIAudio::SetReadSpeed(double dSpeed)
+{
+	m_maMtx.lock();
+	m_dReadSpeed = dSpeed;
+	m_maMtx.unlock();
+}
+
+void MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
+{
+	start = (start * 2) % m_iBufferLength;
+	count *= 2;
+	if (start + count > m_iBufferLength)
+	{
+		bass->Read(m_fAudioBuffer, start, m_iBufferLength - start);
+		count -= m_iBufferLength - start;
+		bass->Read(m_fAudioBuffer, 0, count);
+	}
+	else
+	{
+		bass->Read(m_fAudioBuffer, start, count);
+	}
+}
+
+// Renders `frames` frames of audio into the ring in kGenWriteChunkFrames chunks, advancing m_iBufferWritePos. Returns false if stopGenerator was set mid-write (caller tears down); true when everything was written.
+bool MIDIAudio::WriteAudioChunked(BASSMIDI* bass, int frames)
+{
+	while (frames > 0)
+	{
+		int chunk = min(frames, kGenWriteChunkFrames);
+		BassWriteWrapped(bass, m_iBufferWritePos, chunk);
+		m_iBufferWritePos += chunk;
+		frames -= chunk;
+		if (stopGenerator)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+// this was *sorta* copied from kiva
+void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannelEvent>* events, int start)
+{
+	BASSMIDI* bass = new BASSMIDI(m_iDefaultVoices, m_bDefaultNoFx);
+	m_iBufferWritePos = 0;
+	m_iBufferReadPos = 0;
+
+	PRE_DbgLog("GEN start t=%.3f startidx=%d nEvents=%d speed=%.2f", time, start, (int)events->size(), speed);
+	int dBgSent = 0;
+
+ // Diagnostic: generator throughput vs. wall clock, SendEventRaw cost, and the note-on density per audio second the synth actually faced.
+	using clock_t = std::chrono::steady_clock;
+	auto tGenStart = clock_t::now();
+	auto tLastProg = tGenStart;
+	long long llSent = 0, llProgSent = 0;
+	long long llSynthUs = 0, llProgSynthUs = 0;
+	int iDensSec = -1, iDensOns = 0, iDensPeak = 0;
+	double dDensPeakT = 0.0;
+
+ // Events before the seek point: only non-note events still matter (they set BASS program/controller state). Note events before `start` are skipped wholesale - iterating tens of millions of them on every seek rebuild is what made the audio stall for seconds after a seek.
+	size_t iSkip = min((size_t)max(start, 0), events->size());
+	auto itPre = events->begin();
+	while (itPre != events->begin() + iSkip)
+	{
+		unsigned char iCode = m_pMIDI->GetEventCode(*itPre);
+		if ((iCode >> 4 != 0x8) && (iCode >> 4 != 0x9))
+		{
+			BYTE ev[3] = { iCode, m_pMIDI->GetEventParam1(*itPre), m_pMIDI->GetEventParam2(*itPre) };
+			bass->SendEventRaw(ev, 3);
+			llSent++;
+		}
+		if (stopGenerator)
+		{
+			PRE_DbgLog("GEN stopped mid-loop");
+			break;
+		}
+		++itPre;
+	}
+
+	int iConsecEvents = 0;
+	for (std::vector<MIDIChannelEvent>::iterator e = itPre; e != events->end(); ++e)
+	{
+  // everything before the seek point was handled by the pre-loop above
+		if (e - events->begin() < (long long)iSkip) continue;
+
+		if (stopGenerator)
+		{
+			PRE_DbgLog("GEN stopped mid-loop");
+			break;
+		}
+
+		if (m_iBufferWritePos < m_iBufferReadPos)
+		{
+			m_iBufferWritePos = m_iBufferReadPos;
+			double dAudioFrontTime = m_dStartTime + (double)m_iBufferReadPos / 48000.0;
+			size_t iSkipped = 0;
+			while (e != events->end() && m_pMIDI->GetEventTime(*e) / 1e6 < dAudioFrontTime)
+			{
+				unsigned char iCode = m_pMIDI->GetEventCode(*e);
+				if ((iCode >> 4 != 0x8) && (iCode >> 4 != 0x9))
+				{
+					BYTE ev[3] = { iCode, m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e) };
+					bass->SendEventRaw(ev, 3);
+				}
+				++e;
+				iSkipped++;
+				if (stopGenerator) break;
+			}
+			PRE_DbgLog("GEN underrun skip: fast-forwarded %zu events to t=%.3f", iSkipped, dAudioFrontTime);
+			if (e == events->end() || stopGenerator) break;
+			--e;
+			continue;
+		}
+
+		double evTime = m_pMIDI->GetEventTime(*e) / 1e6;
+
+  // Diagnostic: note-on density per audio second (the load the synth faced) and a 1 Hz throughput/progress line while the generator runs.
+		{
+			int iDensCode = m_pMIDI->GetEventCode(*e);
+			if ((iDensCode >> 4) == 0x9 && m_pMIDI->GetEventParam2(*e) > 0)
+			{
+				int s = (int)floor(evTime);
+				if (s != iDensSec)
+				{
+					if (iDensOns > iDensPeak)
+					{
+						iDensPeak = iDensOns;
+						dDensPeakT = (double)iDensSec;
+					}
+					iDensSec = s;
+					iDensOns = 0;
+				}
+				iDensOns++;
+			}
+			auto tNow = clock_t::now();
+			if (std::chrono::duration_cast<std::chrono::milliseconds>(tNow - tLastProg).count() >= 1000)
+			{
+				double dElapsed = std::chrono::duration<double, std::milli>(tNow - tLastProg).count();
+				double dAudioFront = m_dStartTime + m_iBufferWritePos / 48000.0;
+				PRE_DbgLog("GENPROG ev=%zu/%zu sent/s=%.0f synthMs/s=%.1f r=%d w=%d aheadSec=%.3f",
+					(size_t)(e - events->begin()), events->size(),
+					(double)(llSent - llProgSent) * 1000.0 / dElapsed,
+					(double)(llSynthUs - llProgSynthUs) / 1000.0,
+					m_iBufferReadPos, m_iBufferWritePos, evTime - dAudioFront);
+				llProgSent = llSent;
+				llProgSynthUs = llSynthUs;
+				tLastProg = tNow;
+			}
+		}
+
+  // quantizes events to the nearest "frame"
+		if (m_dFPS != 0.0)
+		{
+			evTime = floor(evTime * m_dFPS) / m_dFPS;
+		}
+		
+		double offset = evTime - m_dStartTime;
+		int samples = (int)(48000 * offset) - m_iBufferWritePos;
+		if (samples > 0)
+		{
+   // Never run more than m_iMaxAheadFrames ahead of the device read position: it keeps a huge underrun cushion while bounding stall drain and the recovery backfill that caused the multi-second freezes (and the joined main thread during stop/restart).
+			while (!stopGenerator && m_iBufferWritePos + samples > m_iBufferReadPos + m_iMaxAheadFrames)
+			{
+				auto spare = (m_iBufferReadPos + m_iMaxAheadFrames) - m_iBufferWritePos;
+				if (spare > 0)
+				{
+					if (spare > samples) spare = samples;
+					if (spare != 0)
+					{
+						if (!WriteAudioChunked(bass, spare))
+						{
+							samples = 0;
+							break;
+						}
+						samples -= spare;
+					}
+					if (samples == 0) break;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			}
+			if (samples != 0 && !stopGenerator)
+			{
+				if (!WriteAudioChunked(bass, samples))
+				{
+					break;
+				}
+			}
+			iConsecEvents = 0;
+		}
+
+  // skipping velocity
+		if ((m_pMIDI->GetEventCode(*e) >> 4) == 0x9 && m_pMIDI->GetEventParam2(*e) > 0 && m_pMIDI->GetEventParam2(*e) < GetSkippingVelocity()) continue;
+		//if ((m_pMIDI->GetEventCode(*e) >> 4) != 0x9 && (m_pMIDI->GetEventCode(*e) >> 4) != 0x8) continue;
+
+  // skip notes with velocity lower than this value
+		if ((m_pMIDI->GetEventCode(*e) >> 4) == 0x9 && m_pMIDI->GetEventParam2(*e) > 0 && \
+			(m_pMIDI->GetEventParam2(*e) <= m_iVelThreshLow || m_pMIDI->GetEventParam2(*e) > m_iVelThreshUpp)) continue;
+
+		BYTE ev[3] = { m_pMIDI->GetEventCode(*e), m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e) };
+
+		auto tSend0 = clock_t::now();
+		int err = 1;
+		err = bass->SendEventRaw(ev, 3);
+		llSynthUs += std::chrono::duration_cast<std::chrono::microseconds>(clock_t::now() - tSend0).count();
+		llSent++;
+		iConsecEvents++;
+		if (iConsecEvents >= 50000 && !stopGenerator)
+		{
+			WriteAudioChunked(bass, 1);
+			iConsecEvents = 0;
+		}
+		if (err <= 0) {}
+		if (dBgSent < 8 && (m_pMIDI->GetEventCode(*e) >> 4) == 0x9 && m_pMIDI->GetEventParam2(*e) > 0)
+		{
+			PRE_DbgLog("GEN  ev[%d] absT=%.3f ch=%d note=%d vel=%d", dBgSent, m_pMIDI->GetEventTime(*e) / 1e6, m_pMIDI->GetEventChannel(*e), m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e));
+			dBgSent++;
+		}
+		if (stopGenerator)
+		{
+			PRE_DbgLog("GEN stopped mid-loop");
+			break;
+		}
+	}
+
+	while (!stopGenerator)
+	{
+		auto spare = (m_iBufferReadPos + m_iMaxAheadFrames) - m_iBufferWritePos;
+		if (spare > 0 && spare != 0)
+		{
+			if (!WriteAudioChunked(bass, spare))
+			{
+				break;
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+
+	PRE_DbgLog("GEN exit (t=%.3f)", time);
+
+	if (iDensOns > iDensPeak)
+	{
+		iDensPeak = iDensOns;
+		dDensPeakT = (double)iDensSec;
+	}
+	PRE_DbgLog("GENPROG done sent=%lld synthMs=%.1f wallMs=%.1f peakOnsPerSec=%d peakT=%.1f",
+		llSent, (double)llSynthUs / 1000.0,
+		std::chrono::duration<double, std::milli>(clock_t::now() - tGenStart).count(),
+		iDensPeak, dDensPeakT);
+
+	bass->~BASSMIDI();
+}
+
+void MIDIAudio::KillLastGenerator()
+{
+	memset(m_fAudioBuffer, 0, m_iBufferLength * sizeof(float));
+	stopGenerator = true;
+	if (m_tGeneratorThread != nullptr)
+	{
+		m_tGeneratorThread->join();
+		m_tGeneratorThread = nullptr;
+	}
+}
+
+void MIDIAudio::Start(double time, std::vector<MIDIChannelEvent>* events, double speed, int start)
+{
+	KillLastGenerator();
+	stopGenerator = false;
+	m_dStartTime = time;
+	m_pMIDI = events ? m_pMIDI : nullptr;
+	m_tGeneratorThread = new std::thread([this, speed, time, events, start] { GeneratorFunc(speed, time, events, start); });
+	m_bAudioStarted = true;
+	m_bAwaitingReset = false;
+}
+
+void MIDIAudio::Stop()
+{
+	KillLastGenerator();
+	m_bPaused = true;
+	m_iBufferWritePos = 0;
+	m_iBufferReadPos = 0;
+}
+
+void MIDIAudio::SyncPlayer(double time, double speed)
+{
+	{
+		m_maMtx.lock();
+  // Publish the speed-adjusted song clock (kept for diagnostics near the ring, e.g. StartRender's force-check). Audio is the master clock, so the read position is deliberately NOT touched here: the fork nudges m_iBufferReadPos toward the song clock whenever it drifts >30ms, but doing that every game frame fires a cross-fade jump per frame even in otherwise-clean playback, which reads as crackle. Stall recovery owns its position entirely (see m_bStallActive) - normal playback just consumes the ring in real time, matching the fork's steady state.
+		m_maMtx.unlock();
+	}
+}
+
+void MIDIAudio::StartRender(long long llStartTime, bool force, std::vector<MIDIChannelEvent>* events, double speed, long long iStartPos)
+{
+	double time = (double)llStartTime / 1000000;
+	if (!force)
+	{
+		if (time + 0.1 > GetPlayerTime() + GetBufferSeconds() || time + 0.01 < GetPlayerTime())
+		{
+			force = true;
+		}
+	}
+	if (force)
+	{
+		m_pMIDI = events ? m_pMIDI : nullptr;
+		Start(time, events, speed, iStartPos);
+	}
+	else
+	{
+		SyncPlayer(time, speed);
+	}
+}
+
+void MIDIAudio::SetMaxAheadMs(int ms)
+{
+	if (ms < 1000) ms = 1000;
+	int frames = (int)((long long)ms * 48);
+	m_iMaxAheadFrames = frames;
+	EnsureBufferCapacity(frames * 2);
+}
+
+void MIDIAudio::EnsureBufferCapacity(int minFrames)
+{
+	int minFloats = minFrames * 2;
+	if (m_iBufferLength < minFloats)
+	{
+		m_maMtx.lock();
+		int oldLength = m_iBufferLength;
+		int newLength = minFloats;
+		float* pNewBuffer = (float*)realloc(m_fAudioBuffer, (size_t)newLength * sizeof(float));
+		if (pNewBuffer)
+		{
+			memset(pNewBuffer + oldLength, 0, (size_t)(newLength - oldLength) * sizeof(float));
+			m_fAudioBuffer = pNewBuffer;
+			m_iBufferLength = newLength;
+		}
+		m_maMtx.unlock();
+	}
+}
