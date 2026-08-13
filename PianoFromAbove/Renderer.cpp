@@ -2911,8 +2911,7 @@ void D3D12Renderer::RenderImGuiFrame() {
         }
 
         if (showToolbar) {
-            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + menuBarHeight));
-            ImGui::SetNextWindowSize(ImVec2(vp->Size.x, toolbarHeight));
+            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + menuBarHeight), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
             ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -2922,16 +2921,6 @@ void D3D12Renderer::RenderImGuiFrame() {
                                        ImGuiWindowFlags_NoNav;
 
 if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
-                if (m_BlurTextureID) {
-                    ImVec2 wpos = ImGui::GetWindowPos();
-                    ImVec2 wsize = ImGui::GetWindowSize();
-                    float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
-                    ImGui::GetWindowDrawList()->AddImage(m_BlurTextureID,
-                        wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y),
-                        ImVec2(wpos.x / bw, wpos.y / bh),
-                        ImVec2((wpos.x + wsize.x) / bw, (wpos.y + wsize.y) / bh));
-                    ImGui::GetWindowDrawList()->AddRectFilled(wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y), 0x80000000);
-                }
                 float buttonWidth = 35.0f;
 
                 bool hasSong = playback.GetPlayMode() != GameState::Intro;
@@ -2967,8 +2956,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 if (!ImGui::IsItemActive()) {
                     seekPos = (int)(m_fPlaybackPosition * 1000.0f);
                 }
-                float availW = ImGui::GetContentRegionAvail().x;
-                float sliderW = max(availW - 350.0f, 150.0f);
+                float sliderW = 300.0f;
                 ImGui::SetNextItemWidth(sliderW);
                 if (ImGui::SliderInt("##pos", &seekPos, 0, 1000, "%d", ImGuiSliderFlags_NoInput))
                     HandOffMsg(TBM_SETPOS, 0, seekPos);
@@ -2987,6 +2975,39 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 ImGui::SetNextItemWidth(70);
                 if (ImGui::SliderInt("% Nts", &nspeedPct, 0, 200, "%d%%"))
                     playback.SetNSpeed(nspeedPct / 100.0, true);
+
+                // Soft rounded capsule behind the centered controls: blurred
+                // content clipped to a rounded rect, dark glass fill built from
+                // concentric rounded layers so the feathering follows the
+                // rounded corners instead of crossing them with straight cuts.
+                {
+                    ImDrawList* bgl = ImGui::GetBackgroundDrawList();
+                    ImVec2 p0 = ImGui::GetWindowPos();
+                    ImVec2 wsz = ImGui::GetWindowSize();
+                    const float hpad = 14.0f;
+                    const float radius = toolbarHeight * 0.5f;
+                    const float feather = 16.0f;
+                    const int nLayers = 8;
+                    // Center the pill vertically on the actual control row.
+                    ImVec2 rowMin = ImGui::GetItemRectMin();
+                    ImVec2 rowMax = ImGui::GetItemRectMax();
+                    float cy = (rowMin.y + rowMax.y) * 0.5f;
+                    ImVec2 c0 = ImVec2(p0.x - hpad, cy - radius);
+                    ImVec2 c1 = ImVec2(p0.x + wsz.x + hpad, cy + radius);
+                    if (m_BlurTextureID) {
+                        float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
+                        bgl->AddImageRounded(m_BlurTextureID, c0, c1,
+                            ImVec2(c0.x / bw, c0.y / bh), ImVec2(c1.x / bw, c1.y / bh),
+                            IM_COL32(255, 255, 255, 255), radius);
+                    }
+                    for (int l = 1; l <= nLayers; l++)
+                    {
+                        float inset = feather * (float)(l - 1) / (float)nLayers;
+                        bgl->AddRectFilled(ImVec2(c0.x + inset, c0.y + inset),
+                            ImVec2(c1.x - inset, c1.y - inset),
+                            IM_COL32(0, 0, 0, 0x14), radius);
+                    }
+                }
 
                 ImGui::End();
                 ImGui::PopStyleVar(2);
