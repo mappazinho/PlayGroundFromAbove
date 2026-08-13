@@ -401,25 +401,8 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 
 		if (m_iBufferWritePos < m_iBufferReadPos)
 		{
+   // Generator fell behind the callback (underrun). Snap the write head to the read head and KEEP processing events in order (reference behavior). Events now behind the front compute samples <= 0 - no audio write, but the event is still sent to the synth, so note state stays consistent. The old fast-forward loop silently dropped note events here: unmatched NoteOffs left notes stuck across the skip window and dropped NoteOns made repeated notes never sound - "repeated notes get cut off" during long playback.
 			m_iBufferWritePos = m_iBufferReadPos;
-			double dAudioFrontTime = m_dStartTime + (double)m_iBufferReadPos / 48000.0;
-			size_t iSkipped = 0;
-			while (e != events->end() && m_pMIDI->GetEventTime(*e) / 1e6 < dAudioFrontTime)
-			{
-				unsigned char iCode = m_pMIDI->GetEventCode(*e);
-				if ((iCode >> 4 != 0x8) && (iCode >> 4 != 0x9))
-				{
-					BYTE ev[3] = { iCode, m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e) };
-					bass->SendEventRaw(ev, 3);
-				}
-				++e;
-				iSkipped++;
-				if (stopGenerator) break;
-			}
-			PRE_DbgLog("GEN underrun skip: fast-forwarded %zu events to t=%.3f", iSkipped, dAudioFrontTime);
-			if (e == events->end() || stopGenerator) break;
-			--e;
-			continue;
 		}
 
 		double evTime = m_pMIDI->GetEventTime(*e) / 1e6;

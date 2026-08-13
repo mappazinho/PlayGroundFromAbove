@@ -1247,6 +1247,67 @@ void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vPr
         g_LoadingProgress.progress++;
     }
 
+    // Repeated notes were getting cut off: the packer stores note-offs as thin
+    // rows and the merge emits pool rows (note-ons) before thin rows on tick
+    // ties, flipping the file's [off, on] order. BASS then kills the just-started
+    // note instantly. Restore file-order semantics within each equal-time group:
+    // thin rows first, pool rows after (relative order preserved), and keep the
+    // sister web pointing at the rows' new positions.
+    {
+        // pool row id -> current list position (partition moves pools too)
+        vector<uint32_t> vRowPos(m_iFullRows);
+        for (size_t p = 0; p < vChannelEvents.size(); p++)
+            if (!IsThinRow(vChannelEvents[p]))
+                vRowPos[vChannelEvents[p]] = (uint32_t)p;
+
+        size_t iGroupStart = 0;
+        const size_t iCount = vChannelEvents.size();
+        while (iGroupStart < iCount)
+        {
+            long long llGroupTime = GetEventTime(vChannelEvents[iGroupStart]);
+            size_t iGroupEnd = iGroupStart + 1;
+            while (iGroupEnd < iCount && GetEventTime(vChannelEvents[iGroupEnd]) == llGroupTime)
+                iGroupEnd++;
+            if (iGroupEnd - iGroupStart > 1)
+            {
+                vector<MIDIChannelEvent> vThins, vPools;
+                vThins.reserve(iGroupEnd - iGroupStart);
+                vPools.reserve(iGroupEnd - iGroupStart);
+                for (size_t p = iGroupStart; p < iGroupEnd; p++)
+                {
+                    if (IsThinRow(vChannelEvents[p]))
+                        vThins.push_back(vChannelEvents[p]);
+                    else
+                        vPools.push_back(vChannelEvents[p]);
+                }
+                if (!vThins.empty() && !vPools.empty())
+                {
+                    std::copy(vThins.begin(), vThins.end(), vChannelEvents.begin() + iGroupStart);
+                    std::copy(vPools.begin(), vPools.end(), vChannelEvents.begin() + iGroupStart + vThins.size());
+                    const size_t iPoolBase = iGroupStart + vThins.size();
+                    for (size_t j = 0; j < vPools.size(); j++)
+                        vRowPos[vPools[j]] = (uint32_t)(iPoolBase + j);
+                }
+            }
+            iGroupStart = iGroupEnd;
+        }
+
+        // The merge points each thin row at its owner pool's position at the
+        // moment the thin was emitted; that position is stale whenever the
+        // pool's tie group was partitioned afterwards. Rewrite the whole
+        // sister web from the final positions.
+        for (size_t p = 0; p < iCount; p++)
+        {
+            MIDIChannelEvent iRow = vChannelEvents[p];
+            if (IsThinRow(iRow))
+            {
+                MIDIChannelEvent iOwner = GetThinOwner(iRow);
+                SetEventSisterIdx(iRow, vRowPos[iOwner]);
+                SetEventSisterIdx(iOwner, (unsigned)p);
+            }
+        }
+    }
+
     // We don't need the per-track row/meta cursors anymore; the merged list is
 
     m_Info.llTotalMicroSecs = llTime;

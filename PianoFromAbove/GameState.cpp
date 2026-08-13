@@ -1743,7 +1743,7 @@ GameState::GameError MainScreen::Logic( void )
                     UpdateState(key, work);
             });
         }
-        
+
         if (cViz.bNerdStats) {
             for (; !m_dNPSNotes.empty(); m_dNPSNotes.pop_front()) {
                 if (std::get<0>(m_dNPSNotes.front()) >= m_llStartTime - 1000000)
