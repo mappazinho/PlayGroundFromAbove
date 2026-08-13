@@ -1,4 +1,4 @@
-﻿/*************************************************************************************************
+/*************************************************************************************************
 *
 * File: GameState.cpp
 *
@@ -21,6 +21,28 @@
 #include "ConfigProcs.h"
 #include "MIDIPreRenderPlayer.h"
 #include <d3d9types.h>
+
+// Uploads the (possibly changed) track settings colors into the renderer's
+// GPU-side color buffer. Must run every frame in every screen that renders
+// notes, since the renderer only re-uploads the marked tracks.
+static void SyncTrackColors(D3D12Renderer* pRenderer, const vector<TrackSettings>& vTrackSettings)
+{
+    auto* track_colors = pRenderer->GetTrackColors();
+    for (size_t i = 0; i < min(vTrackSettings.size(), MaxTrackColors); i++) {
+        bool bChanged = false;
+        for (size_t j = 0; j < 16; j++) {
+            auto& src = vTrackSettings[i].aChannels[j];
+            auto& dst = track_colors[i * 16 + j];
+            TrackColor c = { src.iPrimaryRGB, src.iDarkRGB, src.bHidden ? 0xFFFFFFFF : src.iVeryDarkRGB }; // Hack to signal hidden track without checking on CPU
+            if (dst.primary != c.primary || dst.dark != c.dark || dst.darker != c.darker) {
+                dst = c;
+                bChanged = true;
+            }
+        }
+        if (bChanged)
+            pRenderer->MarkTrackColorsDirty(i);
+    }
+}
 
 const wstring GameState::Errors[] =
 {
@@ -766,21 +788,7 @@ GameState::GameError SplashScreen::Logic()
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
     memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
-    auto* track_colors = m_pRenderer->GetTrackColors();
-    for (size_t i = 0; i < min(m_vTrackSettings.size(), MaxTrackColors); i++) {
-        bool bChanged = false;
-        for (size_t j = 0; j < 16; j++) {
-            auto& src = m_vTrackSettings[i].aChannels[j];
-            auto& dst = track_colors[i * 16 + j];
-            TrackColor c = { src.iPrimaryRGB, src.iDarkRGB, src.iVeryDarkRGB };
-            if (dst.primary != c.primary || dst.dark != c.dark || dst.darker != c.darker) {
-                dst = c;
-                bChanged = true;
-            }
-        }
-        if (bChanged)
-            m_pRenderer->MarkTrackColorsDirty(i);
-    }
+    SyncTrackColors(m_pRenderer, m_vTrackSettings);
 
     return Success;
 }
@@ -1785,21 +1793,7 @@ GameState::GameError MainScreen::Logic( void )
     else
         memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
-    auto* track_colors = m_pRenderer->GetTrackColors();
-    for (size_t i = 0; i < min(m_vTrackSettings.size(), MaxTrackColors); i++) {
-        bool bChanged = false;
-        for (size_t j = 0; j < 16; j++) {
-            auto& src = m_vTrackSettings[i].aChannels[j];
-            auto& dst = track_colors[i * 16 + j];
-            TrackColor c = { src.iPrimaryRGB, src.iDarkRGB, src.bHidden ? 0xFFFFFFFF : src.iVeryDarkRGB }; // Hack to signal hidden track without checking on CPU
-            if (dst.primary != c.primary || dst.dark != c.dark || dst.darker != c.darker) {
-                dst = c;
-                bChanged = true;
-            }
-        }
-        if (bChanged)
-            m_pRenderer->MarkTrackColorsDirty(i);
-    }
+    SyncTrackColors(m_pRenderer, m_vTrackSettings);
 
     return Success;
 }
@@ -3676,6 +3670,7 @@ GameState::GameError FreePlayScreen::Logic()
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
     memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
+    SyncTrackColors(m_pRenderer, m_vTrackSettings);
 
     ImGui::SetNextWindowPos(ImVec2(4.0f, 24.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340.0f, 660.0f), ImGuiCond_FirstUseEver);
