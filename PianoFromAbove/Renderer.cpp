@@ -3439,7 +3439,33 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             float prog = progMax > 0 ? (float)progLoaded / (float)progMax : 0.0f;
             ImGui::ProgressBar(prog, ImVec2(350, 0));
             char buf[128];
-            snprintf(buf, sizeof(buf), "%llu / %llu", progLoaded, progMax);
+            {
+                static double s_fStageStart = 0.0;
+                static MIDILoadingProgress::Stage s_eLastStage = (MIDILoadingProgress::Stage)(-1);
+                static uint64_t s_iLastProgress = 0;
+                const MIDILoadingProgress::Stage eStage = g_LoadingProgress.stage;
+                const double fNow = ImGui::GetTime();
+                if ( eStage != s_eLastStage || progLoaded < s_iLastProgress )
+                    s_fStageStart = fNow;
+                s_eLastStage = eStage;
+                s_iLastProgress = progLoaded;
+                double fETA = 0.0;
+                const double fElapsed = fNow - s_fStageStart;
+                if ( progMax > 0 && fElapsed > 0.5 && progLoaded > 0 && progLoaded < progMax )
+                {
+                    const double fRate = ( double )progLoaded / fElapsed;
+                    fETA = ( double )( progMax - progLoaded ) / fRate;
+                }
+                if ( fETA > 0.0 )
+                {
+                    if ( fETA < 60.0 )
+                        snprintf( buf, sizeof( buf ), "%llu / %llu - ETA %.0fs", progLoaded, progMax, fETA );
+                    else
+                        snprintf( buf, sizeof( buf ), "%llu / %llu - ETA %.1f min", progLoaded, progMax, fETA / 60.0 );
+                }
+                else
+                    snprintf( buf, sizeof( buf ), "%llu / %llu", progLoaded, progMax );
+            }
             ImGui::Text("%s", buf);
             PROCESS_MEMORY_COUNTERS mem{};
             mem.cb = sizeof(mem);

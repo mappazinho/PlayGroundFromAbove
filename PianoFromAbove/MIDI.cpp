@@ -943,6 +943,7 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
     if ( nThreads == 0 ) nThreads = 1;
     {
         atomic< size_t > iNext( 0 );
+        atomic< size_t > iDone( 0 );
         vector< thread > vThreads;
         vThreads.reserve( nThreads );
         for ( unsigned int t = 0; t < nThreads; t++ )
@@ -961,6 +962,7 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
                     {
                         vErrors[i] = current_exception();
                     }
+                    g_LoadingProgress.progress = min( (uint64_t)iDone.fetch_add( 1, memory_order_relaxed ) + 1, g_LoadingProgress.max );
                 }
             } );
         for ( auto &th : vThreads )
@@ -1021,6 +1023,7 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
     vector< vector< MIDIEvent* > > vMetasAll( nChunks );
     {
         atomic< size_t > iNext( 0 );
+        atomic< size_t > iDone2( 0 );
         vector< thread > vThreads;
         vThreads.reserve( nThreads );
         for ( unsigned int t = 0; t < nThreads; t++ )
@@ -1047,6 +1050,7 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
                     {
                         vErrors[i] = current_exception();
                     }
+                    g_LoadingProgress.progress = min( nChunks + (uint64_t)iDone2.fetch_add( 1, memory_order_relaxed ) + 1, g_LoadingProgress.max );
                 }
             } );
         for ( auto &th : vThreads )
@@ -1067,7 +1071,6 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
         track->m_vMetas = std::move( vMetasAll[c] );
         m_vTracks.push_back( track );
         m_Info.AddTrackInfo( *track );
-        g_LoadingProgress.progress++;
     }
     PRE_DbgLog("LOAD [ParseTracks merged rows=%zu]", iTotalRows);
 
