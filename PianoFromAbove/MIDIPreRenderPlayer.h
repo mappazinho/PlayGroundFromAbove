@@ -18,5 +18,13 @@ extern void PRE_Reset();
 // SDL audio callback.
 extern void PRE_FillAudio(void* udata, Uint8* stream, int len);
 
+// True when the SDL audio callback hasn't fired for >2s (device stalled: the whole
+// process keeps running but no sound is produced). Poll from the game thread only.
+extern bool PRE_AudioStalled();
+
+// Closes and re-opens the SDL audio device (safe under the WASAPI backend, whose
+// audio thread parks on a shutdown event even when the device itself has stalled).
+extern void PRE_RestartAudio();
+
 // Temporary diagnostic: thread-safe append to %TEMP%\pfa_prerender.log
 extern void PRE_DbgLog(const char* format, ...);

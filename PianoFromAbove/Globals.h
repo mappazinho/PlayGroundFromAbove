@@ -31,8 +31,18 @@ extern bool g_bSkipGPUWait; // Experiment: skip WaitForGPU fence waits entirely 
 extern bool g_bDisableBlur; // Experiment: skip the per-frame blur compute passes
 extern bool g_bDisableGates; // Experiment: render/present through window transitions like the base
 extern bool g_bInRecovery;   // Set while the renderer is being rebuilt after a TDR
+extern bool g_bD3D12Available; // Probed at startup: can this machine create a D3D12 device at all?
+extern bool g_bBootedFallback; // Set when the requested renderer failed to init and we fell back to D3D11
+extern const wchar_t* g_pwszRenderMode; // Active backend name ("DirectX 12"/"DirectX 11"), set after init
 extern TSQueue< MSG > g_MsgQueue; // Producer/consumer to hold events for our game thread
 
 void HeartbeatLog(const char* tag); // Temporary debug diagnostics (game thread only)
+
+// Sets the main window title with the active renderer indicator appended.
+inline void SetMainTitle(const wchar_t* title) {
+    wchar_t buf[1280];
+    _snwprintf_s(buf, 1280, L"%s (Mode: %s)", title, g_pwszRenderMode);
+    SetWindowText(g_hWnd, buf);
+}
 
 #define ERRORANDRETURN( hwnd, msg, retval ) { MessageBox( ( hwnd ), ( msg ), TEXT( "Error" ), MB_OK | MB_ICONERROR ); return ( retval ); }

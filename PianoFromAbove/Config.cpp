@@ -73,7 +73,7 @@ void Config::LoadConfigValues()
     LoadConfigValues( txRoot );
 
     // Custom settings need to be loaded from a separate file, otherwise stock PFA will reset them
-    doc = TiXmlDocument(sPath + "\\pfavizkhang.xml");
+    doc = TiXmlDocument(sPath + "\\PlayGroundFromAbove.xml");
     if (!doc.LoadFile())
         return;
 
@@ -123,7 +123,7 @@ bool Config::SaveConfigValues()
 
     m_VizSettings.SaveConfigValues(txRoot);
 
-    return bStockRet && doc.SaveFile(sPath + "\\pfavizkhang.xml");
+    return bStockRet && doc.SaveFile(sPath + "\\PlayGroundFromAbove.xml");
 }
 
 bool Config::SaveConfigValues( TiXmlElement *txRoot )
@@ -186,7 +186,7 @@ void VideoSettings::LoadDefaultValues()
 {
     this->bLimitFPS = true;
     this->bShowFPS = false;
-    this->eRenderer = Direct3D;
+    this->eRenderer = DirectX12;
 }
 
 void ControlsSettings::LoadDefaultValues()
@@ -376,7 +376,10 @@ void VideoSettings::LoadConfigValues( TiXmlElement *txRoot )
         this->bShowFPS = ( iAttrVal != 0 );
     if ( txVideo->QueryIntAttribute( "LimitFPS", &iAttrVal ) == TIXML_SUCCESS )
         this->bLimitFPS = ( iAttrVal != 0 );
-    if ( txVideo->QueryIntAttribute( "Renderer", &iAttrVal ) == TIXML_SUCCESS )
+    // New renderer attribute (0 = DirectX 11, 1 = DirectX 12). The legacy
+    // "Renderer" attribute (Direct3D/OpenGL/GDI) no longer exists; old configs
+    // migrate to DirectX 12, which was the only working backend.
+    if ( txVideo->QueryIntAttribute( "RendererAPI", &iAttrVal ) == TIXML_SUCCESS && ( iAttrVal == 0 || iAttrVal == 1 ) )
         this->eRenderer = static_cast< Renderer >( iAttrVal );
 }
 
@@ -592,7 +595,8 @@ bool VideoSettings::SaveConfigValues( TiXmlElement *txRoot )
 {
     TiXmlElement *txVideo = new TiXmlElement( "Video" );
     txRoot->LinkEndChild( txVideo );
-    txVideo->SetAttribute( "Renderer", this->eRenderer );
+    txVideo->SetAttribute( "Renderer", 0 ); // Legacy attribute: always "Direct3D"
+    txVideo->SetAttribute( "RendererAPI", this->eRenderer );
     txVideo->SetAttribute( "ShowFPS", this->bShowFPS );
     txVideo->SetAttribute( "LimitFPS", this->bLimitFPS );
     return true;

@@ -16,6 +16,14 @@ static int s_sampleRate = 48000;
 
 static float* s_pRingBuffer = nullptr;
 
+// Set by the SDL audio callback on every invocation. The game thread polls this via
+// PRE_AudioStalled() to detect a stalled audio device (observed on this machine: the
+// DirectSound waveout thread parks on a buffer event that never fires again after a
+// display/GPU hiccup, leaving the app alive but silent).
+static volatile long long s_llLastCallbackTick = 0;
+
+static bool PRE_OpenDevice();
+
 static CRITICAL_SECTION s_csLog;
 
 void PRE_DbgLog(const char* format, ...)
@@ -53,6 +61,7 @@ void PRE_DbgLog(const char* format, ...)
 
 void PRE_FillAudio(void* udata, Uint8* stream, int len)
 {
+	s_llLastCallbackTick = SDL_GetTicks64();
 	SDL_memset(stream, 0, len);
 	if (PRE_MIDIAudio && s_pRingBuffer)
 	{
@@ -109,6 +118,32 @@ void PRE_Reset()
 		memset(s_pRingBuffer, 0, (size_t)s_bufferSize * sizeof(float) * (size_t)s_bufferSecs);
 }
 
+bool PRE_AudioStalled()
+{
+	long long now = SDL_GetTicks64();
+	long long last = s_llLastCallbackTick;
+	return (now - last) > 2000;
+}
+
+void PRE_RestartAudio()
+{
+	PRE_DbgLog("RestartAudio: err='%s' lastCB=%lldms", SDL_GetError() ? SDL_GetError() : "(null)", (long long)s_llLastCallbackTick);
+	SDL_CloseAudio();
+	PRE_OpenDevice();
+}
+
+static bool PRE_OpenDevice()
+{
+	if (SDL_OpenAudio(&s_wanted, NULL) < 0)
+	{
+		PRE_DbgLog("PRE_InitAudio: SDL_OpenAudio failed: %s", SDL_GetError());
+		return false;
+	}
+	SDL_PauseAudio(1);
+	PRE_DbgLog("PRE_InitAudio: SDL audio driver='%s'", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(null)");
+	return true;
+}
+
 int PRE_InitAudio()
 {
  // Fresh diagnostics each run.
@@ -116,6 +151,12 @@ int PRE_InitAudio()
 	GetTempPathW(_countof(path), path);
 	wcscat_s(path, L"pfa_prerender.log");
 	DeleteFileW(path);
+
+ // WASAPI over DirectSound: the directsound waveout thread can park forever on a
+ // dead buffer event after a display/GPU hiccup (observed: callback stops, process
+ // alive, silence). WASAPI's audio thread waits on a shutdown event too, so device
+ // re-open from the game thread is safe and the backend self-heals on device loss.
+	SDL_SetHint(SDL_HINT_AUDIODRIVER, "wasapi");
 
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
 		return -1;
@@ -136,9 +177,7 @@ int PRE_InitAudio()
 
 	s_obtained = s_wanted;
 
-	if (SDL_OpenAudio(&s_wanted, NULL) < 0)
+	if (!PRE_OpenDevice())
 		return -1;
-
-	SDL_PauseAudio(1);
 	return s_sampleRate;
 }

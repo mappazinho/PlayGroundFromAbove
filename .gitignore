@@ -335,7 +335,8 @@ ASALocalRun/
 
 # ---- Not needed for compilation (kept locally, not uploaded) ----
 # Stray build artifacts
-/PFA-1.1.0viz-AVX2.exe
+/PGFA-Beta-AVX2.exe
+/PGFA-Beta-SSE42.exe
 resolve.obj
 resolve2.obj
 
@@ -344,9 +345,13 @@ PianoFromAbove/bass.dll
 PianoFromAbove/bassmidi.dll
 PianoFromAbove/SDL2.dll
 PianoFromAbove/sdl2/SDL2.dll
+/bass.dll
+/bassmidi.dll
+/SDL2.dll
 
 # Runtime content
 PianoFromAbove/Soundfonts/
+/Soundfonts/
 /Music/
 
 # Installer / redistributable / legacy DXSDK bootstrap

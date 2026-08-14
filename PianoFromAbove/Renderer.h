@@ -15,9 +15,9 @@
 #include <wrl/client.h>
 #include <string>
 #include <vector>
+#include <tuple>
 #include <wincodec.h>
 #include "imgui/imgui.h"
-#include "imgui/imgui_impl_dx12.h"
 #include "imgui/imgui_impl_win32.h"
 
 using Microsoft::WRL::ComPtr;
@@ -57,6 +57,14 @@ struct RootConstants {
     float timespan;
     float stripMode;
     float stripTimeSpan;
+    float fWarp;
+    float fWarpTime;
+    float fWarpSeedX;
+    float fWarpSeedY;
+    float notes_x;
+    float notes_cx;
+    float fMT;
+    float fMTTilt;
 };
 static_assert(sizeof(RootConstants) % 4 == 0);
 
@@ -74,19 +82,60 @@ struct FixedSizeConstants {
     float bends[16];
 };
 
-class D3D12Renderer {
+class D3D11Renderer;
+
+// Base renderer: API-agnostic state, batching, and UI. GPU work happens in
+// D3D12Renderer (d3d12) / D3D11Renderer (d3d11) via the virtual hooks below.
+class Renderer {
 public:
     enum FontSize { Small, SmallBold, SmallComic, Medium, Large };
 
-    D3D12Renderer();
-    ~D3D12Renderer();
+    virtual ~Renderer() {}
 
-    std::tuple<HRESULT, const char*> Init( HWND hWnd, bool bLimitFPS );
+    // Picks the backend: D3D12 when the user requested it and this machine can
+    // create a D3D12 device (g_bD3D12Available probe, no boot-time fallback),
+    // otherwise D3D11.
+    static Renderer* CreateInstance();
+
+    // Human-readable name of the active backend, e.g. "DirectX 12".
+    virtual const wchar_t* GetModeName() const { return L"Unknown"; }
+
+    // --- GPU-backend surface -------------------------------------------------
+    virtual std::tuple<HRESULT, const char*> Init(HWND hWnd, bool bLimitFPS) = 0;
+    virtual HRESULT ResetDevice() = 0;
+    virtual HRESULT ClearAndBeginScene(DWORD color) = 0;
+    virtual HRESULT EndScene(bool draw_bg = false) = 0;
+    virtual HRESULT PresentBackend() = 0;
+    virtual HRESULT WaitForGPU() = 0;
+    virtual std::wstring GetAdapterName() = 0;
+    virtual void SetPipeline(Pipeline pipeline) = 0;
+    virtual char* Screenshot() = 0;
+    virtual void SetBackgroundBlur(float sigma) = 0;
+    virtual void ApplyBlur() = 0;
+    virtual void DrawPianoRollStripBackground() = 0;
+    virtual void DrawPianoRollStrip() = 0;
+
+protected:
+    virtual std::tuple<HRESULT, const char*> CreateWindowDependentObjects(HWND hWnd) = 0;
+    virtual void SetupCommandList() = 0;
+    virtual bool UploadBackgroundBitmap() = 0;
+    virtual HRESULT CreateBlurResources() = 0;
+    virtual void DestroyBlurResources() = 0;
+    virtual void ReleaseDeviceResources() = 0;
+    virtual void ImGuiBackendNewFrame() = 0;
+    virtual void ImGuiBackendShutdown() = 0;
+    virtual void ImGuiBackendCreateDeviceObjects() = 0;
+    void UpdateImGuiSettings(); // shared font/style rebuild; ends in the backend hook
+
+public:
+    // --- Shared (API-agnostic) implementation ---------------------------------
     HRESULT ResetDeviceIfNeeded();
-    HRESULT ResetDevice();
-    HRESULT ClearAndBeginScene( DWORD color );
-    HRESULT EndScene(bool draw_bg = false);
-    HRESULT Present();
+    HRESULT RecoverDevice(HWND hWnd, bool bLimitFPS);
+    HRESULT Present(); // PresentPrelude (throttle/minimize) + PresentBackend()
+    bool DeviceLost() const { return m_bDeviceLost; }
+    int GetBufferWidth() const { return m_iBufferWidth; }
+    int GetBufferHeight() const { return m_iBufferHeight; }
+
     HRESULT BeginText();
     HRESULT DrawTextW( const WCHAR *sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1 );
     HRESULT DrawTextA( const CHAR *sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1 );
@@ -101,17 +150,6 @@ public:
 
     bool GetLimitFPS() const { return m_bLimitFPS; }
     HRESULT SetLimitFPS( bool bLimitFPS );
-
-    // GPU resource and resume rendering; returns the Init result.
-    HRESULT RecoverDevice(HWND hWnd, bool bLimitFPS);
-    bool DeviceLost() const { return m_bDeviceLost; }
-
-    int GetBufferWidth() const { return m_iBufferWidth; }
-    int GetBufferHeight() const { return m_iBufferHeight; }
-
-    HRESULT WaitForGPU();
-    std::wstring GetAdapterName();
-    void SetPipeline(Pipeline pipeline);
 
     RootConstants& GetRootConstants() { return m_RootConstants; };
     FixedSizeConstants& GetFixedSizeConstants() { return m_FixedConstants; };
@@ -128,9 +166,7 @@ public:
     size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size(); };
     void SplitRect() { m_iRectSplit = (int)m_vRectsIntermediate.size(); }
 
-    char* Screenshot();
     bool LoadBackgroundBitmap(std::wstring path);
-    void SetBackgroundBlur(float sigma);
 
     void ImGuiStartFrame();
     void RenderImGuiFrame();
@@ -141,9 +177,6 @@ public:
         m_iPianoRollEndNote = endNote;
         m_fPianoRollPlayhead = playheadFraction;
     }
-    void ApplyBlur();
-    void DrawPianoRollStripBackground();
-    void DrawPianoRollStrip();
     void DrawPianoRollStripKeyboard();
     void SetStripKeyboardColors(DWORD white, DWORD whiteDark, DWORD whiteVeryDark,
                                 DWORD sharp, DWORD sharpDark, DWORD sharpVeryDark,
@@ -161,6 +194,7 @@ public:
         m_fRibbonX = x; m_fRibbonY = y; m_fRibbonCX = cx; m_fRibbonCY = cy;
     }
 
+    // --- Shared UI/state, public for the game states to poke at --------------
     bool m_bShowPreferences = false;
     bool m_bShowAbout = false;
     bool m_bShowSetResolution = false;
@@ -172,20 +206,18 @@ public:
     unsigned m_iLagIntensity = 1; // Fun menu: 1 = no lag, 2/3/4 = NPS-based FPS throttling tiers
     long long m_llLagNPS = 0; // current notes-per-second, fed by GameState for the lag throttler
     void SetLagNPS(long long nps) { m_llLagNPS = nps; }
+    bool m_bOverclockArtifacts = false; // Fun menu: warp geometry harder as FPS falls below 60
+    double m_dLagFPS = 0.0; // EMA-smoothed FPS, feeds the artifact intensity
+
+    bool m_bMTMode = false; // MIDITrail view mode (Fun menu)
+    float m_fMTTilt = 3.0f; // MIDITrail camera tilt
 
     int m_iPianoRollStartNote = 0;
     int m_iPianoRollEndNote = 127;
     float m_fPianoRollPlayhead = 0.0f;
 
-private:
-    std::tuple<HRESULT, const char*> CreateWindowDependentObjects(HWND hWnd);
-    void SetupCommandList();
-    bool UploadBackgroundBitmap();
-    void UpdateImGuiSettings();
-    HRESULT CreateBlurResources();
-    void DestroyBlurResources();
-    void ReleaseDeviceResources();
-
+protected:
+    // Shared constants (both backends use the same layout/timings)
     static constexpr unsigned FrameCount = 2;
     static constexpr unsigned RectsPerPass = 10000; // Relatively low limit, but not many rects are supposed to be rendered anyway
     static constexpr unsigned MaxNotesPerPass = 5000000;
@@ -194,6 +226,8 @@ private:
     static constexpr unsigned StripNoteBudget = 5000000;
     static constexpr unsigned NoteBufferCapacity = MaxNotesPerPass * 2;
     static constexpr unsigned IndexBufferCount = max(RectsPerPass, MaxNotesPerPass) * 6;
+    // Fixed constants + track colors share one upload region so the note
+    // pipeline needs a single t1/t2/t3 SRV set in both APIs.
     static constexpr unsigned GenericUploadSize = sizeof(FixedSizeConstants) + MaxTrackColors * 16 * sizeof(TrackColor);
 
     static ComPtr<IWICImagingFactory> s_pWICFactory;
@@ -206,6 +240,81 @@ private:
     unsigned m_NotesPerPass = MaxNotesPerPass;
 
     HWND m_hWnd = NULL;
+
+    RootConstants m_RootConstants = {};
+    FixedSizeConstants m_FixedConstants = {};
+    FixedSizeConstants m_OldFixedConstants = {};
+    TrackColor m_TrackColors[MaxTrackColors * 16] = {};
+    size_t m_uTrackColorsDirtyBegin = SIZE_MAX;
+    size_t m_uTrackColorsDirtyEnd = 0;
+
+    std::vector<RectVertex> m_vRectsIntermediate;
+    std::vector<NoteData> m_vNotesIntermediate;
+    std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
+    int m_iRectSplit = -1;
+
+    ImDrawList* m_pDrawList = nullptr;
+    float m_fLastUIScale = 1.0f;
+    std::wstring m_sLastFont;
+    bool m_bShowToolbar = true;
+    int m_resWidth = 0;
+    int m_resHeight = 0;
+    float m_fPlaybackPosition = 0.0f;
+
+    // Blur/bloom output exposed to ImGui as a texture id.
+    ImTextureID m_BlurTextureID = 0;
+
+    std::vector<char> m_vScreenshotOutput;
+
+    float m_fRibbonX = 0, m_fRibbonY = 0, m_fRibbonCX = 0, m_fRibbonCY = 0;
+
+    DWORD m_stripKBWhite = 0, m_stripKBWhiteDark = 0, m_stripKBWhiteVeryDark = 0;
+    DWORD m_stripKBSharp = 0, m_stripKBSharpDark = 0, m_stripKBSharpVeryDark = 0;
+    DWORD m_stripKBBackground = 0, m_stripKBBackgroundDark = 0;
+    DWORD m_stripPressedKeys[128] = {};
+    DWORD m_stripRibbonColors[128] = {};
+
+    ComPtr<IWICBitmapSource> m_pUnscaledBackground;
+    float m_fBGBlurSigma = 0.0f;
+
+    // Shared per-frame helpers (backends call into these)
+    void UpdateWarpConstants(); // corruption ramp + warp clock (ClearAndBeginScene prelude)
+    bool PresentPrelude();      // FPS EMA, lag throttle, minimize gate; true = skip frame
+    double m_dPresentWaitMs = 0.0; // per-frame swapchain wait time, fed by PresentBackend
+};
+
+class D3D12Renderer : public Renderer {
+public:
+    D3D12Renderer();
+    ~D3D12Renderer();
+
+    std::tuple<HRESULT, const char*> Init(HWND hWnd, bool bLimitFPS) override;
+    HRESULT ResetDevice() override;
+    HRESULT ClearAndBeginScene(DWORD color) override;
+    HRESULT EndScene(bool draw_bg = false) override;
+    HRESULT PresentBackend() override;
+    HRESULT WaitForGPU() override;
+    std::wstring GetAdapterName() override;
+    const wchar_t* GetModeName() const override { return L"DirectX 12"; }
+    void SetPipeline(Pipeline pipeline) override;
+    char* Screenshot() override;
+    void SetBackgroundBlur(float sigma) override;
+    void ApplyBlur() override;
+    void DrawPianoRollStripBackground() override;
+    void DrawPianoRollStrip() override;
+
+protected:
+    std::tuple<HRESULT, const char*> CreateWindowDependentObjects(HWND hWnd) override;
+    void SetupCommandList() override;
+    bool UploadBackgroundBitmap() override;
+    HRESULT CreateBlurResources() override;
+    void DestroyBlurResources() override;
+    void ReleaseDeviceResources() override;
+    void ImGuiBackendNewFrame() override;
+    void ImGuiBackendShutdown() override;
+    void ImGuiBackendCreateDeviceObjects() override;
+
+private:
     ComPtr<IDXGIFactory2> m_pFactory;
     ComPtr<IDXGIAdapter2> m_pAdapter;
     ComPtr<ID3D12Device> m_pDevice;
@@ -242,28 +351,19 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pGenericUpload;
     ComPtr<ID3D12Resource> m_pFixedBuffer;
     ComPtr<ID3D12Resource> m_pTrackColorBuffer;
-    RootConstants m_RootConstants = {};
-    FixedSizeConstants m_FixedConstants = {};
-    FixedSizeConstants m_OldFixedConstants = {};
-    TrackColor m_TrackColors[MaxTrackColors * 16] = {};
-    size_t m_uTrackColorsDirtyBegin = SIZE_MAX;
-    size_t m_uTrackColorsDirtyEnd = 0;
 
     UINT m_uFrameIndex = 0;
     UINT64 m_pFenceValues[FrameCount] = {};
 
     ComPtr<ID3D12Resource> m_pScreenshotStaging;
-    std::vector<char> m_vScreenshotOutput;
     UINT64 m_ullScreenshotPitch;
 
     ComPtr<ID3D12Resource> m_pTextureUpload;
     ComPtr<ID3D12Resource> m_pTextureBuffer;
-    ComPtr<IWICBitmapSource> m_pUnscaledBackground;
 
     ComPtr<ID3D12DescriptorHeap> m_pBGBlurHeap;
     ComPtr<ID3D12Resource> m_pBGBufferA;
     ComPtr<ID3D12Resource> m_pBGBufferB;
-    float m_fBGBlurSigma = 0.0f;
     D3D12_CPU_DESCRIPTOR_HANDLE m_BGBgTexSRVCPU = {};
     D3D12_GPU_DESCRIPTOR_HANDLE m_BGBgTexSRVGPU = {};
     D3D12_CPU_DESCRIPTOR_HANDLE m_BGBgAUAVCPU = {};
@@ -272,19 +372,6 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     D3D12_GPU_DESCRIPTOR_HANDLE m_BGBgASRVGPU = {};
     D3D12_CPU_DESCRIPTOR_HANDLE m_BGBgBUAVCPU = {};
     D3D12_GPU_DESCRIPTOR_HANDLE m_BGBgBUAVGPU = {};
-
-    std::vector<RectVertex> m_vRectsIntermediate;
-    std::vector<NoteData> m_vNotesIntermediate;
-    std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
-    int m_iRectSplit = -1;
-
-    ImDrawList* m_pDrawList = nullptr;
-    float m_fLastUIScale = 1.0f;
-    std::wstring m_sLastFont;
-    bool m_bShowToolbar = true;
-    int m_resWidth = 0;
-    int m_resHeight = 0;
-    float m_fPlaybackPosition = 0.0f;
 
     ComPtr<ID3D12RootSignature> m_pBlurRootSignature;
     ComPtr<ID3D12PipelineState> m_pBlurPipelineState;
@@ -302,7 +389,6 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     D3D12_GPU_DESCRIPTOR_HANDLE m_BlurOutputSRVGPU = {};
     D3D12_CPU_DESCRIPTOR_HANDLE m_BlurOutputUAVCPU = {};
     D3D12_GPU_DESCRIPTOR_HANDLE m_BlurOutputUAVGPU = {};
-    ImTextureID m_BlurTextureID = 0;
     D3D12_RESOURCE_STATES m_BlurTempState = D3D12_RESOURCE_STATE_COMMON;
     D3D12_RESOURCE_STATES m_BlurOutputState = D3D12_RESOURCE_STATE_COMMON;
     D3D12_RESOURCE_STATES m_SceneCopyState = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -328,12 +414,4 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     int m_iBloomHalfWidth = 0, m_iBloomHalfHeight = 0;
     ComPtr<ID3D12PipelineState> m_pBloomExtractPipelineState;
     ComPtr<ID3D12RootSignature> m_pBloomExtractRootSignature;
-
-    float m_fRibbonX = 0, m_fRibbonY = 0, m_fRibbonCX = 0, m_fRibbonCY = 0;
-
-    DWORD m_stripKBWhite = 0, m_stripKBWhiteDark = 0, m_stripKBWhiteVeryDark = 0;
-    DWORD m_stripKBSharp = 0, m_stripKBSharpDark = 0, m_stripKBSharpVeryDark = 0;
-    DWORD m_stripKBBackground = 0, m_stripKBBackgroundDark = 0;
-    DWORD m_stripPressedKeys[128] = {};
-    DWORD m_stripRibbonColors[128] = {};
 };

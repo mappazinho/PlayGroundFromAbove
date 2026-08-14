@@ -37,6 +37,9 @@ bool g_bSkipGPUWait = false;
 bool g_bDisableBlur = false;
 bool g_bDisableGates = false; // Keep the size-move/reset gates ON: presenting through window animations stalls the flip queue on NVIDIA (2s+ fence waits -> TDR)
 bool g_bInRecovery = false;
+bool g_bD3D12Available = true;
+bool g_bBootedFallback = false;
+const wchar_t* g_pwszRenderMode = L"DirectX 12";
 
 static void TraceMsg(const char* name, WPARAM wParam, LPARAM lParam) {
     static bool bInit = false;
@@ -110,7 +113,7 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     cPlayback.SetPaused(false, true);
                     cPlayback.SetPosition(0);
                     cView.SetZoomMove(false, true);
-                    SetWindowText(g_hWnd, L"PlayGroundFromAbove - Free Play");
+                    SetMainTitle(L"PlayGroundFromAbove - Free Play");
                     HandOffMsg(WM_COMMAND, ID_CHANGESTATE, (LPARAM)pGameState);
                     return 0;
                 }
@@ -120,7 +123,7 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     cPlayback.SetPlayMode( GameState::Intro, true );
                     cPlayback.SetPlayable( false, true );
                     cPlayback.SetPosition( 0 );
-                    SetWindowText( g_hWnd, L"PlayGroundFromAbove " __DATE__ );
+                    SetMainTitle(L"PlayGroundFromAbove " __DATE__);
                     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )new IntroScreen( NULL, NULL ) );
                     return 0;
                 }
@@ -510,7 +513,7 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
     cPlayback.SetPaused( ePlayMode != GameState::Practice, true );
     cPlayback.SetPosition( 0 );
     cView.SetZoomMove( false, true );
-    SetWindowText( g_hWnd, sFile.c_str() + ( sFile.find_last_of( L'\\' ) + 1 ) );
+    SetMainTitle( sFile.c_str() + ( sFile.find_last_of( L'\\' ) + 1 ) );
 
     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )pGameState );
     return TRUE;

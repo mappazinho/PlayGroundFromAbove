@@ -10,6 +10,7 @@
 *************************************************************************************************/
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <Shlobj.h>
 #include <ctime>
 #include <shlwapi.h>
 #include <winhttp.h>
@@ -300,8 +301,54 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
     return 0;
 }
 
+// Runtime DLLs and config (SDL2/BASS) live in %APPDATA%\PlayGroundFromAbove rather
+// than next to the exe. The DLLs are delay-loaded, so on first launch we migrate
+// any copies found beside the exe into that folder and load them from there.
+static bool EnsureAppDataRuntime()
+{
+    wchar_t szAppData[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, szAppData)))
+        return false;
+
+    std::wstring dir = std::wstring(szAppData) + L"\\" L"PlayGroundFromAbove";
+    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        if (!CreateDirectoryW(dir.c_str(), NULL))
+            return false;
+
+    static const wchar_t* const s_runtimeDLLs[] = { L"SDL2.dll", L"bass.dll", L"bassmidi.dll" };
+
+    wchar_t szExe[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, szExe, MAX_PATH);
+    std::wstring exeDir(szExe);
+    size_t lastSlash = exeDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos)
+        exeDir.resize(lastSlash + 1);
+    else
+        exeDir.clear();
+
+    for (const wchar_t* dll : s_runtimeDLLs) {
+        std::wstring dst = dir + L"\\" + dll;
+        if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::wstring src = exeDir + dll;
+            if (GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES)
+                CopyFileW(src.c_str(), dst.c_str(), FALSE);
+        }
+        if (!LoadLibraryW(dst.c_str())) {
+            wchar_t msg[1024];
+            _snwprintf_s(msg, _TRUNCATE, L"Failed to load %ls from:\n%ls\n\nError %u",
+                         dll, dst.c_str(), (unsigned)GetLastError());
+            MessageBoxW(NULL, msg, L"PlayGroundFromAbove - Missing Runtime", MB_OK | MB_ICONERROR);
+            return false;
+        }
+    }
+    return true;
+}
+
 INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdShow )
 {
+    if (!EnsureAppDataRuntime())
+        return 1;
+
     AddVectoredExceptionHandler(1, VectoredCrashHandler);
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         WriteCrashLog(ep);
@@ -378,7 +425,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     if ( !hAccel ) return 1;
 
     // Get the game going
-    HANDLE hThread = CreateThread( NULL, 0, GameThread, new SplashScreen( NULL, NULL ), 0, NULL );
+    HANDLE hThread = CreateThread( NULL, 8 * 1024 * 1024, GameThread, new SplashScreen( NULL, NULL ), 0, NULL );
     if ( !hThread ) return 1;
 
     // Set up GUI and show
@@ -429,7 +476,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     return 0;
 }
 
-static void RecoverRenderer(D3D12Renderer* pRenderer) {
+static void RecoverRenderer(Renderer* pRenderer) {
     static bool s_bErrorPosted = false;
     HRESULT res = pRenderer->RecoverDevice(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
     if (FAILED(res)) {
@@ -449,7 +496,7 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
 
     __try {
 
-    D3D12Renderer *pRenderer = new D3D12Renderer();
+    Renderer *pRenderer = Renderer::CreateInstance();
     std::tuple<HRESULT, const char*> init_res = { E_FAIL, "Init not attempted" };
     for (int attempt = 0; attempt < 3; attempt++) {
         init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
@@ -457,10 +504,27 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
             break;
         Sleep(500);
     }
+    // A user-requested D3D12 backend that cannot initialize falls back to D3D11
+    // for the rest of the session (the D3D12 option is disabled from then on).
+    if (FAILED(std::get<0>(init_res)) && !g_bBootedFallback &&
+        Config::GetConfig().GetVideoSettings().eRenderer == VideoSettings::DirectX12) {
+        g_bBootedFallback = true;
+        delete pRenderer;
+        pRenderer = Renderer::CreateInstance();
+        init_res = { E_FAIL, "Init not attempted" };
+        for (int attempt = 0; attempt < 3; attempt++) {
+            init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+            if (SUCCEEDED(std::get<0>(init_res)))
+                break;
+            Sleep(500);
+        }
+        if (SUCCEEDED(std::get<0>(init_res)))
+            MessageBox(g_hWnd, TEXT("DirectX 12 could not be initialized; this session is running on DirectX 11."), TEXT("PlayGroundFromAbove"), MB_OK | MB_ICONINFORMATION);
+    }
     if( FAILED(std::get<0>(init_res)) )
     {
         wchar_t msg[1024] = {};
-        _snwprintf_s(msg, 1024, L"Fatal error initializing D3D12.\n%S failed with code 0x%x.", std::get<1>(init_res), std::get<0>(init_res));
+        _snwprintf_s(msg, 1024, L"Fatal error initializing the graphics device.\n%S failed with code 0x%x.", std::get<1>(init_res), std::get<0>(init_res));
         MessageBox( g_hWnd, msg, TEXT( "Error" ), MB_OK | MB_ICONEXCLAMATION );
         delete pRenderer;
         delete reinterpret_cast<GameState*>(lpParameter);
@@ -476,10 +540,11 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
     GameState::GameError ge;
 
     wchar_t buf[1024] = {};
+    g_pwszRenderMode = pRenderer->GetModeName();
 #ifdef __AVX2__
-    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (AVX2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
+    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (AVX2 build, Device: %s, Mode: %s)", __DATE__, pRenderer->GetAdapterName().c_str(), g_pwszRenderMode);
 #else
-    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (SSE4.2 build, Device: %s)", __DATE__, pRenderer->GetAdapterName().c_str());
+    _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (SSE4.2 build, Device: %s, Mode: %s)", __DATE__, pRenderer->GetAdapterName().c_str(), g_pwszRenderMode);
 #endif
     SetWindowTextW(g_hWnd, buf);
 

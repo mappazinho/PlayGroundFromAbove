@@ -20,7 +20,7 @@
 #include "GameState.h"
 #include "MainProcs.h"
 
-#define APPNAME "Piano From Above"
+#define APPNAME "PlayGroundFromAbove"
 #define APPNAMENOSPACES "PlayGroundFromAbove"
 #define CLASSNAME  TEXT( "PianoFromAbove" )
 #define GFXCLASSNAME  TEXT( "PianoFromAboveGfx" )
@@ -86,7 +86,7 @@ struct VideoSettings : public ISettings
     void LoadConfigValues( TiXmlElement *txRoot );
     bool SaveConfigValues( TiXmlElement *txRoot );
 
-    enum Renderer { Direct3D, OpenGL, GDI } eRenderer;
+    enum Renderer { DirectX11, DirectX12 } eRenderer;
     bool bShowFPS, bLimitFPS;
 };
 

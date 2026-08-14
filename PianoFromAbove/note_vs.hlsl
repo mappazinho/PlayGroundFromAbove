@@ -68,15 +68,42 @@ NotePSInput main(uint id : SV_VertexID) {
     }
     bool is_right = vertex == 1 || vertex == 2;
     uint color_idx = root.stripMode > 0.5 ? (vertex < 2) : is_right;
-    float2 position = float2(x, y);
-    position.y -= cy * float(vertex < 2);
-    position.x += cx * float(vertex == 1 || vertex == 2);
-    
+    float2 base = float2(x, y);
+    // Per-lane corruption: notes sharing a key share a stable level that evolves
+    // in half-second steps, always a step ahead of (and hotter than) the keys.
+    float qt = floor(root.fWarpTime * 2.0);
+    float h = WarpHash(float2(x * 0.013, qt * 2.71));
+    float amp = NoteCorruptAmp(root.fWarp, NoteCorruptFactor(h));
+    // Some lanes also get their gradient scrambled (never all): the harder the
+    // corruption, the more notes shuffle primary/dark/darker across corners.
+    float gh = WarpHash(float2(x * 0.019, qt * 0.61 + 0.83));
+    bool gradBroken = gh > 1.0 - min(1.0, amp) * 0.65;
+    uint palette[3] = { colors[track * 16 + chan].colors[0],
+                        colors[track * 16 + chan].colors[1],
+                        colors[track * 16 + chan].colors[2] };
+    uint color = palette[color_idx];
+    if (gradBroken) {
+        float g = WarpHash(float2(x * 0.023, qt * 0.53 + (float)vertex * 0.37 + 0.19));
+        color = palette[(uint)(g * 3.0)];
+    }
+    // Warp each corner on its own (like the keys) so notes stretch and tear
+    // instead of sliding around as rigid bars.
+    float2 corners[4];
+    [unroll]
+    for (uint v = 0; v < 4; v++) {
+        float2 p = base;
+        p.y -= cy * float(v < 2);
+        p.x += cx * float(v == 1 || v == 2);
+        corners[v] = p + WarpOffset(p, amp, root.fWarpTime, root.fWarpSeedX, root.fWarpSeedY, x * 0.013);
+    }
+    float2 position = corners[vertex];
+    float2 minp = min(min(corners[0], corners[1]), min(corners[2], corners[3]));
+    float2 maxp = max(max(corners[0], corners[1]), max(corners[2], corners[3]));
+
     result.position = colors[track * 16 + chan].colors[2] == 0xFFFFFFFF ? float4(0, 0, 0, 0) : mul(root.proj, float4(position, !sharp * 0.5, 1));
-    result.color = float4(unpack_color(colors[track * 16 + chan].colors[color_idx]), 0);
+    result.color = float4(unpack_color(color), 0);
     result.border = float4(unpack_color(colors[track * 16 + chan].colors[2]), 0);
-    //result.edges = float4(left_top, right_bottom);
-    result.edges = float4(x, y, x + cx, y - cy);
+    result.edges = float4(minp.x, minp.y, maxp.x, maxp.y);
     //result.color = outline ? float4(0, 0, 0, 0) : float4(1, 1, 1, 0);
 
     return result;

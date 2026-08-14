@@ -25,7 +25,7 @@
 // Uploads the (possibly changed) track settings colors into the renderer's
 // GPU-side color buffer. Must run every frame in every screen that renders
 // notes, since the renderer only re-uploads the marked tracks.
-static void SyncTrackColors(D3D12Renderer* pRenderer, const vector<TrackSettings>& vTrackSettings)
+static void SyncTrackColors(Renderer* pRenderer, const vector<TrackSettings>& vTrackSettings)
 {
     auto* track_colors = pRenderer->GetTrackColors();
     for (size_t i = 0; i < min(vTrackSettings.size(), MaxTrackColors); i++) {
@@ -219,7 +219,7 @@ GameState::GameError IntroScreen::Render()
 }
 
 
-SplashScreen::SplashScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( hWnd, pRenderer )
+SplashScreen::SplashScreen( HWND hWnd, Renderer *pRenderer ) : GameState( hWnd, pRenderer )
 {
     if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
     {
@@ -631,6 +631,17 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     {
         SDL_PauseAudio(0);
 
+        // Watchdog: the SDL callback must be producing audio. If it has gone quiet
+        // (device stall after a display/GPU hiccup on this machine), re-open the
+        // device so the splash music resumes instead of dying silently.
+        if (PRE_AudioStalled())
+        {
+            PRE_DbgLog("UPA: SDL audio callback stalled - restarting device");
+            SDL_PauseAudio(1);
+            PRE_RestartAudio();
+            SDL_PauseAudio(0);
+        }
+
         if (bRestart)
         {
             PRE_DbgLog("UPA: generator restart");
@@ -783,6 +794,8 @@ GameState::GameError SplashScreen::Logic()
     root_consts.notes_cy = m_fNotesCY;
     root_consts.white_cx = m_fWhiteCX;
     root_consts.timespan = TimeSpan;
+    root_consts.notes_x = m_fNotesX;
+    root_consts.notes_cx = m_fNotesCX;
 
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
@@ -958,7 +971,7 @@ float SplashScreen::GetNoteX(int iNote) {
 }
 
 
-MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, D3D12Renderer *pRenderer ) :
+MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer *pRenderer ) :
     GameState( hWnd, pRenderer ), m_MIDI( sMIDIFile ), m_eGameMode( eGameMode )
 {
     if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
@@ -1788,6 +1801,8 @@ GameState::GameError MainScreen::Logic( void )
     root_consts.notes_cy = m_fNotesCY;
     root_consts.white_cx = m_fWhiteCX;
     root_consts.timespan = (float)m_llTimeSpan;
+    root_consts.notes_x = m_fNotesX;
+    root_consts.notes_cx = m_fNotesCX;
 
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
@@ -2291,7 +2306,7 @@ GameState::GameError MainScreen::Render()
         const std::wstring& name = m_MIDI.GetInfo().sFilename;
         TCHAR sTitle[1024];
         _stprintf_s(sTitle, TEXT("%ws (%.1lf%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), (m_dFPS / m_Timer.m_dFramerate) * 100.0);
-        SetWindowText(g_hWnd, sTitle);
+        SetMainTitle(sTitle);
     }
     return Success;
 }
@@ -3080,11 +3095,11 @@ void MainScreen::RenderMarker(const char* str) {
 void MainScreen::RenderMessage(LPRECT prcMsg, TCHAR* sMsg)
 {
     RECT rcMsg = {};
-    D3D12Renderer::FontSize eFontSize = D3D12Renderer::Medium;
+    Renderer::FontSize eFontSize = Renderer::Medium;
     m_pRenderer->DrawText(sMsg, eFontSize, &rcMsg, DT_CALCRECT, 0xFF000000);
     if (rcMsg.right > m_pRenderer->GetBufferWidth())
     {
-        eFontSize = D3D12Renderer::Small;
+        eFontSize = Renderer::Small;
         m_pRenderer->DrawText(sMsg, eFontSize, &rcMsg, DT_CALCRECT, 0xFF000000);
     }
 
@@ -3096,7 +3111,7 @@ void MainScreen::RenderMessage(LPRECT prcMsg, TCHAR* sMsg)
 }
 
 
-FreePlayScreen::FreePlayScreen(HWND hWnd, D3D12Renderer* pRenderer)
+FreePlayScreen::FreePlayScreen(HWND hWnd, Renderer* pRenderer)
     : MainScreen(L"", GameState::Practice, hWnd, pRenderer)
 {
     InitColors();
@@ -3668,6 +3683,8 @@ GameState::GameError FreePlayScreen::Logic()
     root_consts.notes_cy = m_fNotesCY;
     root_consts.white_cx = m_fWhiteCX;
     root_consts.timespan = (float)m_llTimeSpan;
+    root_consts.notes_x = m_fNotesX;
+    root_consts.notes_cx = m_fNotesCX;
 
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);

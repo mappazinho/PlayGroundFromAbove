@@ -37,7 +37,7 @@ public:
     static GameError ChangeState( GameState *pNextState, GameState **pDestObj );
 
     // Constructors
-    GameState( HWND hWnd, D3D12Renderer *pRenderer ) : m_hWnd( hWnd ), m_pRenderer( pRenderer ), m_pNextState( NULL ) {};
+    GameState( HWND hWnd, Renderer *pRenderer ) : m_hWnd( hWnd ), m_pRenderer( pRenderer ), m_pNextState( NULL ) {};
     virtual ~GameState( void ) {};
 
     virtual const char* DebugName() const = 0;
@@ -61,12 +61,12 @@ public:
     GameState *NextState() { return m_pNextState; };
 
     void SetHWnd( HWND hWnd ) { m_hWnd = hWnd; }
-    void SetRenderer( D3D12Renderer *pRenderer ) { m_pRenderer = pRenderer; }
+    void SetRenderer( Renderer *pRenderer ) { m_pRenderer = pRenderer; }
 
 protected:
     HWND m_hWnd;
 
-    D3D12Renderer *m_pRenderer;
+    Renderer *m_pRenderer;
 
     GameState *m_pNextState;
 
@@ -89,7 +89,7 @@ struct TrackSettings { ChannelSettings aChannels[16]; };
 class SplashScreen : public GameState
 {
 public:
-    SplashScreen( HWND hWnd, D3D12Renderer *pRenderer );
+    SplashScreen( HWND hWnd, Renderer *pRenderer );
 
     const char* DebugName() const override { return "SplashScreen"; }
 
@@ -142,7 +142,7 @@ private:
 class IntroScreen : public GameState
 {
 public:
-    IntroScreen( HWND hWnd, D3D12Renderer *pRenderer ) : GameState( hWnd, pRenderer ) {}
+    IntroScreen( HWND hWnd, Renderer *pRenderer ) : GameState( hWnd, pRenderer ) {}
 
     const char* DebugName() const override { return "IntroScreen"; }
 
@@ -162,7 +162,7 @@ class MainScreen : public GameState
 public:
     static const float KBPercent;
 
-    MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, D3D12Renderer *pRenderer );
+    MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer *pRenderer );
 
     const char* DebugName() const override { return "MainScreen"; }
     virtual bool IsFreePlay() const { return false; }
@@ -322,7 +322,7 @@ void RenderText();
 class FreePlayScreen : public MainScreen
 {
 public:
-    FreePlayScreen(HWND hWnd, D3D12Renderer* pRenderer);
+    FreePlayScreen(HWND hWnd, Renderer* pRenderer);
 
     GameError Init() override;
     GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override;

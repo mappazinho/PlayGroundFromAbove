@@ -7,7 +7,72 @@ struct RootSignatureData {
     float timespan;
     float stripMode;
     float stripTimeSpan;
+    float fWarp;
+    float fWarpTime;
+    float fWarpSeedX;
+    float fWarpSeedY;
+    float notes_x;
+    float notes_cx;
 };
+
+// Overclock artifact emulation. amp = 0..1 instability (0 at 60+ FPS, 1 at 1 FPS),
+// t = running time, s0/s1 = per-frame seeds.
+float WarpHash(float2 p) {
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+// Per-quad corruption amount. h is a stable hash in [0,1) unique to each key.
+// Keys cluster near 100% with tails from ~30% up past 200%.
+float KeyCorruptFactor(float h) {
+    return 0.3 + 1.9 * pow(h, 1.7);
+}
+
+// Notes run hotter than the keys (up to ~2.5x their own lane factor).
+float NoteCorruptFactor(float h) {
+    return 0.4 + 2.1 * pow(h, 1.5);
+}
+
+// Global corruption -> effective amp for a quad.
+// Keys hold off until 15% corruption and only reach full tilt at 100%...
+float KeyCorruptAmp(float w, float f) {
+    return saturate((w - 0.15) / 0.85) * f;
+}
+
+// ...while notes ramp in immediately (full tilt by ~55%) so they corrupt first.
+float NoteCorruptAmp(float w, float f) {
+    return saturate(w / 0.55) * f * 1.15;
+}
+
+float2 WarpOffset(float2 pos, float amp, float t, float s0, float s1, float qseed) {
+    float2 result = 0;
+    if (amp > 0.0) {
+        // Converge point varies per quad: a solid share (about two fifths) keep
+        // the classic upper-left corner pull, the rest stretch toward a random
+        // point that can sit mid screen, so their strands sweep across the view.
+        float qt = floor(t * 2.0); // geometry corruption state evolves in half-second steps
+        float cMix = WarpHash(float2(qseed * 1.37, qt * 0.87 + 0.41));
+        float2 random = (float2(WarpHash(float2(qseed * 3.19, qt * 1.13 + 0.62)),
+                                WarpHash(float2(qseed * 5.71, qt * 1.47 + 0.29))) - 0.5) * float2(3000.0, 2000.0);
+        float2 converge = cMix < 0.45 ? float2(-100.0, -60.0) : random;
+        // Per-vertex factor: stable hash of the position + state, so geometry
+        // stays coherent between steps instead of shimmering per frame.
+        float h = WarpHash(pos * 0.013 + float2(qt * 3.71, qt * 1.93) + s0 * 3.17);
+        // Non-linear scaling: at low amp only the extreme-h vertices break loose
+        // (occasional long thin strands); as amp -> 1 nearly all vertices stream
+        // toward the converge point.
+        float k = 16.0 - amp * 13.0;
+        float f = pow(h, k);
+        f += 0.06 * sin(t * 0.9 + WarpHash(pos * 0.021) * 6.28);
+        f = saturate(f) * amp;
+        // Loose convergence: strands cluster near the corner, not all to one pixel
+        float2 scatter = (float2(WarpHash(pos * 0.05), WarpHash(pos * 0.05 + 0.7)) * 2.0 - 1.0) * 70.0;
+        float2 dir = converge + scatter - pos;
+        result = dir * f * (0.6 + 1.4 * amp);
+    }
+    return result;
+}
 
 struct RectPSInput {
     float4 position : SV_POSITION;

@@ -294,7 +294,16 @@ INT_PTR WINAPI VideoProc( HWND hWnd, UINT msg, WPARAM, LPARAM lParam )
             Config &config = Config::GetConfig();
             const VideoSettings &cVideo = config.GetVideoSettings();
 
-            CheckRadioButton( hWnd, IDC_DIRECT3D, IDC_GDI, IDC_DIRECT3D + cVideo.eRenderer );
+            CheckRadioButton( hWnd, IDC_DIRECT3D, IDC_OPENGL,
+                              cVideo.eRenderer == cVideo.DirectX12 ? IDC_DIRECT3D : IDC_OPENGL );
+            // DirectX 12 is unavailable (startup probe failed or this session
+            // already fell back to D3D11): disable the radio and force D3D11.
+            const bool dx12Blocked = !g_bD3D12Available || g_bBootedFallback;
+            if ( dx12Blocked )
+            {
+                EnableWindow( GetDlgItem( hWnd, IDC_DIRECT3D ), FALSE );
+                CheckRadioButton( hWnd, IDC_DIRECT3D, IDC_OPENGL, IDC_OPENGL );
+            }
             CheckDlgButton( hWnd, IDC_DISPLAYFPS, cVideo.bShowFPS ? BST_CHECKED : BST_UNCHECKED );
             CheckDlgButton( hWnd, IDC_LIMITFPS, cVideo.bLimitFPS ? BST_CHECKED : BST_UNCHECKED );
 
@@ -315,10 +324,9 @@ INT_PTR WINAPI VideoProc( HWND hWnd, UINT msg, WPARAM, LPARAM lParam )
                     Config &config = Config::GetConfig();
                     VideoSettings cVideo = config.GetVideoSettings();
 
-                    cVideo.eRenderer = ( IsDlgButtonChecked( hWnd, IDC_DIRECT3D ) == BST_CHECKED ? cVideo.Direct3D : 
-                                         IsDlgButtonChecked( hWnd, IDC_OPENGL ) == BST_CHECKED ? cVideo.OpenGL :
-                                         IsDlgButtonChecked( hWnd, IDC_GDI ) == BST_CHECKED ? cVideo.GDI :
-                                         cVideo.Direct3D );
+                    const bool dx12Blocked = !g_bD3D12Available || g_bBootedFallback;
+                    cVideo.eRenderer = ( IsDlgButtonChecked( hWnd, IDC_DIRECT3D ) == BST_CHECKED && !dx12Blocked ? cVideo.DirectX12 :
+                                         cVideo.DirectX11 );
                     cVideo.bShowFPS = ( IsDlgButtonChecked( hWnd, IDC_DISPLAYFPS ) == BST_CHECKED );
                     cVideo.bLimitFPS = ( IsDlgButtonChecked( hWnd, IDC_LIMITFPS ) == BST_CHECKED );
 
