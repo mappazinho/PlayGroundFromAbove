@@ -363,3 +363,7 @@ PianoFromAbove/Soundfonts/
 /Scripts/
 /azure-pipelines.yml
 /Docs/
+
+# Session state (local only)
+/AGENTS.md
+/Config.xml.bak

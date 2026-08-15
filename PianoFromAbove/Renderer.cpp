@@ -698,7 +698,8 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
 
         HeartbeatLog("resize:resizebuffers");
         // Resize the swap chain
-        res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(res)) {
             if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
                 m_bDeviceLost = true;
@@ -726,6 +727,16 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
             .Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
         };
         res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+        if (FAILED(res)) {
+            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1
+            // path) and fail with E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions,
+            // virtual GPUs, etc. Fall back to the bitblt model, which works everywhere.
+            HeartbeatLog("swapchain:flipfailed - trying bitblt");
+            m_bAllowTearing = false;
+            swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            swap_chain_desc.Flags = 0;
+            res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+        }
         if (FAILED(res))
             return std::make_tuple(res, "CreateSwapChainForHwnd");
         res = temp_swapchain->QueryInterface(IID_PPV_ARGS(&m_pSwapChain));
@@ -1267,8 +1278,8 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         m_pCommandList->IASetIndexBuffer(&m_IndexBufferView);
 
         m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BloomBlurResultSRVGPU);
-        float compositeCB[4] = { max(0.0f, bloomViz.fBloomSaturation), 1.0f, 0.0f, 0.0f };
-        m_pCommandList->SetGraphicsRoot32BitConstants(0, 4, compositeCB, 0);
+        float compositeCB[8] = { max(0.0f, bloomViz.fBloomSaturation), 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+        m_pCommandList->SetGraphicsRoot32BitConstants(0, 8, compositeCB, 0);
         float intensity = min(bloomViz.fBloomIntensity, 1.0f);
         float bf1[4] = { intensity, intensity, intensity, intensity };
         m_pCommandList->OMSetBlendFactor(bf1);
@@ -1281,8 +1292,14 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
             const float totalH = m_fRibbonCY + fadePad * 2.0f;
             const float stripH = totalH / strips;
 
-            float ribbonCB[4] = { max(0.0f, bloomViz.fBloomSaturation), ribBrightness, 0.0f, 0.0f };
-            m_pCommandList->SetGraphicsRoot32BitConstants(0, 4, ribbonCB, 0);
+            float ribbonTint[3] = { 1.0f, 1.0f, 1.0f };
+            if (bloomViz.bRibbonCustomColor) {
+                ribbonTint[0] = ((bloomViz.dwRibbonBaseColor >> 16) & 0xFF) / 255.0f;
+                ribbonTint[1] = ((bloomViz.dwRibbonBaseColor >> 8) & 0xFF) / 255.0f;
+                ribbonTint[2] = (bloomViz.dwRibbonBaseColor & 0xFF) / 255.0f;
+            }
+            float ribbonCB[8] = { max(0.0f, bloomViz.fBloomSaturation), ribBrightness, 0.0f, 0.0f, ribbonTint[0], ribbonTint[1], ribbonTint[2], 0.0f };
+            m_pCommandList->SetGraphicsRoot32BitConstants(0, 8, ribbonCB, 0);
 
             for (int s = 0; s < strips; s++) {
                 float t = (s + 0.5f) / (float)strips;
@@ -1361,7 +1378,7 @@ HRESULT D3D12Renderer::PresentBackend() {
     if (m_bLimitFPS)
         res = m_pSwapChain->Present(1, 0);
     else {
-        res = m_pSwapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+        res = m_pSwapChain->Present(0, m_bAllowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     }
     if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
         // The display driver was reset (TDR). The device is dead; do not run the
@@ -1892,7 +1909,7 @@ SamplerState g_sampler : register(s0);
 cbuffer BloomConstants : register(b0) {
     float saturation;
     float brightness;
-    float2 padding;
+    float3 tint;
 };
 
 struct PSInput {
@@ -1918,7 +1935,7 @@ float4 main(PSInput input) : SV_TARGET {
         bloom = normalized * compressedMax;
     }
 
-    return float4(bloom, 0.0);
+    return float4(bloom * tint, 0.0);
 }
 )";
 
@@ -2087,7 +2104,7 @@ HRESULT D3D12Renderer::CreateBlurResources() {
         bloom_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         bloom_params[0].Constants.ShaderRegister = 0;
         bloom_params[0].Constants.RegisterSpace = 0;
-        bloom_params[0].Constants.Num32BitValues = 4;
+        bloom_params[0].Constants.Num32BitValues = 8;
         bloom_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         bloom_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         bloom_params[1].DescriptorTable.NumDescriptorRanges = _countof(bloom_srv_ranges);
@@ -2179,6 +2196,9 @@ HRESULT D3D12Renderer::CreateBlurResources() {
     if (FAILED(res)) return res;
 
     tex_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // UAVs on B8G8R8A8_UNORM require FL 11.1; blur work textures use R8G8B8A8
+    // (FL 11.0-safe) so older GPUs like the Intel HD 4400 can create them.
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     res = m_pDevice->CreateCommittedResource(&heap_default, D3D12_HEAP_FLAG_NONE, &tex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_pBlurTemp));
     if (FAILED(res)) return res;
 
@@ -2239,19 +2259,22 @@ HRESULT D3D12Renderer::CreateBlurResources() {
 
     m_BlurOutputSRVCPU = { heap_start_cpu.ptr + 1 * srv_inc };
     m_BlurOutputSRVGPU = { heap_start_gpu.ptr + 1 * srv_inc };
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     m_pDevice->CreateShaderResourceView(m_pBlurOutput.Get(), &srv_desc, m_BlurOutputSRVCPU);
     m_BlurTextureID = (ImTextureID)m_BlurOutputSRVGPU.ptr;
 
     m_BlurSceneSRVCPU = { heap_start_cpu.ptr + 2 * srv_inc };
     m_BlurSceneSRVGPU = { heap_start_gpu.ptr + 2 * srv_inc };
+    srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     m_pDevice->CreateShaderResourceView(m_pSceneCopy.Get(), &srv_desc, m_BlurSceneSRVCPU);
 
     m_BlurTempSRVCPU = { heap_start_cpu.ptr + 3 * srv_inc };
     m_BlurTempSRVGPU = { heap_start_gpu.ptr + 3 * srv_inc };
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     m_pDevice->CreateShaderResourceView(m_pBlurTemp.Get(), &srv_desc, m_BlurTempSRVCPU);
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {
-        .Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
         .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D,
         .Texture2D = { .MipSlice = 0, .PlaneSlice = 0 },
     };

@@ -485,6 +485,20 @@ void Renderer::RenderImGuiFrame() {
                 ImGui::Unindent();
             }
             ImGui::Checkbox("Colored Ribbon", &viz.bColoredRibbon);
+            ImGui::Checkbox("Custom Ribbon Color", &viz.bRibbonCustomColor);
+            if (viz.bRibbonCustomColor) {
+                float rc[3] = {
+                    ((viz.dwRibbonBaseColor >> 16) & 0xFF) / 255.0f,
+                    ((viz.dwRibbonBaseColor >> 8) & 0xFF) / 255.0f,
+                    (viz.dwRibbonBaseColor & 0xFF) / 255.0f,
+                };
+                if (ImGui::ColorEdit3("Ribbon Base Color", rc, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
+                    viz.dwRibbonBaseColor = 0xFF000000 |
+                        ((DWORD)(rc[0] * 255.0f + 0.5f) << 16) |
+                        ((DWORD)(rc[1] * 255.0f + 0.5f) << 8) |
+                        (DWORD)(rc[2] * 255.0f + 0.5f);
+                }
+            }
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();

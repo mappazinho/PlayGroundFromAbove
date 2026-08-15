@@ -64,41 +64,49 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     }
 
     IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; m_pFactory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
-        DXGI_ADAPTER_DESC2 desc = {};
-        ComPtr<IDXGIAdapter2> adapter2;
-        if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&adapter2))))
-            continue;
-        if (FAILED(adapter2->GetDesc2(&desc)))
-            continue;
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-            continue;
+    if (!g_bForceWARP) {
+        for (UINT i = 0; m_pFactory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+            DXGI_ADAPTER_DESC2 desc = {};
+            ComPtr<IDXGIAdapter2> adapter2;
+            if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&adapter2))))
+                continue;
+            if (FAILED(adapter2->GetDesc2(&desc)))
+                continue;
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+                continue;
 
-        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+            D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+            UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
-        flags |= D3D11_CREATE_DEVICE_DEBUG;
+            flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
-        res = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2, D3D11_SDK_VERSION,
-                                &m_pDevice, nullptr, &m_pContext);
+            res = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 2, D3D11_SDK_VERSION,
+                                    &m_pDevice, nullptr, &m_pContext);
 #ifdef _DEBUG
-        if (FAILED(res)) {
-            res = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                    levels, 2, D3D11_SDK_VERSION, &m_pDevice, nullptr, &m_pContext);
-        }
+            if (FAILED(res)) {
+                res = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                        levels, 2, D3D11_SDK_VERSION, &m_pDevice, nullptr, &m_pContext);
+            }
 #endif
-        if (SUCCEEDED(res)) {
-            m_pAdapter = adapter2;
-            break;
+            if (SUCCEEDED(res)) {
+                m_pAdapter = adapter2;
+                break;
+            }
         }
     }
     if (m_pDevice == nullptr) {
-        HeartbeatLog("init(d3d11):nodevice");
-        if (!g_bInRecovery) {
-            MessageBoxW(NULL, L"Couldn't find a suitable D3D11 device.", L"DirectX Error", MB_ICONERROR);
-            exit(1);
-        }
-        return std::make_tuple(E_FAIL, "D3D11CreateDevice");
+        // No usable hardware device (WARP forced after a failed hardware init, or
+        // no suitable adapter at all): fall back to the WARP software rasterizer
+        // so the app can still boot on legacy/RDP/virtual machines with broken or
+        // missing WDDM support.
+        HeartbeatLog("init(d3d11):nodevice - trying WARP");
+        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+        res = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                levels, 2, D3D11_SDK_VERSION, &m_pDevice, nullptr, &m_pContext);
+        if (FAILED(res))
+            return std::make_tuple(res, "D3D11CreateDevice (WARP)");
+        m_bAllowTearing = false;
+        HeartbeatLog("init(d3d11):warp");
     }
 
     ComPtr<ID3D11Device5> device5;
@@ -246,6 +254,7 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pBloomExtractConstants);
     if (FAILED(res))
         return std::make_tuple(res, "CreateBuffer (bloom extract constants)");
+    cb_desc.ByteWidth = 32;
     res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pBloomConstants);
     if (FAILED(res))
         return std::make_tuple(res, "CreateBuffer (bloom constants)");
@@ -360,8 +369,9 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     }
     m_pDrawList = new ImDrawList(ImGui::GetDrawListSharedData());
 
-    if (FAILED(CreateBlurResources()))
-        return std::make_tuple(E_FAIL, "CreateBlurResources");
+    HRESULT blurRes = CreateBlurResources();
+    if (FAILED(blurRes))
+        return std::make_tuple(blurRes, "CreateBlurResources");
     HeartbeatLog("init(d3d11):done");
 
     return std::make_tuple(S_OK, "");
@@ -383,7 +393,8 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
         m_pBackgroundSRV.Reset();
 
         HeartbeatLog("resize(d3d11):resizebuffers");
-        res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(res)) {
             if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
                 m_bDeviceLost = true;
@@ -403,15 +414,33 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
             },
             .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
             .BufferCount = FrameCount,
-            .Scaling = DXGI_SCALING_NONE,
-            .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            .Scaling = g_bForceWARP ? DXGI_SCALING_STRETCH : DXGI_SCALING_NONE,
+            .SwapEffect = g_bForceWARP ? DXGI_SWAP_EFFECT_DISCARD : DXGI_SWAP_EFFECT_FLIP_DISCARD,
             .AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED,
-            .Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+            .Flags = (UINT)(m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0),
         };
         ComPtr<IDXGISwapChain1> temp_swapchain;
         res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
-        if (FAILED(res))
+        if (FAILED(res)) {
+            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1
+            // path) and fail with E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions,
+            // virtual GPUs, etc. Fall back to the bitblt model, which works everywhere.
+            // (DXGI_SCALING_NONE is flip-model-only, so switch to STRETCH too.)
+            char ebuf[96];
+            sprintf_s(ebuf, "swapchain(d3d11):flipfailed hr=0x%08X - trying bitblt", (unsigned)res);
+            HeartbeatLog(ebuf);
+            m_bAllowTearing = false;
+            swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            swap_chain_desc.Scaling = DXGI_SCALING_STRETCH;
+            swap_chain_desc.Flags = 0;
+            res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+        }
+        if (FAILED(res)) {
+            char ebuf[96];
+            sprintf_s(ebuf, "swapchain(d3d11):bitbltfailed hr=0x%08X", (unsigned)res);
+            HeartbeatLog(ebuf);
             return std::make_tuple(res, "CreateSwapChainForHwnd");
+        }
         res = temp_swapchain->QueryInterface(IID_PPV_ARGS(&m_pSwapChain));
         if (FAILED(res))
             return std::make_tuple(res, "IDXGISwapChain1 -> IDXGISwapChain3");
@@ -780,7 +809,7 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         m_pContext->PSSetShaderResources(0, 1, &bloomResultSRV);
         m_pContext->PSSetSamplers(0, 1, m_pSamplerLinearClamp.GetAddressOf());
 
-        float compositeCB[4] = { max(0.0f, bloomViz.fBloomSaturation), 1.0f, 0.0f, 0.0f };
+        float compositeCB[8] = { max(0.0f, bloomViz.fBloomSaturation), 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f };
         m_pContext->UpdateSubresource(m_pBloomConstants.Get(), 0, nullptr, compositeCB, 0, 0);
         float intensity = min(bloomViz.fBloomIntensity, 1.0f);
         float bf1[4] = { intensity, intensity, intensity, intensity };
@@ -794,7 +823,13 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
             const float totalH = m_fRibbonCY + fadePad * 2.0f;
             const float stripH = totalH / strips;
 
-            float ribbonCB[4] = { max(0.0f, bloomViz.fBloomSaturation), ribBrightness, 0.0f, 0.0f };
+            float ribbonTint[3] = { 1.0f, 1.0f, 1.0f };
+            if (bloomViz.bRibbonCustomColor) {
+                ribbonTint[0] = ((bloomViz.dwRibbonBaseColor >> 16) & 0xFF) / 255.0f;
+                ribbonTint[1] = ((bloomViz.dwRibbonBaseColor >> 8) & 0xFF) / 255.0f;
+                ribbonTint[2] = (bloomViz.dwRibbonBaseColor & 0xFF) / 255.0f;
+            }
+            float ribbonCB[8] = { max(0.0f, bloomViz.fBloomSaturation), ribBrightness, 0.0f, 0.0f, ribbonTint[0], ribbonTint[1], ribbonTint[2], 0.0f };
             m_pContext->UpdateSubresource(m_pBloomConstants.Get(), 0, nullptr, ribbonCB, 0, 0);
 
             for (int s = 0; s < strips; s++) {
@@ -834,7 +869,7 @@ HRESULT D3D11Renderer::PresentBackend() {
     if (m_bLimitFPS)
         res = m_pSwapChain->Present(1, 0);
     else {
-        res = m_pSwapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+        res = m_pSwapChain->Present(0, m_bAllowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     }
     if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
         m_bDeviceLost = true;
@@ -908,6 +943,8 @@ HRESULT D3D11Renderer::WaitForGPU() {
 }
 
 std::wstring D3D11Renderer::GetAdapterName() {
+    if (g_bForceWARP && !m_pAdapter)
+        return L"WARP (software)";
     if (m_pAdapter) {
         DXGI_ADAPTER_DESC2 desc = {};
         if (FAILED(m_pAdapter->GetDesc2(&desc)))
@@ -1092,11 +1129,11 @@ HRESULT D3D11Renderer::CreateBlurResources() {
     HRESULT res;
 
     res = m_pDevice->CreateComputeShader(g_pBlurShader11, sizeof(g_pBlurShader11), nullptr, &m_pBlurCS);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateComputeShader(g_pBloomExtractShader11, sizeof(g_pBloomExtractShader11), nullptr, &m_pBloomExtractCS);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreatePixelShader(g_pBloomPixelShader11, sizeof(g_pBloomPixelShader11), nullptr, &m_pBloomPS);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     // Scene copy / blur textures (full-res B8G8R8A8)
     ComPtr<ID3D11Texture2D> tex = nullptr;
@@ -1109,29 +1146,33 @@ HRESULT D3D11Renderer::CreateBlurResources() {
     tex_desc.SampleDesc.Count = 1;
     tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     res = m_pDevice->CreateTexture2D(&tex_desc, nullptr, &tex);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     m_pSceneCopy = tex;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
     srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srv_desc.Texture2D.MipLevels = 1;
     res = m_pDevice->CreateShaderResourceView(m_pSceneCopy.Get(), &srv_desc, &m_pSceneCopySRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    // UAVs on B8G8R8A8_UNORM require FL 11.1; blur work textures use R8G8B8A8
+    // (FL 11.0-safe) so older GPUs like the Intel HD 4400 can create them.
+    tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     res = m_pDevice->CreateTexture2D(&tex_desc, nullptr, &m_pBlurTemp);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     res = m_pDevice->CreateShaderResourceView(m_pBlurTemp.Get(), &srv_desc, &m_pBlurTempSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBlurTemp.Get(), nullptr, &m_pBlurTempUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     res = m_pDevice->CreateTexture2D(&tex_desc, nullptr, &m_pBlurOutput);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateShaderResourceView(m_pBlurOutput.Get(), &srv_desc, &m_pBlurOutputSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBlurOutput.Get(), nullptr, &m_pBlurOutputUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     m_BlurTextureID = (ImTextureID)m_pBlurOutputSRV.Get();
     tex.Reset();
 
@@ -1145,21 +1186,21 @@ HRESULT D3D11Renderer::CreateBlurResources() {
     bg_tex_desc.SampleDesc.Count = 1;
     bg_tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     res = m_pDevice->CreateTexture2D(&bg_tex_desc, nullptr, &m_pBGBufferA);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateTexture2D(&bg_tex_desc, nullptr, &m_pBGBufferB);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     D3D11_SHADER_RESOURCE_VIEW_DESC bg_srv_desc = {};
     bg_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     bg_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     bg_srv_desc.Texture2D.MipLevels = 1;
     res = m_pDevice->CreateShaderResourceView(m_pBGBufferA.Get(), &bg_srv_desc, &m_pBGBufferASRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateShaderResourceView(m_pBGBufferB.Get(), &bg_srv_desc, &m_pBGBufferBSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBGBufferA.Get(), nullptr, &m_pBGBufferAUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBGBufferB.Get(), nullptr, &m_pBGBufferBUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     // Bloom buffers (half-res R16G16B16A16_FLOAT)
     m_iBloomHalfWidth = max(1, m_iBufferWidth / 2);
@@ -1173,27 +1214,27 @@ HRESULT D3D11Renderer::CreateBlurResources() {
     bloom_tex_desc.SampleDesc.Count = 1;
     bloom_tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     res = m_pDevice->CreateTexture2D(&bloom_tex_desc, nullptr, &m_pBloomHalf);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateTexture2D(&bloom_tex_desc, nullptr, &m_pBloomBlurTemp);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateTexture2D(&bloom_tex_desc, nullptr, &m_pBloomBlurResult);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     D3D11_SHADER_RESOURCE_VIEW_DESC bloom_srv_desc = {};
     bloom_srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     bloom_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     bloom_srv_desc.Texture2D.MipLevels = 1;
     res = m_pDevice->CreateShaderResourceView(m_pBloomHalf.Get(), &bloom_srv_desc, &m_pBloomHalfSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateShaderResourceView(m_pBloomBlurTemp.Get(), &bloom_srv_desc, &m_pBloomBlurTempSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateShaderResourceView(m_pBloomBlurResult.Get(), &bloom_srv_desc, &m_pBloomBlurResultSRV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBloomHalf.Get(), nullptr, &m_pBloomHalfUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBloomBlurTemp.Get(), nullptr, &m_pBloomBlurTempUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreateUnorderedAccessView(m_pBloomBlurResult.Get(), nullptr, &m_pBloomBlurResultUAV);
-    if (FAILED(res)) return res;
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     return S_OK;
 }

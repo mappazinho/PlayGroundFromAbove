@@ -39,6 +39,7 @@ bool g_bDisableGates = false; // Keep the size-move/reset gates ON: presenting t
 bool g_bInRecovery = false;
 bool g_bD3D12Available = true;
 bool g_bBootedFallback = false;
+bool g_bForceWARP = false;
 const wchar_t* g_pwszRenderMode = L"DirectX 12";
 
 static void TraceMsg(const char* name, WPARAM wParam, LPARAM lParam) {

@@ -225,6 +225,8 @@ struct VizSettings : public ISettings {
     int iRibbonBloomSteps;
     float fBloomSaturation;
     bool bColoredRibbon;
+    bool bRibbonCustomColor;
+    DWORD dwRibbonBaseColor;
     bool bDumpFrames;
     int iBarColor;
     std::wstring sBackground;

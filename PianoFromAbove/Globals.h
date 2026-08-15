@@ -33,6 +33,7 @@ extern bool g_bDisableGates; // Experiment: render/present through window transi
 extern bool g_bInRecovery;   // Set while the renderer is being rebuilt after a TDR
 extern bool g_bD3D12Available; // Probed at startup: can this machine create a D3D12 device at all?
 extern bool g_bBootedFallback; // Set when the requested renderer failed to init and we fell back to D3D11
+extern bool g_bForceWARP;     // Retry D3D11 init on the WARP software rasterizer (hardware swapchain failed)
 extern const wchar_t* g_pwszRenderMode; // Active backend name ("DirectX 12"/"DirectX 11"), set after init
 extern TSQueue< MSG > g_MsgQueue; // Producer/consumer to hold events for our game thread
 

@@ -2629,7 +2629,8 @@ void MainScreen::RenderKeys()
 
     m_pRenderer->SetRibbonArea(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY);
 
-    const bool bBloom = Config::GetConfig().GetVizSettings().bBloom;
+    const VizSettings &cViz2 = Config::GetConfig().GetVizSettings();
+    const bool bBloom = cViz2.bBloom;
     auto darken32 = [](DWORD c, float f) -> DWORD {
         DWORD r = (DWORD)(((c >> 16) & 0xFF) * f);
         DWORD g = (DWORD)(((c >> 8) & 0xFF) * f);
@@ -2637,6 +2638,19 @@ void MainScreen::RenderKeys()
         return (c & 0xFF000000) | (min(r, 255u) << 16) | (min(g, 255u) << 8) | min(b, 255u);
     };
     float kb = bBloom ? 0.25f : 1.0f;
+    DWORD ribDark, ribPrim, drawDark, drawPrim;
+    if (cViz2.bRibbonCustomColor) {
+        DWORD ribBase = cViz2.dwRibbonBaseColor & 0x00FFFFFF;
+        ribDark = darken32(ribBase, 0.75f);
+        ribPrim = ribBase;
+        drawDark = ribDark;
+        drawPrim = ribPrim;
+    } else {
+        ribDark = m_csKBRed.iDarkRGB;
+        ribPrim = m_csKBRed.iPrimaryRGB;
+        drawDark = darken32(ribDark, kb);
+        drawPrim = darken32(ribPrim, kb);
+    }
     if (m_bBackgroundLoaded) {
         auto dark = 0x80000000;
         auto very_dark = 0x00000000;
@@ -2644,8 +2658,8 @@ void MainScreen::RenderKeys()
         m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fTransitionCY,
             0xFF000000, 0xFF000000, very_dark, very_dark);
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY,
-            darken32(m_csKBRed.iDarkRGB, kb), darken32(m_csKBRed.iDarkRGB, kb),
-            darken32(m_csKBRed.iPrimaryRGB, kb), darken32(m_csKBRed.iPrimaryRGB, kb));
+            drawDark, drawDark,
+            drawPrim, drawPrim);
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY + fRedCY, m_fNotesCX, fSpacerCY, dark);
     } else {
         m_pRenderer->DrawRect(m_fNotesX, fKeysY, m_fNotesCX, fKeysCY, darken32(m_csKBBackground.iVeryDarkRGB, kb));
@@ -2653,8 +2667,8 @@ void MainScreen::RenderKeys()
             darken32(m_csBackground.iPrimaryRGB, kb), darken32(m_csBackground.iPrimaryRGB, kb),
             darken32(m_csKBBackground.iVeryDarkRGB, kb), darken32(m_csKBBackground.iVeryDarkRGB, kb));
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY, m_fNotesCX, fRedCY,
-            darken32(m_csKBRed.iDarkRGB, kb), darken32(m_csKBRed.iDarkRGB, kb),
-            darken32(m_csKBRed.iPrimaryRGB, kb), darken32(m_csKBRed.iPrimaryRGB, kb));
+            drawDark, drawDark,
+            drawPrim, drawPrim);
         m_pRenderer->DrawRect(m_fNotesX, fKeysY + fTransitionCY + fRedCY, m_fNotesCX, fSpacerCY,
             darken32(m_csKBBackground.iDarkRGB, kb), darken32(m_csKBBackground.iDarkRGB, kb),
             darken32(m_csKBBackground.iDarkRGB, kb), darken32(m_csKBBackground.iDarkRGB, kb));

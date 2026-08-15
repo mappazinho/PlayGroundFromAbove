@@ -6,7 +6,7 @@ SamplerState g_sampler : register(s0);
 cbuffer BloomConstants : register(b0) {
     float saturation;
     float brightness;
-    float2 padding;
+    float3 tint;
 };
 
 struct PSInput {
@@ -32,5 +32,5 @@ float4 main(PSInput input) : SV_TARGET {
         bloom = normalized * compressedMax;
     }
 
-    return float4(bloom, 0.0);
+    return float4(bloom * tint, 0.0);
 }

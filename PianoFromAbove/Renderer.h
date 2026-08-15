@@ -236,6 +236,7 @@ protected:
     int m_iBufferHeight = 0;
     bool m_bLimitFPS = false;
     bool m_bDeviceLost = false;
+    bool m_bAllowTearing = true;
     bool m_bUnlimitedNotes = true;
     unsigned m_NotesPerPass = MaxNotesPerPass;
 

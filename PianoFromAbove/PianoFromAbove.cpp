@@ -498,8 +498,16 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
 
     Renderer *pRenderer = Renderer::CreateInstance();
     std::tuple<HRESULT, const char*> init_res = { E_FAIL, "Init not attempted" };
-    for (int attempt = 0; attempt < 3; attempt++) {
+    auto TryInitOnce = [&]() {
         init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+        if (FAILED(std::get<0>(init_res))) {
+            char ebuf[160];
+            sprintf_s(ebuf, "init_failed:%s hr=0x%08X", std::get<1>(init_res), (unsigned)std::get<0>(init_res));
+            HeartbeatLog(ebuf);
+        }
+    };
+    for (int attempt = 0; attempt < 3; attempt++) {
+        TryInitOnce();
         if (SUCCEEDED(std::get<0>(init_res)))
             break;
         Sleep(500);
@@ -513,13 +521,30 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
         pRenderer = Renderer::CreateInstance();
         init_res = { E_FAIL, "Init not attempted" };
         for (int attempt = 0; attempt < 3; attempt++) {
-            init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+            TryInitOnce();
             if (SUCCEEDED(std::get<0>(init_res)))
                 break;
             Sleep(500);
         }
         if (SUCCEEDED(std::get<0>(init_res)))
             MessageBox(g_hWnd, TEXT("DirectX 12 could not be initialized; this session is running on DirectX 11."), TEXT("PlayGroundFromAbove"), MB_OK | MB_ICONINFORMATION);
+    }
+    // Last resort: hardware D3D11 failed to create a swap chain (e.g. WDDM 1.x,
+    // RDP, or a virtual GPU). Retry once on the WARP software rasterizer so the
+    // app can still boot.
+    if (FAILED(std::get<0>(init_res)) && !g_bForceWARP && !g_bInRecovery) {
+        g_bForceWARP = true;
+        delete pRenderer;
+        pRenderer = Renderer::CreateInstance();
+        init_res = { E_FAIL, "Init not attempted" };
+        for (int attempt = 0; attempt < 3; attempt++) {
+            TryInitOnce();
+            if (SUCCEEDED(std::get<0>(init_res)))
+                break;
+            Sleep(500);
+        }
+        if (SUCCEEDED(std::get<0>(init_res)))
+            MessageBox(g_hWnd, TEXT("Hardware accelerated rendering is unavailable on this system; this session is running on the software (WARP) renderer."), TEXT("PlayGroundFromAbove"), MB_OK | MB_ICONINFORMATION);
     }
     if( FAILED(std::get<0>(init_res)) )
     {

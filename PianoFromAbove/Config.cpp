@@ -242,6 +242,8 @@ void VizSettings::LoadDefaultValues() {
     this->iRibbonBloomSteps = 64;
     this->fBloomSaturation = 1.2f;
     this->bColoredRibbon = true;
+    this->bRibbonCustomColor = false;
+    this->dwRibbonBaseColor = 0xFFFFFFFF;
     this->bDumpFrames = false;
     this->iBarColor = 0x00FF0080;
     this->sBackground = L"";
@@ -492,6 +494,10 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     fBloomSaturation = max(0.0f, min(fBloomSaturation, 3.0f));
     if (txViz->QueryIntAttribute("ColoredRibbon", &iAttrVal) == TIXML_SUCCESS)
         bColoredRibbon = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("RibbonCustomColor", &iAttrVal) == TIXML_SUCCESS)
+        bRibbonCustomColor = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("RibbonBaseColor", &iAttrVal) == TIXML_SUCCESS)
+        dwRibbonBaseColor = (DWORD)iAttrVal;
     if (txViz->QueryIntAttribute("DumpFrames", &iAttrVal) == TIXML_SUCCESS)
         bDumpFrames = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("ColorLoop", &iAttrVal) == TIXML_SUCCESS)
@@ -680,6 +686,8 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("RibbonBloomSteps", iRibbonBloomSteps);
     txViz->SetDoubleAttribute("BloomSaturation", fBloomSaturation);
     txViz->SetAttribute("ColoredRibbon", bColoredRibbon);
+    txViz->SetAttribute("RibbonCustomColor", bRibbonCustomColor);
+    txViz->SetAttribute("RibbonBaseColor", (int)dwRibbonBaseColor);
     txViz->SetAttribute("DumpFrames", bDumpFrames);
     txViz->SetAttribute("Background", Util::WstringToString(sBackground));
     txViz->SetDoubleAttribute("BGBlur", fBGBlur);
