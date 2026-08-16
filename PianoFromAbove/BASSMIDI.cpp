@@ -1,4 +1,5 @@
 #include "BASSMIDI.h"
+#include "MIDIPreRenderPlayer.h"
 #include <algorithm>
 #include <vector>
 #include <sstream>
@@ -27,7 +28,8 @@ BASSMIDI::BASSMIDI(int voices, bool nofx = true) {
 	if (m_hsHandle == -1)
 	{
 		int err = BASS_ErrorGetCode();
-		MessageBoxW(NULL, L"BASSMIDI Handle failed to load!\0", L"Error\0", MB_ICONERROR);
+		PRE_DbgLog("STREAMCREATE failed err=%d", err);
+		m_bStreamDead = true;
 	}
 
 	BASS_ChannelSetAttribute(m_hsHandle, BASS_ATTRIB_MIDI_VOICES, voices);
@@ -292,10 +294,21 @@ DWORD BASSMIDI::Read(float* buffer, int offset, int count) {
 	DWORD size = count * sizeof(float);
 	DWORD ret = BASS_ChannelGetData(m_hsHandle, buffer + offset, size | BASS_DATA_FLOAT);
 
-	if (ret == 0)
+	if (ret != size)
 	{
-		int err = BASS_ErrorGetCode();
-		MessageBox(NULL, L"Error\0", L"Error\0", MB_ICONERROR);
+		// Diagnostic: GetData must return exactly the requested bytes on a
+		// decode stream. Short returns mean the stream has ended or stalled -
+		// the generator silently zero-fills the remainder of the chunk.
+		static int sLogCount = 0;
+		if (sLogCount < 30)
+		{
+			sLogCount++;
+			PRE_DbgLog("GETDATA short ret=%u want=%u err=%d", ret, size, BASS_ErrorGetCode());
+		}
+		if (ret == (DWORD)-1 || ret == 0)
+		{
+			m_bStreamDead = true;
+		}
 	}
 	return ret / 4;
 }

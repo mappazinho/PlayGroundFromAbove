@@ -454,6 +454,8 @@ void Renderer::RenderImGuiFrame() {
             ImGui::BeginDisabled(!viz.bDualPianoRoll);
             ImGui::Checkbox("DualRoll Keyboard", &viz.bDualRollKeyboard);
             ImGui::EndDisabled();
+            ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
+            ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
             ImGui::Separator();
             ImGui::Checkbox("Bloom", &viz.bBloom);
             if (viz.bBloom) {
@@ -911,11 +913,9 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Viz")) {
-                    ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
                     ImGui::Checkbox("Show Markers", &viz.bShowMarkers);
                     ImGui::Combo("Marker Encoding", (int*)&viz.eMarkerEncoding, "CP-1252 (Western)\0CP-932 (Japanese)\0UTF-8\0");
                     ImGui::Checkbox("Nerd Stats", &viz.bNerdStats);
-                    ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
                     ImGui::Checkbox("Dump Frames", &viz.bDumpFrames);
                     ImGui::Checkbox("Disable UI (Reenable by pressing CTRL + ALT)", &viz.bDisableUI);
                     ImGui::Separator();

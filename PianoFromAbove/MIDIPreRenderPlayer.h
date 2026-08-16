@@ -5,6 +5,11 @@
 
 extern MIDIAudio* PRE_MIDIAudio;
 
+// Set by the generator thread when the BASS MIDI synth dies (stream handle lost,
+// position frozen, or silent-after-audio). Cleared on generator start and by the
+// game thread after a rebuild. Polled by UpdatePreRenderAudio to rebuild the synth.
+extern std::atomic<bool> g_bGenDead;
+
 // Instantaneous game-loop FPS, published each frame by the game thread and read by the SDL audio callback. Used for the "repeat on player lag" checkbox.
 #include <atomic>
 extern std::atomic<float> g_fGameFPS;

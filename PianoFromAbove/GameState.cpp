@@ -571,6 +571,14 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
 }
 
 // from the song clock every frame; the classic MIDI-device path is bypassed.
+// Prerender self-healing: when the BASS synth dies (stream handle lost, position
+// frozen, silent-after-audio) the generator is rebuilt from the current position.
+// After s_iPreRestartsLimit failed rebuilds the song falls back to the live MIDI
+// device (omnimidi). Reset per song by MainScreen::InitState.
+static const int s_iPreRestartsLimit = 4;
+static int s_iPreRestarts = 0;
+static bool s_bPreFailed = false;
+
 static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, const MIDI& midi, long long llStartTime, int iStartPos, bool& bAudioStarted)
 {
     static Config &config = Config::GetConfig();
@@ -578,6 +586,13 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     static PlaybackSettings &cPlayback = config.GetPlaybackSettings();
 
     if (!cAudio.bPreRenderAudio)
+    {
+        if (PRE_MIDIAudio)
+            SDL_PauseAudio(1);
+        return;
+    }
+
+    if (s_bPreFailed)
     {
         if (PRE_MIDIAudio)
             SDL_PauseAudio(1);
@@ -626,6 +641,25 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     PRE_MIDIAudio->m_iRepeatFrames = cAudio.bPreRepeatCustom ? cAudio.iPreRepeatMs * 48 : 12000;
     PRE_MIDIAudio->m_bExtendVisualsOnSkip = cAudio.bPreStutterOnLag;
     PRE_MIDIAudio->SetReadSpeed(cPlayback.GetSpeed());
+
+    if (g_bGenDead && PRE_MIDIAudio)
+    {
+        if (s_iPreRestarts >= s_iPreRestartsLimit)
+        {
+            s_bPreFailed = true;
+            PRE_DbgLog("UPA: prerender dead %d times - falling back to live device", s_iPreRestarts);
+            SDL_PauseAudio(1);
+            PRE_MIDIAudio->Stop();
+            bAudioStarted = false;
+            g_bGenDead = false;
+            return;
+        }
+        s_iPreRestarts++;
+        PRE_DbgLog("UPA: generator dead - rebuild #%d (t=%.2f)", s_iPreRestarts, (double)llStartTime / 1e6);
+        PRE_MIDIAudio->Stop();
+        bAudioStarted = false;
+        g_bGenDead = false;
+    }
 
     if (!bPaused)
     {
@@ -695,11 +729,7 @@ GameState::GameError SplashScreen::Logic()
         m_OutDevice.AllNotesOff();
 
     double dSpeed = cPlayback.GetSpeed();
-    long long llElapsedStep = 0;
-    if ( config.GetAudioSettings().bPreRenderAudio )
-        llElapsedStep = static_cast< long long >( (double)llElapsed * dSpeed + 0.5 );
-    else
-        llElapsedStep = static_cast< long long >( min( (double)llElapsed * dSpeed, 100000.0 ) + 0.5 );
+    long long llElapsedStep = static_cast< long long >( min( (double)llElapsed * dSpeed, 100000.0 ) + 0.5 );
     long long llNextStartTime = m_llStartTime + llElapsedStep;
     // fixed slew would break speed changes; instead cap the catch-up on top of
     const long long kDeadZone = 20000;   // ignore drift smaller than 20ms
@@ -748,9 +778,7 @@ GameState::GameError SplashScreen::Logic()
     while ( m_iEndPos + 1 < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iEndPos + 1]) < llEndTime )
         m_iEndPos++;
 
-    // Pre-rendered audio mode drives the playback clock; skip the MIDI device
-    UpdatePreRenderAudio(m_vEvents, m_MIDI, m_llStartTime, m_iStartPos, m_bAudioStarted);
-        
+    // The splash always plays through the live MIDI device below.
     {
         using clock_t = std::chrono::steady_clock;
         static auto s_tPushLog = clock_t::now();
@@ -761,14 +789,11 @@ GameState::GameError SplashScreen::Logic()
         while ( m_iStartPos < iEventCount && m_MIDI.GetEventTime(m_vEvents[m_iStartPos]) <= m_llStartTime )
         {
             MIDIChannelEvent pEvent = m_vEvents[m_iStartPos];
-            if ( !Config::GetConfig().GetAudioSettings().bPreRenderAudio )
-            {
-                if ( m_MIDI.GetEventChannelEventType(pEvent) != MIDI::NoteOn )
-                    m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent), m_MIDI.GetEventParam2(pEvent) );
-                else if ( !m_bMute && !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted )
-                    m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent),
-                                            static_cast< int >( m_MIDI.GetEventParam2(pEvent) * dVolumeCorrect + 0.5 ) );
-            }
+            if ( m_MIDI.GetEventChannelEventType(pEvent) != MIDI::NoteOn )
+                m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent), m_MIDI.GetEventParam2(pEvent) );
+            else if ( !m_bMute && !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted )
+                m_OutDevice.PlayEvent( m_MIDI.GetEventCode(pEvent), m_MIDI.GetEventParam1(pEvent),
+                                        static_cast< int >( m_MIDI.GetEventParam2(pEvent) * dVolumeCorrect + 0.5 ) );
             UpdateState( m_iStartPos );
             m_iStartPos++;
             iPushed++;
@@ -779,8 +804,7 @@ GameState::GameError SplashScreen::Logic()
         if ( dFrameUs > s_dMaxFrameUs ) s_dMaxFrameUs = dFrameUs;
         if ( std::chrono::duration_cast<std::chrono::milliseconds>(tPushEnd - s_tPushLog).count() >= 1000 )
         {
-            PRE_DbgLog("LIVEPUSH %s ev/s=%lld maxFrameMs=%.1f",
-                Config::GetConfig().GetAudioSettings().bPreRenderAudio ? "pre" : "live",
+            PRE_DbgLog("LIVEPUSH live ev/s=%lld maxFrameMs=%.1f",
                 s_iPushed, s_dMaxFrameUs / 1000.0);
             s_iPushed = 0;
             s_dMaxFrameUs = 0;
@@ -1087,6 +1111,10 @@ void MainScreen::InitColors()
 
 void MainScreen::InitState()
 {
+    s_iPreRestarts = 0;
+    s_bPreFailed = false;
+    g_bGenDead = false;
+
     static Config &config = Config::GetConfig();
     static const PlaybackSettings &cPlayback = config.GetPlaybackSettings();
     static const ViewSettings &cView = config.GetViewSettings();
@@ -1494,8 +1522,9 @@ GameState::GameError MainScreen::Logic( void )
             PRE_DbgLog("Logic: bCustomAudio=%d bPreAudio=%d bLiveAudio=%d prerenderCfg=%d path='%ls' firstNote=%.2f", (int)bCustomAudio, (int)(!bCustomAudio && cAudio.bPreRenderAudio), (int)(!bCustomAudio && !cAudio.bPreRenderAudio), (int)cAudio.bPreRenderAudio, m_sCustomAudioPath.c_str(), (double)mInfo.llFirstNote / 1e6);
         }
     }
-    const bool bPreAudio = !bCustomAudio && cAudio.bPreRenderAudio;
-    const bool bLiveAudio = !bCustomAudio && !bPreAudio;
+    const bool bPreAudioCfg = !bCustomAudio && cAudio.bPreRenderAudio;
+    const bool bPreAudio = bPreAudioCfg && !s_bPreFailed;
+    const bool bLiveAudio = !bCustomAudio && !bPreAudioCfg;
 
     // people are probably going to yell at me if you can't change the bar color during playback
     m_csKBRed.SetColor(cViz.iBarColor, 0.5f);
@@ -1722,14 +1751,14 @@ GameState::GameError MainScreen::Logic( void )
                 if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::PitchBend) {
                     m_pBends[m_MIDI.GetEventChannel(pEvent)] = (notex_table[1] - notex_table[0]) *
                         (((short)(iCorruptValue - 8192)) / (8192.0f / 12.0f));
-                    if (bLiveAudio)
+                    if (bLiveAudio || s_bPreFailed)
                         m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptValue & 0x7F, iCorruptValue >> 7);
                 }
-                else if (bLiveAudio)
+                else if (bLiveAudio || s_bPreFailed)
                     m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch, iCorruptValue);
             }
             else if (!m_bMute && (!m_bAnyChannelMuted || !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted)) {
-                if (bLiveAudio)
+                if (bLiveAudio || s_bPreFailed)
                     m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch,
                         static_cast<int>(CorruptVelocity(fCorruptor, hCorrupt, m_MIDI.GetEventParam2(pEvent)) * dVolumeCorrect + 0.5));
                 notes_played++;

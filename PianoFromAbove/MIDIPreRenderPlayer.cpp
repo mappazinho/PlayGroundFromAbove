@@ -2,10 +2,12 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cmath>
 #include <windows.h>
 
 MIDIAudio* PRE_MIDIAudio = nullptr;
 std::atomic<float> g_fGameFPS = 1000.0f;
+std::atomic<bool> g_bGenDead = false;
 
 static SDL_AudioSpec s_wanted;
 static SDL_AudioSpec s_obtained;
@@ -73,16 +75,28 @@ void PRE_FillAudio(void* udata, Uint8* stream, int len)
 		static double s_peakDet = 0;
 		static long long s_clickFrames = 0;
 		static long long s_clickCallbacks = 0;
+		static double s_rmsSumSq = 0;
+		static int s_levelFrames = 0;
+		static float s_levelPeak = 0;
 		const int n = len / (int)sizeof(float);
 		{
 			float* p = s_pRingBuffer;
 			double peak = 0;
 			int clicks = 0;
+			double sumSq = 0;
+			float lvlPeak = 0;
 			for (int i = 1; i < n; i++)
 			{
 				double det = (double)fabs((double)p[i] - (double)p[i - 1]);
 				if (det > peak) peak = det;
 				if (det > kClickThresh) clicks++;
+			}
+			for (int i = 0; i < n; i++)
+			{
+				float v = p[i];
+				sumSq += (double)v * (double)v;
+				float a = v < 0 ? -v : v;
+				if (a > lvlPeak) lvlPeak = a;
 			}
 			if (clicks > 0)
 			{
@@ -90,6 +104,9 @@ void PRE_FillAudio(void* udata, Uint8* stream, int len)
 				s_clickCallbacks++;
 			}
 			if (peak > s_peakDet) s_peakDet = peak;
+			s_rmsSumSq += sumSq;
+			s_levelFrames += n;
+			if (lvlPeak > s_levelPeak) s_levelPeak = lvlPeak;
 		}
 		s_framesSec += n / 2;
 		if (s_framesSec >= 48000)
@@ -101,12 +118,18 @@ void PRE_FillAudio(void* udata, Uint8* stream, int len)
 			s_clickFrames = 0;
 			s_clickCallbacks = 0;
 
-   // Diagnostic: log the ring state once per second from the audio thread.
-			PRE_DbgLog("CB r=%d w=%d paused=%d bufSecs=%.2f",
+   // Diagnostic: log the ring state once per second from the audio thread, including the actual RMS level of the samples delivered. Level in dBFS distinguishes "callback running but the synth produced silence" (rms around -120dB) from real playback (roughly -45dB..-10dB), which the click detector cannot: healthy quiet music has no discontinuities either.
+			double rms = sqrt(s_rmsSumSq / (double)max(1, s_levelFrames));
+			double rmsDb = 20.0 * log10(rms + 1e-12);
+			PRE_DbgLog("CB r=%d w=%d paused=%d bufSecs=%.2f rms=%.1fdB peak=%.3f",
 				PRE_MIDIAudio->GetBufferReadPos(),
 				PRE_MIDIAudio->GetBufferWritePos(),
 				PRE_MIDIAudio->m_bPaused,
-				PRE_MIDIAudio->GetBufferSeconds());
+				PRE_MIDIAudio->GetBufferSeconds(),
+				rmsDb, s_levelPeak);
+			s_rmsSumSq = 0;
+			s_levelFrames = 0;
+			s_levelPeak = 0;
 		}
 	}
 	SDL_memcpy(stream, (const Uint8*)s_pRingBuffer, len);

@@ -23,6 +23,9 @@ public:
 	BASSMIDI(int voices, bool nofx);
 	~BASSMIDI() { BASS_StreamFree(m_hsHandle); }
 
+	bool IsStreamDead() const { return m_bStreamDead; }
+	void MarkStreamDead() { m_bStreamDead = true; }
+
 	static void FreeSoundfont();
 	static void LoadSoundfont(const wchar_t* path);
 	static std::wstring ResolveSoundfontPath(const std::wstring& path, const std::wstring& dir = L"");
@@ -49,6 +52,18 @@ public:
 		return BASS_MIDI_StreamEvents(m_hsHandle, BASS_MIDI_EVENTS_RAW | BASS_MIDI_EVENTS_NORSTATUS, data, length);
 	}
 
+	// Scheduled STRUCT|TIME event: fires when the stream position reaches
+	// (current position + deltaSamples). Position-explicit events cannot be
+	// lost to RAW-stream position drift. deltaSamples is clamped to >= 0
+	// (already-past events fire immediately, like the legacy KShortMessage path).
+	DWORD SendEventScheduled(BYTE code, BYTE p1, BYTE p2, long long deltaSamples)
+	{
+		if (deltaSamples < 0) deltaSamples = 0;
+		if (deltaSamples > 0x3FFFFFFF) deltaSamples = 0x3FFFFFFF;
+		BASS_MIDI_EVENT ev = { (DWORD)code, (DWORD)((p2 << 8) | p1), (DWORD)(code & 0xF), 0, (DWORD)(deltaSamples << 3) };
+		return BASS_MIDI_StreamEvents(m_hsHandle, BASS_MIDI_EVENTS_TIME | BASS_MIDI_EVENTS_STRUCT, &ev, 1);
+	}
+
 	void ResetChannels()
 	{
 		for (int ch = 0; ch < 16; ch++)
@@ -64,4 +79,8 @@ public:
 	}
 
 	DWORD Read(float buffer[], int offset, int count);
+
+	bool m_bStreamDead = false;
+	bool m_bGenHeardAudio = false;
+	int m_iGenSilentFrames = 0;
 };

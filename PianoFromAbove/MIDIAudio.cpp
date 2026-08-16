@@ -315,8 +315,14 @@ void MIDIAudio::SetReadSpeed(double dSpeed)
 	m_maMtx.unlock();
 }
 
-void MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
+bool MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
 {
+	if (bass->IsStreamDead())
+	{
+		g_bGenDead = true;
+		PRE_DbgLog("SYNTHDEAD detected before write (stream dead)");
+		return false;
+	}
 	start = (start * 2) % m_iBufferLength;
 	count *= 2;
 	if (start + count > m_iBufferLength)
@@ -329,6 +335,73 @@ void MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
 	{
 		bass->Read(m_fAudioBuffer, start, count);
 	}
+
+	// Diagnostic: RMS of the chunk just pulled from the synth. A chunk that
+	// comes back silent while the generator keeps sending events means the
+	// synth is no longer sounding the notes (the prerender death signature).
+	// Only logged after real audio has been heard (skips the silent pre-roll).
+	static bool sHeardAudio = false;
+	static int sSilentLogs = 0;
+	double dSum = 0.0;
+	int n = 0;
+	for (int i = start; i < min(start + count, m_iBufferLength); i += 2)
+	{
+		float f = m_fAudioBuffer[i];
+		dSum += (double)f * f;
+		n++;
+	}
+	double dRms = (n > 0) ? sqrt(dSum / n) : 0.0;
+	if (dRms > 0.005) sHeardAudio = true;
+	if (sHeardAudio && dRms < 0.0005 && sSilentLogs < 30)
+	{
+		sSilentLogs++;
+		PRE_DbgLog("SILENTCHUNK posF=%.1f frames=%d rms=%.5f r=%d",
+			(double)(start / 2) / 48000.0, count / 2, dRms, m_iBufferReadPos);
+	}
+
+	// Synth-death detection: the decode position must advance with every write.
+	// A frozen or errored position while events keep flowing means the synth is
+	// dead (the prerender death) - the ring fills with zeros forever otherwise.
+	if (dRms > 0.005) bass->m_bGenHeardAudio = true;
+	if (bass->m_bGenHeardAudio)
+	{
+		if (dRms < 0.0005) bass->m_iGenSilentFrames += count / 2;
+		else bass->m_iGenSilentFrames = 0;
+		if (bass->m_iGenSilentFrames > 48000 * 3)
+		{
+			bass->MarkStreamDead();
+			g_bGenDead = true;
+			PRE_DbgLog("SYNTHDEAD silent %d frames after audio (rms=%.5f) w=%d r=%d",
+				bass->m_iGenSilentFrames, dRms, m_iBufferWritePos, m_iBufferReadPos);
+			return false;
+		}
+	}
+	QWORD qSynthPos = BASS_ChannelGetPosition(bass->m_hsHandle, BASS_POS_BYTE);
+	if (qSynthPos == (QWORD)-1)
+	{
+		bass->MarkStreamDead();
+		g_bGenDead = true;
+		PRE_DbgLog("SYNTHDEAD GetPosition=-1 w=%d r=%d", m_iBufferWritePos, m_iBufferReadPos);
+		return false;
+	}
+	if (qSynthPos <= m_qLastSynthPos)
+	{
+		m_iFrozenFrames += count / 2;
+		if (m_iFrozenFrames > 48000 * 2)
+		{
+			bass->MarkStreamDead();
+			g_bGenDead = true;
+			PRE_DbgLog("SYNTHDEAD position frozen %d frames pos=%llu w=%d r=%d",
+				m_iFrozenFrames, (unsigned long long)qSynthPos, m_iBufferWritePos, m_iBufferReadPos);
+			return false;
+		}
+	}
+	else
+	{
+		m_iFrozenFrames = 0;
+		m_qLastSynthPos = qSynthPos;
+	}
+	return true;
 }
 
 // Renders `frames` frames of audio into the ring in kGenWriteChunkFrames chunks, advancing m_iBufferWritePos. Returns false if stopGenerator was set mid-write (caller tears down); true when everything was written.
@@ -337,7 +410,10 @@ bool MIDIAudio::WriteAudioChunked(BASSMIDI* bass, int frames)
 	while (frames > 0)
 	{
 		int chunk = min(frames, kGenWriteChunkFrames);
-		BassWriteWrapped(bass, m_iBufferWritePos, chunk);
+		if (!BassWriteWrapped(bass, m_iBufferWritePos, chunk))
+		{
+			return false;
+		}
 		m_iBufferWritePos += chunk;
 		frames -= chunk;
 		if (stopGenerator)
@@ -356,7 +432,15 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 	m_iBufferReadPos = 0;
 
 	PRE_DbgLog("GEN start t=%.3f startidx=%d nEvents=%d speed=%.2f", time, start, (int)events->size(), speed);
+	if (bass->IsStreamDead())
+	{
+		g_bGenDead = true;
+		PRE_DbgLog("GEN abort: stream create failed, no audio this pass");
+		bass->~BASSMIDI();
+		return;
+	}
 	int dBgSent = 0;
+	m_tGenStart = std::chrono::steady_clock::now();
 
  // Diagnostic: generator throughput vs. wall clock, SendEventRaw cost, and the note-on density per audio second the synth actually faced.
 	using clock_t = std::chrono::steady_clock;
@@ -430,11 +514,13 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 			{
 				double dElapsed = std::chrono::duration<double, std::milli>(tNow - tLastProg).count();
 				double dAudioFront = m_dStartTime + m_iBufferWritePos / 48000.0;
-				PRE_DbgLog("GENPROG ev=%zu/%zu sent/s=%.0f synthMs/s=%.1f r=%d w=%d aheadSec=%.3f",
+				QWORD qSynthPos = BASS_ChannelGetPosition(bass->m_hsHandle, BASS_POS_BYTE);
+				PRE_DbgLog("GENPROG ev=%zu/%zu sent/s=%.0f synthMs/s=%.1f r=%d w=%d aheadSec=%.3f synthPos=%.3f",
 					(size_t)(e - events->begin()), events->size(),
 					(double)(llSent - llProgSent) * 1000.0 / dElapsed,
 					(double)(llSynthUs - llProgSynthUs) / 1000.0,
-					m_iBufferReadPos, m_iBufferWritePos, evTime - dAudioFront);
+					m_iBufferReadPos, m_iBufferWritePos, evTime - dAudioFront,
+					(qSynthPos == -1 ? -1.0 : (double)(qSynthPos / 8)));
 				llProgSent = llSent;
 				llProgSynthUs = llSynthUs;
 				tLastProg = tNow;
@@ -494,19 +580,57 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 		auto tSend0 = clock_t::now();
 		int err = 1;
 		err = bass->SendEventRaw(ev, 3);
+		if (err <= 0)
+		{
+			// Diagnostic: events rejected by BASS (queue full / stream state).
+			static int sLogErr = 0;
+			if (sLogErr < 30)
+			{
+				sLogErr++;
+				PRE_DbgLog("EVFAIL err=%d code=0x%02X p1=%d p2=%d evT=%.3f w=%d r=%d",
+					err, m_pMIDI->GetEventCode(*e), m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e),
+					m_pMIDI->GetEventTime(*e) / 1e6, m_iBufferWritePos, m_iBufferReadPos);
+			}
+		}
+		{
+			// Diagnostic: poison-event scan - any status byte >= 0xF0 sent as raw
+			// MIDI starts a SysEx/real-time sequence in BASS and eats following
+			// events, permanently corrupting the stream. Also dump every 5000th
+			// event so the stream around the death boundary is visible.
+			int iCode = m_pMIDI->GetEventCode(*e);
+			if ((iCode & 0xF0) == 0xF0)
+			{
+				static int sPoison = 0;
+				if (sPoison < 50)
+				{
+					sPoison++;
+					PRE_DbgLog("POISON code=0x%02X p1=%d p2=%d absT=%.6f",
+						iCode, m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e),
+						m_pMIDI->GetEventTime(*e) / 1e6);
+				}
+			}
+			if ((llSent % 5000) == 0)
+			{
+				PRE_DbgLog("EVSTREAM sent=%llu code=0x%02X p1=%d p2=%d absT=%.6f w=%d",
+					(unsigned long long)llSent, iCode,
+					m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e),
+					m_pMIDI->GetEventTime(*e) / 1e6, m_iBufferWritePos);
+			}
+		}
 		llSynthUs += std::chrono::duration_cast<std::chrono::microseconds>(clock_t::now() - tSend0).count();
 		llSent++;
 		iConsecEvents++;
-		if (iConsecEvents >= 50000 && !stopGenerator)
-		{
-			WriteAudioChunked(bass, 1);
-			iConsecEvents = 0;
-		}
-		if (err <= 0) {}
 		if (dBgSent < 8 && (m_pMIDI->GetEventCode(*e) >> 4) == 0x9 && m_pMIDI->GetEventParam2(*e) > 0)
 		{
 			PRE_DbgLog("GEN  ev[%d] absT=%.3f ch=%d note=%d vel=%d", dBgSent, m_pMIDI->GetEventTime(*e) / 1e6, m_pMIDI->GetEventChannel(*e), m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e));
 			dBgSent++;
+		}
+		if ((m_pMIDI->GetEventTime(*e) / 1e6) < 8.0 && (llSent % 10) == 0 && llSent < 4000)
+		{
+			PRE_DbgLog("EVFULL sent=%llu code=0x%02X p1=%d p2=%d absT=%.4f",
+				(unsigned long long)llSent, m_pMIDI->GetEventCode(*e),
+				m_pMIDI->GetEventParam1(*e), m_pMIDI->GetEventParam2(*e),
+				m_pMIDI->GetEventTime(*e) / 1e6);
 		}
 		if (stopGenerator)
 		{
@@ -558,6 +682,9 @@ void MIDIAudio::Start(double time, std::vector<MIDIChannelEvent>* events, double
 {
 	KillLastGenerator();
 	stopGenerator = false;
+	g_bGenDead = false;
+	m_qLastSynthPos = 0;
+	m_iFrozenFrames = 0;
 	m_dStartTime = time;
 	m_pMIDI = events ? m_pMIDI : nullptr;
 	m_tGeneratorThread = new std::thread([this, speed, time, events, start] { GeneratorFunc(speed, time, events, start); });

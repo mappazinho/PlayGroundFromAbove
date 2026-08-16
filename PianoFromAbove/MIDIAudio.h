@@ -83,6 +83,7 @@ public:
 	AudioBufferStream m_asAudioStream;
 
 	std::thread* m_tGeneratorThread;
+	std::chrono::steady_clock::time_point m_tGenStart;
 
 	int GetSkippingVelocity()
 	{
@@ -146,10 +147,16 @@ private:
 	BASSMIDI* m_bBass = nullptr;
 
 	static void WrappedCopy(float* src, int pos, int srcCount, float* dst, int pos2, int count);
-	void BassWriteWrapped(BASSMIDI* bass, int start, int count);
+	bool BassWriteWrapped(BASSMIDI* bass, int start, int count);
 	bool WriteAudioChunked(BASSMIDI* bass, int frames);
 
 	void GeneratorFunc(double speed, double time, std::vector<MIDIChannelEvent>* events, int start = 0);
 
 	void KillLastGenerator();
+
+	// Synth-death tracking: the BASS decode position must advance with every
+	// GetData. If it stalls (or errors) the synth is dead even though the ring
+	// keeps filling with zeros - the prerender death signature.
+	QWORD m_qLastSynthPos = 0;
+	int m_iFrozenFrames = 0;
 };
