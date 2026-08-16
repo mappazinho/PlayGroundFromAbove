@@ -367,3 +367,6 @@ PianoFromAbove/Soundfonts/
 # Session state (local only)
 /AGENTS.md
 /Config.xml.bak
+
+# Local test harness (not part of the game)
+/StandaloneTest/
