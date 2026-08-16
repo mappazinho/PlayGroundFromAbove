@@ -241,6 +241,9 @@ void VizSettings::LoadDefaultValues() {
     this->fRibbonBloomBrightness = 1.0f;
     this->iRibbonBloomSteps = 64;
     this->fBloomSaturation = 1.2f;
+    this->bVignette = false;
+    this->fVignetteIntensity = 0.35f;
+    this->fVignetteWidth = 0.5f;
     this->bColoredRibbon = true;
     this->bRibbonCustomColor = false;
     this->dwRibbonBaseColor = 0xFFFFFFFF;
@@ -492,6 +495,14 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     iRibbonBloomSteps = max(1, min(iRibbonBloomSteps, 100));
     txViz->QueryFloatAttribute("BloomSaturation", &fBloomSaturation);
     fBloomSaturation = max(0.0f, min(fBloomSaturation, 3.0f));
+    if (txViz->QueryIntAttribute("Vignette", &iAttrVal) == TIXML_SUCCESS)
+        bVignette = (iAttrVal != 0);
+    txViz->QueryFloatAttribute("VignetteIntensity", &fVignetteIntensity);
+    fVignetteIntensity = max(0.0f, min(fVignetteIntensity, 1.0f));
+    if (std::isnan(fVignetteIntensity)) fVignetteIntensity = 0.35f;
+    txViz->QueryFloatAttribute("VignetteWidth", &fVignetteWidth);
+    fVignetteWidth = max(0.0f, min(fVignetteWidth, 3.0f));
+    if (std::isnan(fVignetteWidth)) fVignetteWidth = 0.5f;
     if (txViz->QueryIntAttribute("ColoredRibbon", &iAttrVal) == TIXML_SUCCESS)
         bColoredRibbon = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("RibbonCustomColor", &iAttrVal) == TIXML_SUCCESS)
@@ -685,6 +696,9 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetDoubleAttribute("RibbonBloomBrightness", fRibbonBloomBrightness);
     txViz->SetAttribute("RibbonBloomSteps", iRibbonBloomSteps);
     txViz->SetDoubleAttribute("BloomSaturation", fBloomSaturation);
+    txViz->SetAttribute("Vignette", bVignette);
+    txViz->SetDoubleAttribute("VignetteIntensity", fVignetteIntensity);
+    txViz->SetDoubleAttribute("VignetteWidth", fVignetteWidth);
     txViz->SetAttribute("ColoredRibbon", bColoredRibbon);
     txViz->SetAttribute("RibbonCustomColor", bRibbonCustomColor);
     txViz->SetAttribute("RibbonBaseColor", (int)dwRibbonBaseColor);

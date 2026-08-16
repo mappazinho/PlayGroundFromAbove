@@ -18,6 +18,7 @@
 #include "BlurShader11.h"
 #include "BloomExtractShader11.h"
 #include "BloomPixelShader11.h"
+#include "VignettePixelShader11.h"
 #include "Globals.h"
 #include "Renderer.h"
 #include "RendererD3D11.h"
@@ -186,6 +187,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     if (FAILED(res))
         return std::make_tuple(res, "CreateBlendState (bloom)");
 
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    res = m_pDevice->CreateBlendState(&blend_desc, &m_pBlendVignette);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBlendState (vignette)");
+
     // Rasterizer: back-face culling, depth clip, scissor enabled (mirrors the
     // D3D12 default rasterizer + per-draw RSSetScissorRects)
     D3D11_RASTERIZER_DESC rs_desc = {};
@@ -258,6 +267,10 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pBloomConstants);
     if (FAILED(res))
         return std::make_tuple(res, "CreateBuffer (bloom constants)");
+    cb_desc.ByteWidth = 16;
+    res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pVignetteConstants);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBuffer (vignette constants)");
 
     // Fixed size data buffer (t1)
     D3D11_BUFFER_DESC fixed_desc = {};
@@ -857,6 +870,25 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     DrawPianoRollStripBackground();
     DrawPianoRollStrip();
 
+    const auto& vignetteViz = Config::GetConfig().GetVizSettings();
+    if (vignetteViz.bVignette && vignetteViz.fVignetteIntensity > 0.0f && m_pVignettePS && m_pBlendVignette && m_pVignetteConstants) {
+        m_pContext->VSSetShader(m_pBackgroundVS.Get(), nullptr, 0);
+        m_pContext->PSSetShader(m_pVignettePS.Get(), nullptr, 0);
+        m_pContext->IASetInputLayout(nullptr);
+        m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        UINT stride0 = 0, offset0 = 0;
+        m_pContext->IASetVertexBuffers(0, 0, nullptr, &stride0, &offset0);
+        m_pContext->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+        m_pContext->RSSetState(m_pRasterizer.Get());
+        m_pContext->OMSetBlendState(m_pBlendVignette.Get(), nullptr, 0xFFFFFFFF);
+        m_pContext->OMSetDepthStencilState(m_pDepthDisabled.Get(), 0);
+        m_pContext->PSSetConstantBuffers(0, 1, m_pVignetteConstants.GetAddressOf());
+        m_pContext->RSSetScissorRects(1, &m_FullScissor);
+        float vg[4] = { vignetteViz.fVignetteIntensity, (float)m_iBufferWidth / (float)max(1, m_iBufferHeight), vignetteViz.fVignetteWidth, 0.4f };
+        m_pContext->UpdateSubresource(m_pVignetteConstants.Get(), 0, nullptr, vg, 0, 0);
+        m_pContext->Draw(3, 0);
+    }
+
     if (!Config::GetConfig().GetVizSettings().bDisableUI) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     }
@@ -1134,6 +1166,8 @@ HRESULT D3D11Renderer::CreateBlurResources() {
     if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
     res = m_pDevice->CreatePixelShader(g_pBloomPixelShader11, sizeof(g_pBloomPixelShader11), nullptr, &m_pBloomPS);
     if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
+    res = m_pDevice->CreatePixelShader(g_pVignettePixelShader11, sizeof(g_pVignettePixelShader11), nullptr, &m_pVignettePS);
+    if (FAILED(res)) { char eb[160]; sprintf_s(eb, "blurfail:d3d11 L%d hr=0x%08X", __LINE__, (unsigned)res); HeartbeatLog(eb); return res; }
 
     // Scene copy / blur textures (full-res B8G8R8A8)
     ComPtr<ID3D11Texture2D> tex = nullptr;
@@ -1243,6 +1277,7 @@ void D3D11Renderer::DestroyBlurResources() {
     m_pBlurCS.Reset();
     m_pBloomExtractCS.Reset();
     m_pBloomPS.Reset();
+    m_pVignettePS.Reset();
     m_pSceneCopy.Reset();
     m_pSceneCopySRV.Reset();
     m_pBlurTemp.Reset();

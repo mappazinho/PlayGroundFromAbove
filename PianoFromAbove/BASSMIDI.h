@@ -81,6 +81,4 @@ public:
 	DWORD Read(float buffer[], int offset, int count);
 
 	bool m_bStreamDead = false;
-	bool m_bGenHeardAudio = false;
-	int m_iGenSilentFrames = 0;
 };

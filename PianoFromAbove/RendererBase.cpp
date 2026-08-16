@@ -486,6 +486,17 @@ void Renderer::RenderImGuiFrame() {
                     viz.iRibbonBloomSteps = steps;
                 ImGui::Unindent();
             }
+            ImGui::Checkbox("Vignette", &viz.bVignette);
+            if (viz.bVignette) {
+                ImGui::Indent();
+                float vignette = viz.fVignetteIntensity;
+                if (ImGui::SliderFloat("Vignette Intensity", &vignette, 0.0f, 1.0f, "%.2f"))
+                    viz.fVignetteIntensity = vignette;
+                float width = viz.fVignetteWidth;
+                if (ImGui::SliderFloat("Vignette Width", &width, 0.0f, 3.0f, "%.2f"))
+                    viz.fVignetteWidth = width;
+                ImGui::Unindent();
+            }
             ImGui::Checkbox("Colored Ribbon", &viz.bColoredRibbon);
             ImGui::Checkbox("Custom Ribbon Color", &viz.bRibbonCustomColor);
             if (viz.bRibbonCustomColor) {

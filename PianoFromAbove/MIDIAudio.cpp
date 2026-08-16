@@ -362,20 +362,8 @@ bool MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
 	// Synth-death detection: the decode position must advance with every write.
 	// A frozen or errored position while events keep flowing means the synth is
 	// dead (the prerender death) - the ring fills with zeros forever otherwise.
-	if (dRms > 0.005) bass->m_bGenHeardAudio = true;
-	if (bass->m_bGenHeardAudio)
-	{
-		if (dRms < 0.0005) bass->m_iGenSilentFrames += count / 2;
-		else bass->m_iGenSilentFrames = 0;
-		if (bass->m_iGenSilentFrames > 48000 * 3)
-		{
-			bass->MarkStreamDead();
-			g_bGenDead = true;
-			PRE_DbgLog("SYNTHDEAD silent %d frames after audio (rms=%.5f) w=%d r=%d",
-				bass->m_iGenSilentFrames, dRms, m_iBufferWritePos, m_iBufferReadPos);
-			return false;
-		}
-	}
+	// (An RMS-based "silent output" heuristic was removed: quiet passages in real
+	// songs trip it and burned all rebuilds mid-song.)
 	QWORD qSynthPos = BASS_ChannelGetPosition(bass->m_hsHandle, BASS_POS_BYTE);
 	if (qSynthPos == (QWORD)-1)
 	{

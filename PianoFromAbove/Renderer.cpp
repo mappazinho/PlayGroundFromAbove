@@ -1334,6 +1334,20 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     DrawPianoRollStrip();
     auto s_t3 = std::chrono::steady_clock::now();
 
+    const auto& vignetteViz = Config::GetConfig().GetVizSettings();
+    if (vignetteViz.bVignette && vignetteViz.fVignetteIntensity > 0.0f && m_pVignettePipelineState && m_pVignetteRootSignature) {
+        D3D12_RECT vgScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
+        m_pCommandList->RSSetScissorRects(1, &vgScissor);
+        m_pCommandList->SetPipelineState(m_pVignettePipelineState.Get());
+        m_pCommandList->SetGraphicsRootSignature(m_pVignetteRootSignature.Get());
+        m_pCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_pCommandList->IASetVertexBuffers(0, 0, nullptr);
+        m_pCommandList->IASetIndexBuffer(&m_IndexBufferView);
+        float vg[4] = { vignetteViz.fVignetteIntensity, (float)m_iBufferWidth / (float)max(1, m_iBufferHeight), vignetteViz.fVignetteWidth, 0.4f };
+        m_pCommandList->SetGraphicsRoot32BitConstants(0, 4, vg, 0);
+        m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);
+    }
+
     if (!Config::GetConfig().GetVizSettings().bDisableUI) {
         ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
         m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
@@ -1943,6 +1957,35 @@ static HRESULT CompileBloomShader(ID3DBlob** ppBlob) {
     return D3DCompile(g_BloomHLSL, strlen(g_BloomHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
 }
 
+// Vignette: a fullscreen multiply pass after bloom. The pixel shader computes a
+// radial falloff factor from the UVs and the frame is darkened multiplicatively
+// (DEST_COLOR x vignette factor), so no scene texture needs to be sampled.
+static const char* g_VignetteHLSL = R"(
+cbuffer VignetteConstants : register(b0) {
+    float g_intensity;
+    float g_aspect;
+    float g_innerRadius;
+    float g_smoothness;
+};
+
+struct PSInput {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+float4 main(PSInput input) : SV_TARGET {
+    float2 c = input.uv - 0.5;
+    c.x *= g_aspect;
+    float d = length(c) * 2.0;
+    float v = 1.0 - g_intensity * smoothstep(g_innerRadius, g_innerRadius + g_smoothness, d);
+    return float4(v, v, v, 1.0);
+}
+)";
+
+static HRESULT CompileVignetteShader(ID3DBlob** ppBlob) {
+    return D3DCompile(g_VignetteHLSL, strlen(g_VignetteHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
+}
+
 HRESULT D3D12Renderer::CreateBlurResources() {
     if (m_pBlurPipelineState)
         DestroyBlurResources();
@@ -2169,6 +2212,59 @@ HRESULT D3D12Renderer::CreateBlurResources() {
         bloom_desc.SampleDesc = { .Count = 1 };
         res = m_pDevice->CreateGraphicsPipelineState(&bloom_desc, IID_PPV_ARGS(&m_pBloomPipelineState));
         if (FAILED(res)) return res;
+
+        // Vignette: constants-only root signature (intensity/aspect/radius/smoothness)
+        D3D12_ROOT_PARAMETER vignette_params[1] = {};
+        vignette_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        vignette_params[0].Constants.ShaderRegister = 0;
+        vignette_params[0].Constants.RegisterSpace = 0;
+        vignette_params[0].Constants.Num32BitValues = 4;
+        vignette_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC vignette_rs_desc = {
+            .NumParameters = _countof(vignette_params),
+            .pParameters = vignette_params,
+            .NumStaticSamplers = 0,
+            .pStaticSamplers = nullptr,
+            .Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS,
+        };
+        ComPtr<ID3DBlob> vignette_rs_blob, vignette_rs_err;
+        res = D3D12SerializeRootSignature(&vignette_rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &vignette_rs_blob, &vignette_rs_err);
+        if (FAILED(res)) return res;
+        res = m_pDevice->CreateRootSignature(0, vignette_rs_blob->GetBufferPointer(), vignette_rs_blob->GetBufferSize(), IID_PPV_ARGS(&m_pVignetteRootSignature));
+        if (FAILED(res)) return res;
+
+        ComPtr<ID3DBlob> vignette_ps_blob;
+        res = CompileVignetteShader(&vignette_ps_blob);
+        if (FAILED(res)) return res;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC vignette_desc = {};
+        vignette_desc.pRootSignature = m_pVignetteRootSignature.Get();
+        vignette_desc.VS = { .pShaderBytecode = g_pBackgroundVertexShader, .BytecodeLength = sizeof(g_pBackgroundVertexShader) };
+        vignette_desc.PS = { .pShaderBytecode = vignette_ps_blob->GetBufferPointer(), .BytecodeLength = vignette_ps_blob->GetBufferSize() };
+        // Multiplicative: output = backbuffer * vignette factor
+        vignette_desc.BlendState.RenderTarget[0] = {
+            .BlendEnable = TRUE,
+            .LogicOpEnable = FALSE,
+            .SrcBlend = D3D12_BLEND_DEST_COLOR,
+            .DestBlend = D3D12_BLEND_ZERO,
+            .BlendOp = D3D12_BLEND_OP_ADD,
+            .SrcBlendAlpha = D3D12_BLEND_ONE,
+            .DestBlendAlpha = D3D12_BLEND_ZERO,
+            .BlendOpAlpha = D3D12_BLEND_OP_ADD,
+            .LogicOp = D3D12_LOGIC_OP_NOOP,
+            .RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL,
+        };
+        vignette_desc.SampleMask = UINT_MAX;
+        vignette_desc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        vignette_desc.DepthStencilState = { .DepthEnable = FALSE, .StencilEnable = FALSE };
+        vignette_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        vignette_desc.NumRenderTargets = 1;
+        vignette_desc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        vignette_desc.SampleDesc = { .Count = 1 };
+        res = m_pDevice->CreateGraphicsPipelineState(&vignette_desc, IID_PPV_ARGS(&m_pVignettePipelineState));
+        if (FAILED(res)) return res;
     }
 
     D3D12_RESOURCE_DESC tex_desc = {
@@ -2357,6 +2453,8 @@ void D3D12Renderer::DestroyBlurResources() {
     m_pBlurPipelineState.Reset();
     m_pBloomRootSignature.Reset();
     m_pBloomPipelineState.Reset();
+    m_pVignetteRootSignature.Reset();
+    m_pVignettePipelineState.Reset();
     m_pBloomExtractRootSignature.Reset();
     m_pBloomExtractPipelineState.Reset();
     m_pSceneCopy.Reset();

@@ -224,6 +224,9 @@ struct VizSettings : public ISettings {
     float fRibbonBloomBrightness;
     int iRibbonBloomSteps;
     float fBloomSaturation;
+    bool bVignette;
+    float fVignetteIntensity;
+    float fVignetteWidth;
     bool bColoredRibbon;
     bool bRibbonCustomColor;
     DWORD dwRibbonBaseColor;

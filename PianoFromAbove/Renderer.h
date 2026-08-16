@@ -341,6 +341,8 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12PipelineState> m_pBackgroundPipelineState;
     ComPtr<ID3D12RootSignature> m_pBloomRootSignature;
     ComPtr<ID3D12PipelineState> m_pBloomPipelineState;
+    ComPtr<ID3D12RootSignature> m_pVignetteRootSignature;
+    ComPtr<ID3D12PipelineState> m_pVignettePipelineState;
     ComPtr<ID3D12GraphicsCommandList> m_pCommandList;
     ComPtr<ID3D12Fence> m_pFence;
     HANDLE m_hFenceEvent = NULL;

@@ -95,6 +95,7 @@ private:
     ComPtr<ID3D11ComputeShader> m_pBlurCS;
     ComPtr<ID3D11ComputeShader> m_pBloomExtractCS;
     ComPtr<ID3D11PixelShader> m_pBloomPS;
+    ComPtr<ID3D11PixelShader> m_pVignettePS;
 
     ComPtr<ID3D11InputLayout> m_pRectInputLayout;
     ComPtr<ID3D11Buffer> m_pIndexBuffer;
@@ -104,6 +105,7 @@ private:
     ComPtr<ID3D11Buffer> m_pBlurConstants;
     ComPtr<ID3D11Buffer> m_pBloomExtractConstants;
     ComPtr<ID3D11Buffer> m_pBloomConstants;
+    ComPtr<ID3D11Buffer> m_pVignetteConstants;
 
     ComPtr<ID3D11Buffer> m_pFixedBuffer;
     ComPtr<ID3D11ShaderResourceView> m_pFixedSRV;
@@ -116,6 +118,7 @@ private:
 
     ComPtr<ID3D11BlendState> m_pBlendInverted;
     ComPtr<ID3D11BlendState> m_pBlendBloom;
+    ComPtr<ID3D11BlendState> m_pBlendVignette;
     ComPtr<ID3D11RasterizerState> m_pRasterizer;
     ComPtr<ID3D11DepthStencilState> m_pDepthDisabled;
     ComPtr<ID3D11DepthStencilState> m_pDepthEnabled;
