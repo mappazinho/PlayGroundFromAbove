@@ -29,6 +29,7 @@ public:
     HRESULT PresentBackend() override;
     HRESULT WaitForGPU() override;
     std::wstring GetAdapterName() override;
+    bool GetAdapterVideoMemory(DWORDLONG& used, DWORDLONG& total) override;
     const wchar_t* GetModeName() const override { return L"DirectX 11"; }
     void SetPipeline(Pipeline pipeline) override;
     char* Screenshot() override;

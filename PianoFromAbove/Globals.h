@@ -37,6 +37,14 @@ extern bool g_bForceWARP;     // Retry D3D11 init on the WARP software rasterize
 extern const wchar_t* g_pwszRenderMode; // Active backend name ("DirectX 12"/"DirectX 11"), set after init
 extern TSQueue< MSG > g_MsgQueue; // Producer/consumer to hold events for our game thread
 
+// Video render: captures playback frames into an FFmpeg pipe, records the
+// prerendered audio to WAV, and muxes both into an mp4. RequestVideoRender is
+// safe to call from any thread (queues the request to the game thread state).
+extern bool g_bVideoRendering;
+bool RequestVideoRender();
+void StopVideoRender();
+bool VideoRenderSongLoaded(); // True when the current state is a loaded song screen
+
 void HeartbeatLog(const char* tag); // Temporary debug diagnostics (game thread only)
 
 // Sets the main window title with the active renderer indicator appended.

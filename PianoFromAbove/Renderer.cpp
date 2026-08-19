@@ -1440,11 +1440,18 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
     const float stripH = max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripBottom = stripTop + stripH;
     const float fadeBottom = min((float)m_iBufferHeight, stripBottom + 40.0f);
+    const float fadeTop = max(0.0f, stripTop - 40.0f);
     const D3D12_RECT stripScissor = {
         0,
         (LONG)floor(stripTop),
         m_iBufferWidth,
         min(m_iBufferHeight, (LONG)ceil(fadeBottom)),
+    };
+    const D3D12_RECT topScissor = {
+        0,
+        (LONG)floor(fadeTop),
+        m_iBufferWidth,
+        (LONG)ceil(stripTop),
     };
     const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
 
@@ -1452,7 +1459,7 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
         .fadeStart = stripBottom,
         .fadeEnd = fadeBottom,
         .fadeEnabled = 1.0f,
-        .padding = 1.0f,
+        .padding = 1.0f, // fade mode 1: alpha = smoothstep -> blur in the strip, fading out toward fade_end (bottom edge)
     };
     SetPipeline(Pipeline::Background);
     ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
@@ -1460,6 +1467,19 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
     m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(backgroundConstants) / 4, &backgroundConstants, 0);
     m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BlurOutputSRVGPU);
     m_pCommandList->RSSetScissorRects(1, &stripScissor);
+    m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);
+
+    // Top-edge fade, symmetric to the bottom one: the blurred background fades
+    // out over the 40 px band above the strip.
+    const BackgroundConstants topConstants = {
+        .fadeStart = fadeTop,
+        .fadeEnd = stripTop,
+        .fadeEnabled = 1.0f,
+        .padding = 0.0f, // fade mode 0: alpha = 1 - smoothstep -> sharp above, blur fading in toward fade_start (top edge)
+    };
+    m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(topConstants) / 4, &topConstants, 0);
+    m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BlurOutputSRVGPU);
+    m_pCommandList->RSSetScissorRects(1, &topScissor);
     m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);
     m_pCommandList->RSSetScissorRects(1, &fullScissor);
 }
@@ -1556,6 +1576,20 @@ std::wstring D3D12Renderer::GetAdapterName() {
         return desc.Description;
     }
     return L"None";
+}
+
+bool D3D12Renderer::GetAdapterVideoMemory(DWORDLONG& used, DWORDLONG& total) {
+    used = 0;
+    total = 0;
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (!m_pAdapter || FAILED(m_pAdapter.As(&adapter3)))
+        return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return false;
+    used = info.CurrentUsage;
+    total = info.Budget;
+    return true;
 }
 
 HRESULT D3D12Renderer::WaitForGPU() {
@@ -1813,15 +1847,20 @@ struct PSInput {
 
 float4 main(PSInput input) : SV_TARGET {
     float4 c = tex.Sample(tex_sampler, input.uv);
-    float vis;
+    float alpha;
     if (fade_enabled > 0.5) {
         float denom = max(fade_start + 1.0, fade_end) - fade_start;
         float t = saturate((input.position.y - fade_start) / denom);
-        vis = 1.0 - t * t * (3.0 - 2.0 * t);
+        float s = t * t * (3.0 - 2.0 * t);
+        // 4th cbuffer float = fade mode: 1 gives alpha = smoothstep (blur in
+        // the strip, fading out toward fade_end / bottom edge); 0 gives
+        // alpha = 1 - smoothstep (sharp above, fading out toward fade_start /
+        // top edge).
+        alpha = (opacity > 0.5) ? s : (1.0 - s);
     } else {
-        vis = c.a;
+        alpha = 1.0 - opacity * c.a;
     }
-    return float4(c.rgb, 1.0 - opacity * vis);
+    return float4(c.rgb, alpha);
 }
 )";
 

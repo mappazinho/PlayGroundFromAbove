@@ -42,6 +42,120 @@ bool g_bBootedFallback = false;
 bool g_bForceWARP = false;
 const wchar_t* g_pwszRenderMode = L"DirectX 12";
 
+// ---- Render progress window -------------------------------------------------
+// A plain Win32 popup that shows the render progress, output size, and render
+// speed while a video render runs. It is a separate top-level window, so it is
+// never captured into the video (the ImGui UI is hidden during renders). It is
+// created and destroyed on the main thread (window messages), while the game
+// thread feeds it via UpdateRenderProgressWindow (cross-thread SendMessage is
+// marshaled to the main thread automatically).
+#define WM_RENDERPROG_CREATE (WM_APP + 0x201)
+#define WM_RENDERPROG_DESTROY (WM_APP + 0x202)
+
+static HWND s_hRenderProgWnd = NULL;
+static HWND s_hRenderProgBar = NULL;
+static wchar_t s_wRenderProgText[512] = L"Rendering...";
+static wchar_t s_wRenderProgLast[512] = L"";
+
+static LRESULT CALLBACK RenderProgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CLOSE:
+        // Closing the progress window cancels the render (same semantics as
+        // closing the standalone renderer window).
+        if (g_bVideoRendering)
+            HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
+        return 0;
+    case WM_DESTROY:
+        s_hRenderProgWnd = NULL;
+        s_hRenderProgBar = NULL;
+        return 0;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(230, 230, 230));
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT hOld = (HFONT)SelectObject(hdc, hFont);
+        RECT rcText = { 12, 8, rc.right - 12, 62 };
+        DrawTextW(hdc, s_wRenderProgText, -1, &rcText, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        SelectObject(hdc, hOld);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+VOID RequestCreateRenderProgressWindow()
+{
+    PostMessageW(g_hWnd, WM_RENDERPROG_CREATE, 0, 0);
+}
+
+VOID RequestDestroyRenderProgressWindow()
+{
+    PostMessageW(g_hWnd, WM_RENDERPROG_DESTROY, 0, 0);
+}
+
+VOID UpdateRenderProgressWindow(INT iPermille, const wchar_t* wText)
+{
+    if (wText)
+    {
+        wcsncpy_s(s_wRenderProgText, wText, _TRUNCATE);
+        if (wcscmp(s_wRenderProgText, s_wRenderProgLast) != 0)
+        {
+            wcscpy_s(s_wRenderProgLast, s_wRenderProgText);
+            if (s_hRenderProgWnd)
+                InvalidateRect(s_hRenderProgWnd, NULL, TRUE);
+        }
+    }
+    if (s_hRenderProgBar)
+        SendMessageW(s_hRenderProgBar, PBM_SETPOS, iPermille, 0);
+}
+
+static void CreateRenderProgressWindow()
+{
+    if (s_hRenderProgWnd)
+        return;
+    static bool s_bClassRegistered = false;
+    if (!s_bClassRegistered)
+    {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = RenderProgProc;
+        wc.hInstance = g_hInstance;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = L"PGFA_RenderProgress";
+        RegisterClassExW(&wc);
+        s_bClassRegistered = true;
+    }
+    s_hRenderProgWnd = CreateWindowExW(WS_EX_NOACTIVATE, L"PGFA_RenderProgress", L"Render to Video",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 340, 120, NULL, NULL, g_hInstance, NULL);
+    if (!s_hRenderProgWnd)
+        return;
+    s_hRenderProgBar = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+        WS_CHILD | WS_VISIBLE, 12, 66, 300, 14, s_hRenderProgWnd, NULL, g_hInstance, NULL);
+    SendMessageW(s_hRenderProgBar, PBM_SETRANGE, 0, MAKELPARAM(0, 1000));
+    // Top-right of the work area, clear of the centered renderer window.
+    RECT rcWork = {};
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
+    SetWindowPos(s_hRenderProgWnd, HWND_TOP, rcWork.right - 350, rcWork.top + 12, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+}
+
+static void DestroyRenderProgressWindow()
+{
+    if (s_hRenderProgWnd)
+        DestroyWindow(s_hRenderProgWnd);
+    s_hRenderProgWnd = NULL;
+    s_hRenderProgBar = NULL;
+}
+
 static void TraceMsg(const char* name, WPARAM wParam, LPARAM lParam) {
     static bool bInit = false;
     static __int64 nStart = 0;
@@ -79,6 +193,12 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
 
     switch( msg )
     {
+        case WM_RENDERPROG_CREATE:
+            CreateRenderProgressWindow();
+            return 0;
+        case WM_RENDERPROG_DESTROY:
+            DestroyRenderProgressWindow();
+            return 0;
         case WM_COMMAND:
         {
             int iId = LOWORD( wParam );
@@ -126,6 +246,13 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     cPlayback.SetPosition( 0 );
                     SetMainTitle(L"PlayGroundFromAbove " __DATE__);
                     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )new IntroScreen( NULL, NULL ) );
+                    return 0;
+                }
+                case ID_FILE_RENDERVIDEO:
+                {
+                    // Toggles: starts a video render, or stops one in progress.
+                    // Runs on the game thread (it owns the render state).
+                    HandOffMsg( WM_COMMAND, ID_FILE_RENDERVIDEO, 0 );
                     return 0;
                 }
                 case ID_PRACTICE_DEFAULT:
@@ -353,6 +480,16 @@ LRESULT WINAPI GfxProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
         case WM_CREATE:
             ShowKeyboard( cView.GetKeyboard() );
             return 0;
+        case WM_CLOSE:
+            // Closing the standalone renderer window (it is only detached from
+            // the player window while a render runs) cancels the render and
+            // brings the player window back.
+            if ( g_bVideoRendering )
+            {
+                HandOffMsg( WM_COMMAND, ID_FILE_STOPRENDER, 0 );
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN: case WM_RBUTTONDOWN:
             SetFocus( hWnd );
             if ( !bTrackR && !bTrackL ) SetCapture( hWnd );

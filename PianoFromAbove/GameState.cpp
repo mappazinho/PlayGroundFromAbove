@@ -13,12 +13,16 @@
 #include <ppl.h>
 #include <dwmapi.h>
 #include <fstream>
+#include <pdh.h>
+#include <thread>
+#include <atomic>
 
 #include "Globals.h"
 #include "GameState.h"
 #include "Config.h"
 #include "resource.h"
-#include "ConfigProcs.h"
+#include "ConfigProcs.h"        
+#include "MainProcs.h"          
 #include "MIDIPreRenderPlayer.h"
 #include <d3d9types.h>
 
@@ -42,6 +46,423 @@ static void SyncTrackColors(Renderer* pRenderer, const vector<TrackSettings>& vT
         if (bChanged)
             pRenderer->MarkTrackColorsDirty(i);
     }
+}
+
+// ---- video render (FFmpeg capture) -----------------------------------------
+bool g_bVideoRendering = false;
+
+// Resolution the raw stream was started with (the capture aborts cleanly if
+// the window is resized mid-render, which would corrupt the stream).
+static int s_FFCapW = 0, s_FFCapH = 0;
+
+// Runs an ffmpeg command to completion (used for the final mux pass).
+static void RunFFmpegSync(wchar_t* sCmd)
+{
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(NULL, sCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+bool RequestVideoRender()
+{
+    if (!g_pGameState)
+        return false;
+    MainScreen* ms = dynamic_cast<MainScreen*>(g_pGameState);
+    if (!ms)
+        return false;
+    ms->StartVideoRender();
+    return true;
+}
+
+void StopVideoRender()
+{
+    if (!g_pGameState)
+        return;
+    MainScreen* ms = dynamic_cast<MainScreen*>(g_pGameState);
+    if (ms)
+        ms->FinishVideoRender();
+}
+
+bool VideoRenderSongLoaded()
+{
+    if (!g_pGameState)
+        return false;
+    MainScreen* ms = dynamic_cast<MainScreen*>(g_pGameState);
+    if (!ms)
+        return false;
+    return !ms->IsFreePlay() && ms->IsValid();
+}
+
+void MainScreen::StartVideoRender()
+{
+    if (m_bRenderVideo)
+        return;
+    if (IsFreePlay() || !m_MIDI.IsValid())
+    {
+        MessageBox(g_hWnd, TEXT("Load a song first - the video render captures song playback."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    Config& config = Config::GetConfig();
+    VizSettings& viz = config.GetVizSettings();
+
+    if (m_bUseCustomAudio && !m_sCustomAudioPath.empty())
+    {
+        MessageBox(g_hWnd, TEXT("Custom audio is not supported by the video render.\nDisable custom audio in the Playback menu first."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (viz.bDumpFrames)
+    {
+        MessageBox(g_hWnd, TEXT("Turn off Dump Frames in the Viz tab first."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (!config.GetAudioSettings().bPreRenderAudio)
+    {
+        MessageBox(g_hWnd, TEXT("Enable Pre-rendered Audio in Settings -> Audio first.\nThe video render records the prerendered audio track."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (viz.sFFmpegDir.empty())
+    {
+        MessageBox(g_hWnd, TEXT("Set the FFmpeg folder (the one containing ffmpeg.exe) first."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring sFFmpeg = viz.sFFmpegDir + L"\\ffmpeg.exe";
+    if (GetFileAttributesW(sFFmpeg.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        MessageBox(g_hWnd, TEXT("ffmpeg.exe was not found in the FFmpeg folder."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // Capture starts immediately at the renderer's current resolution; ffmpeg
+    // scales the stream to the requested output resolution on the fly.
+    BeginVideoRender();
+}
+
+void MainScreen::BeginVideoRender()
+{
+    Config& config = Config::GetConfig();
+    VizSettings& viz = config.GetVizSettings();
+
+    // Output file names: the user's path (with the chosen container extension,
+    // like Comet's replace_extension) or a default next to the executable.
+    std::wstring sName = m_MIDI.GetInfo().sFilename;
+    size_t slash = sName.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        sName = sName.substr(slash + 1);
+    size_t dot = sName.find_last_of(L'.');
+    if (dot != std::wstring::npos)
+        sName = sName.substr(0, dot);
+    wchar_t cwd[MAX_PATH] = {};
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    m_sFFWav = std::wstring(cwd) + L"\\Render_" + sName + L"_audio.wav";
+    m_sFFVideoRaw = std::wstring(cwd) + L"\\Render_" + sName + L"_video.mp4";
+    const std::wstring sExt = viz.iRenderFormat == 1 ? L"mov" : viz.iRenderFormat == 2 ? L"avi" : L"mp4";
+    m_sFFVideoOut = viz.sRenderOutputPath;
+    if (m_sFFVideoOut.empty())
+        m_sFFVideoOut = std::wstring(cwd) + L"\\Render_" + sName + L"." + sExt;
+    else
+    {
+        size_t dot2 = m_sFFVideoOut.find_last_of(L'.');
+        size_t slash2 = m_sFFVideoOut.find_last_of(L"\\/");
+        if (dot2 != std::wstring::npos && (slash2 == std::wstring::npos || dot2 > slash2))
+            m_sFFVideoOut = m_sFFVideoOut.substr(0, dot2);
+        m_sFFVideoOut += L"." + sExt;
+    }
+
+    // Capture at the renderer's current resolution; the output resolution
+    // (and fps, which is also the capture rate) come from the render dialog.
+    int w = (int)m_pRenderer->GetBufferWidth(), h = (int)m_pRenderer->GetBufferHeight();
+    s_FFCapW = w;
+    s_FFCapH = h;
+
+    // Encoder settings: codec, x264/x265 preset, constant bitrate or CRF, and
+    // the user's extra ffmpeg options (mirrors Comet's FFmpegCommandBuilder).
+    static const char* sPresets[] = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo" };
+    std::string sEnc = std::string("-c:v ") + (viz.iRenderCodec == 1 ? "libx265" : "libx264") + " -preset " + sPresets[max(0, min(viz.iRenderPreset, 9))] + " ";
+    char sNum[128];
+    if (viz.iRenderBitrateMode == 0)
+    {
+        sprintf_s(sNum, "-b:v %dk -minrate %dk -maxrate %dk -bufsize %dk ",
+            viz.iRenderBitrateKbps, viz.iRenderBitrateKbps, viz.iRenderBitrateKbps, viz.iRenderBitrateKbps * 2);
+        sEnc += sNum;
+    }
+    else
+    {
+        sprintf_s(sNum, "-crf %d ", max(0, min(viz.iRenderCRF, 51)));
+        sEnc += sNum;
+    }
+    if (viz.bRenderAdvanced && !viz.sRenderAdvancedOptions.empty())
+        sEnc += std::string(Util::WstringToString(viz.sRenderAdvancedOptions)) + " ";
+    if (w != viz.iRenderWidth || h != viz.iRenderHeight)
+    {
+        sprintf_s(sNum, "-vf scale=%d:%d ", viz.iRenderWidth, viz.iRenderHeight);
+        sEnc += sNum;
+    }
+    sEnc += "-pix_fmt yuv420p";
+
+    // Spawn ffmpeg: raw BGRA frames over stdin -> video-only intermediate.
+    // The Framerate setting is the video's output fps: each captured frame is
+    // one video frame at that rate, so the video length matches the song. The
+    // render itself is uncapped (limit FPS off) and runs as fast as the
+    // machine can; the window title shows the achieved render speed.
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hPipeRead = NULL, hPipeWrite = NULL;
+    if (!CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0))
+    {
+        MessageBox(g_hWnd, TEXT("Could not create the capture pipe."), TEXT("Render Video"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    SetHandleInformation(hPipeWrite, HANDLE_FLAG_INHERIT, 0);
+    wchar_t sCmd[4096];
+    swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -f rawvideo -pix_fmt bgra -s %dx%d -r %d -i pipe:0 -an %hs -r %d \"%ls\"",
+        viz.sFFmpegDir.c_str(), w, h, viz.iRenderFPS, sEnc.c_str(), viz.iRenderFPS, m_sFFVideoRaw.c_str());
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hPipeRead;
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(NULL, sCmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(hPipeRead);
+        CloseHandle(hPipeWrite);
+        MessageBox(g_hWnd, TEXT("Could not start ffmpeg.exe."), TEXT("Render Video"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(hPipeRead);
+    m_hFFPipeWrite = hPipeWrite;
+    m_hFFProc = pi.hProcess;
+    CloseHandle(pi.hThread);
+
+    // Show only the renderer window while rendering: detach the gfx window
+    // from the (hidden) player window and center it on the screen. Closing
+    // the renderer window cancels the render and brings the player window back.
+    SetParent(g_hWndGfx, NULL);
+    SetWindowLongPtrA(g_hWndGfx, GWL_STYLE, (GetWindowLongPtrA(g_hWndGfx, GWL_STYLE) & ~WS_CHILD) | WS_POPUP);
+    {
+        RECT rcWork = {};
+        SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
+        int iX = rcWork.left + max(0, ((rcWork.right - rcWork.left) - w) / 2);
+        int iY = rcWork.top + max(0, ((rcWork.bottom - rcWork.top) - h) / 2);
+        SetWindowPos(g_hWndGfx, HWND_TOP, iX, iY, w, h, SWP_SHOWWINDOW);
+    }
+    ShowWindow(g_hWnd, SW_HIDE);
+    SetWindowText(g_hWndGfx, L"Render to Video");
+
+    // Restart the prerender with WAV recording, rewind the song, and unpause.
+    // The song clock advances one output frame per rendered frame, while the
+    // real frame rate stays uncapped (limit FPS off) so the render runs as
+    // fast as the machine can; the window title shows the achieved speed.
+    if (PRE_MIDIAudio)
+        PRE_MIDIAudio->StartWavRecording(m_sFFWav.c_str());
+    m_bAudioStarted = false;
+    JumpTo(GetMinTime());
+    config.GetPlaybackSettings().SetPaused(false, true);
+    m_Timer.Init(true);
+    m_Timer.SetFrameRate(viz.iRenderFPS);
+
+    m_bRenderVideo = true;
+    g_bVideoRendering = true;
+    PRE_DbgLog("RENDER: begin %dx%d fps=%d raw=%ls wav=%ls", w, h, viz.iRenderFPS, m_sFFVideoRaw.c_str(), m_sFFWav.c_str());
+
+    // Strip the UI for the video: close the ImGui render dialog and any other
+    // ImGui windows (the captured output must stay clean), and pop up the
+    // plain Win32 progress window (progress, size, render speed).
+    if (m_pRenderer)
+        m_pRenderer->m_bShowRenderDialog = m_pRenderer->m_bShowPreferences = m_pRenderer->m_bShowAbout = false;
+    RequestCreateRenderProgressWindow();
+}
+
+void MainScreen::FinishVideoRender()
+{
+    if (!m_bRenderVideo)
+        return;
+    m_bRenderVideo = false;
+    g_bVideoRendering = false;
+    s_FFCapW = s_FFCapH = 0;
+
+    // Close the Win32 progress window and restore the ImGui UI.
+    RequestDestroyRenderProgressWindow();
+
+    // Restore the app's normal timer mode (the render forced the 60 fps
+    // manual timer; leaving it manual would lock the FPS limiter on).
+    m_Timer.Init(Config::GetConfig().m_bManualTimer);
+
+    PRE_DbgLog("RENDER: finalizing");
+    if (m_hFFPipeWrite)
+    {
+        CloseHandle(m_hFFPipeWrite);
+        m_hFFPipeWrite = NULL;
+    }
+    if (m_hFFProc)
+    {
+        WaitForSingleObject(m_hFFProc, 60000);
+        CloseHandle(m_hFFProc);
+        m_hFFProc = NULL;
+    }
+
+    // Bring the player window back: reattach the renderer window as a child
+    // and refit it to the main window's client area.
+    ShowWindow(g_hWnd, SW_SHOW);
+    SetParent(g_hWndGfx, g_hWnd);
+    SetWindowLongPtrA(g_hWndGfx, GWL_STYLE, (GetWindowLongPtrA(g_hWndGfx, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
+    {
+        RECT rcClient;
+        GetClientRect(g_hWnd, &rcClient);
+        SetWindowPos(g_hWndGfx, NULL, 0, 0, rcClient.right, rcClient.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    ShowWindow(g_hWndGfx, SW_SHOW);
+    SetFocus(g_hWndGfx);
+
+    if (PRE_MIDIAudio)
+        PRE_MIDIAudio->Stop();
+    if (PRE_MIDIAudio)
+        PRE_MIDIAudio->StopWavRecording();
+
+    // Mux the raw video with the recorded WAV (unless audio is disabled),
+    // padding the audio with silence if it came up short, and remux into the
+    // chosen container at the user's output path.
+    Config& config = Config::GetConfig();
+    VizSettings& viz = config.GetVizSettings();
+    const wchar_t* sFmt = viz.iRenderFormat == 1 ? L"mov" : viz.iRenderFormat == 2 ? L"avi" : L"mp4";
+    const wchar_t* sFast = viz.iRenderFormat == 2 ? L"" : L" -movflags +faststart";
+    wchar_t sCmd[4096];
+    if (viz.bRenderIncludeAudio)
+        swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -i \"%ls\" -i \"%ls\" -filter:a apad -c:v copy -c:a aac -b:a 192k -shortest%s -f %ls \"%ls\"",
+            viz.sFFmpegDir.c_str(), m_sFFVideoRaw.c_str(), m_sFFWav.c_str(), sFast, sFmt, m_sFFVideoOut.c_str());
+    else
+        swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -i \"%ls\" -c:v copy -f %ls \"%ls\"",
+            viz.sFFmpegDir.c_str(), m_sFFVideoRaw.c_str(), sFmt, m_sFFVideoOut.c_str());
+    RunFFmpegSync(sCmd);
+
+    PRE_DbgLog("RENDER: done out=%ls", m_sFFVideoOut.c_str());
+    DeleteFileW(m_sFFVideoRaw.c_str());
+    DeleteFileW(m_sFFWav.c_str());
+
+    const std::wstring& name = m_MIDI.GetInfo().sFilename;
+    TCHAR sTitle[1024];
+    _stprintf_s(sTitle, TEXT("%ws"), name.c_str() + (name.find_last_of(L'\\') + 1));
+    SetMainTitle(sTitle);
+
+    std::wstring sMsg = L"Render complete:\n" + m_sFFVideoOut;
+    MessageBox(g_hWnd, sMsg.c_str(), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+    PRE_DbgLog("RENDER: done %ls", m_sFFVideoOut.c_str());
+}
+
+// ---- system stats sampling (CPU / RAM / VRAM / GPU) -------------------------
+// CPU/RAM/VRAM are sampled at 1 Hz on the game thread (cheap Win32 calls). GPU
+// usage is sampled on a DEDICATED thread: the PDH "GPU Engine" counters are
+// maintained by the display driver and are known to hang or fail the process -
+// they must never run on the render thread.
+static ULONGLONG s_ullLastKernel = 0, s_ullLastUser = 0, s_ullLastIdle = 0;
+static bool s_bCpuBase = false;
+static double s_dCpuPct = 0.0;
+static MEMORYSTATUSEX s_memEx = {};
+static DWORDLONG s_ullVramUsed = 0, s_ullVramTotal = 0;
+static LONGLONG s_llLastSysSample = 0;
+
+static std::atomic<float> s_fGpuPct(0.0f);
+static std::atomic<bool> s_bGpuAvail(false);
+
+/// Transition-mode zoom state (MainScreen::RenderGlobals). File scope so the
+// stop button can reset the zoom back to the base view. The keyboard glides
+// toward 128-key range when out-of-range notes appear and stays there
+// permanently until the song is stopped/reset.
+static float s_fTransitionPhase = 0.0f;
+static std::chrono::steady_clock::time_point s_LastTransitionFrame = std::chrono::steady_clock::now();
+
+static void GpuPdhThreadMain()
+{
+    PDH_HQUERY hQuery = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &hQuery) != ERROR_SUCCESS)
+        return;
+    PDH_HCOUNTER hCounter = nullptr;
+    if (PdhAddCounterW(hQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &hCounter) != ERROR_SUCCESS)
+    {
+        PdhCloseQuery(hQuery);
+        return;
+    }
+    bool bPrimed = false;
+    for (;;)
+    {
+        Sleep(1000);
+        try
+        {
+            PDH_STATUS st = PdhCollectQueryData(hQuery);
+            if (st == ERROR_SUCCESS && bPrimed)
+            {
+                DWORD nSize = 0, nCount = 0;
+                PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &nSize, &nCount, nullptr);
+                if (nSize > 0 && nCount > 0 && nSize < 4 * 1024 * 1024)
+                {
+                    std::vector<BYTE> buf(nSize + sizeof(PDH_FMT_COUNTERVALUE_ITEM_A) * 16);
+                    PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &nSize, &nCount, (PPDH_FMT_COUNTERVALUE_ITEM_A)buf.data());
+                    size_t capacity = (buf.size() - sizeof(PDH_FMT_COUNTERVALUE_ITEM_A) * 16) / sizeof(PDH_FMT_COUNTERVALUE_ITEM_A);
+                    size_t items = min((size_t)nCount, capacity);
+                    const PDH_FMT_COUNTERVALUE_ITEM_A* arr = (const PDH_FMT_COUNTERVALUE_ITEM_A*)buf.data();
+                    double dSum = 0.0;
+                    char pidTag[32] = {};
+                    snprintf(pidTag, sizeof(pidTag) - 1, "pid_%lu", GetCurrentProcessId());
+                    for (size_t i = 0; i < items; i++)
+                    {
+                        if (arr[i].szName && strstr(arr[i].szName, pidTag))
+                            dSum += arr[i].FmtValue.doubleValue;
+                    }
+                    s_fGpuPct.store((float)min(dSum, 100.0));
+                    s_bGpuAvail.store(true);
+                }
+            }
+            else if (st == ERROR_SUCCESS)
+                bPrimed = true;
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+static void StartGpuPdhThread()
+{
+    static std::atomic<bool> s_bStarted(false);
+    if (!s_bStarted.exchange(true))
+        std::thread(GpuPdhThreadMain).detach();
+}
+
+static void UpdateSysStats(Renderer* pRenderer)
+{
+    LARGE_INTEGER pc = {};
+    QueryPerformanceCounter(&pc);
+    if (pc.QuadPart - s_llLastSysSample < 10000000)
+        return; // once per second
+    s_llLastSysSample = pc.QuadPart;
+
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user))
+    {
+        ULONGLONG i = ((ULONGLONG)idle.dwHighDateTime << 32) | idle.dwLowDateTime;
+        ULONGLONG k = ((ULONGLONG)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime;
+        ULONGLONG u = ((ULONGLONG)user.dwHighDateTime << 32) | user.dwLowDateTime;
+        if (s_bCpuBase)
+        {
+            ULONGLONG dk = k - s_ullLastKernel, du = u - s_ullLastUser, di = i - s_ullLastIdle;
+            ULONGLONG total = dk + du;
+            if (total > 0)
+                s_dCpuPct = 100.0 * (double)(total - di) / (double)total;
+        }
+        s_ullLastKernel = k; s_ullLastUser = u; s_ullLastIdle = i; s_bCpuBase = true;
+    }
+
+    s_memEx.dwLength = sizeof(s_memEx);
+    GlobalMemoryStatusEx(&s_memEx);
+
+    if (pRenderer)
+        pRenderer->GetAdapterVideoMemory(s_ullVramUsed, s_ullVramTotal);
+
+    StartGpuPdhThread();
 }
 
 const wstring GameState::Errors[] =
@@ -1044,6 +1465,31 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
             }
             PRE_DbgLog("EVENTTYPES on=%zu off=%zu cc=%zu prog=%zu bend=%zu atouch=%zu catouch=%zu other=%zu",
                 aTypes[0], aTypes[1], aTypes[2], aTypes[3], aTypes[4], aTypes[5], aTypes[6], aTypes[7]);
+
+            // Precompute maximum Notes-Per-Second for the song
+            m_llMaxNPS = 1;
+            vector<long long> noteTimes;
+            noteTimes.reserve(m_vEvents.size());
+            for (size_t i = 0; i < m_vEvents.size(); i++)
+            {
+                if (m_MIDI.GetEventChannelEventType(m_vEvents[i]) == MIDI::NoteOn &&
+                    m_MIDI.GetEventParam2(m_vEvents[i]) > 0)
+                {
+                    noteTimes.push_back(m_MIDI.GetEventTime(m_vEvents[i]));
+                }
+            }
+            if (!noteTimes.empty())
+            {
+                size_t left = 0;
+                for (size_t right = 0; right < noteTimes.size(); right++)
+                {
+                    while (noteTimes[right] - noteTimes[left] > 1000000)
+                        left++;
+                    long long curWindowNPS = (long long)(right - left + 1);
+                    if (curWindowNPS > m_llMaxNPS)
+                        m_llMaxNPS = curWindowNPS;
+                }
+            }
         }
     }
     catch (const std::exception& e)
@@ -1093,6 +1539,7 @@ void MainScreen::Discard()
     m_sMarker.clear();
     m_sCurBackground.clear();
     m_dNPSNotes.clear();
+    m_dNPSHistory.clear();
     m_vImageData.clear();
     PRE_DbgLog("Discard: done");
 }
@@ -1126,6 +1573,8 @@ void MainScreen::InitState()
     m_llStartTime = GetMinTime();
     m_llDisplayTime = m_llStartTime;
     m_fKeysTransition = 0.0f;
+    s_fTransitionPhase = 0.0f;
+    s_LastTransitionFrame = std::chrono::steady_clock::now();
     m_bTrackPos = m_bTrackZoom = false;
     m_fTempZoomX = 1.0f;
     m_fTempOffsetX = m_fTempOffsetY = 0.0f;
@@ -1323,6 +1772,9 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                 case ID_PLAY_STOP:
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
+                    s_fTransitionPhase = 0.0f;
+                    m_fKeysTransition = 0.0f;
+                    s_LastTransitionFrame = std::chrono::steady_clock::now();
                     return Success;
                 case ID_PLAY_SKIPFWD:
                     JumpTo(static_cast<long long>(m_llStartTime + cControls.dFwdBackSecs * 1000000));
@@ -1332,6 +1784,14 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     return Success;
                 case ID_VIEW_RESETDEVICE:
                     m_pRenderer->ResetDevice();
+                    return Success;
+                case ID_FILE_RENDERVIDEO:
+                    // Open the render settings dialog; the actual render starts
+                    // from the Render! button inside it.
+                    m_pRenderer->m_bShowRenderDialog = true;
+                    return Success;
+                case ID_FILE_STOPRENDER:
+                    StopVideoRender();
                     return Success;
                 case ID_VIEW_MOVEANDZOOM:
                     if ( cView.GetZoomMove() )
@@ -1380,6 +1840,9 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
 
             switch( wParam )
             {
+                case VK_F6:
+                    m_pRenderer->m_bShowRenderDialog = true;
+                    return Success;
                 case VK_SPACE:
                     cPlayback.TogglePaused( true );
                     return Success;
@@ -1563,7 +2026,7 @@ GameState::GameError MainScreen::Logic( void )
     m_iStartNote = min( cVisual.iFirstKey, cVisual.iLastKey );
     m_iEndNote = max( cVisual.iFirstKey, cVisual.iLastKey );
     m_bShowFPS = cVideo.bShowFPS;
-    if (m_bDumpFrames)
+    if (m_bDumpFrames || m_bRenderVideo)
         m_pRenderer->SetLimitFPS(false);
     else if (m_Timer.m_bManualTimer)
         m_pRenderer->SetLimitFPS(true);
@@ -1639,7 +2102,7 @@ GameState::GameError MainScreen::Logic( void )
         // advance to a fixed slew would break speed changes; instead cap the
         const long long kDeadZone = 20000;   // ignore drift smaller than 20ms
         const long long kMaxCatchUp = 10000; // extra catch-up at most 10ms per frame
-        if ( bPreAudio && config.GetAudioSettings().bPreStutterOnLag
+        if ( bPreAudio && config.GetAudioSettings().bPreStutterOnLag && !m_bRenderVideo
              && m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->IsAudioStarted() )
         {
             long long llAudioTime = (long long)( PRE_MIDIAudio->GetPlayerTime() * 1000000.0 );
@@ -1805,6 +2268,10 @@ GameState::GameError MainScreen::Logic( void )
         for (size_t i = 0; i < m_dNPSNotes.size(); i++)
             lagNps += std::get<1>(m_dNPSNotes[i]);
         m_pRenderer->SetLagNPS(lagNps);
+
+        m_dNPSHistory.push_back(lagNps);
+        if ((int)m_dNPSHistory.size() > 600)
+            m_dNPSHistory.pop_front();
     }
 
     AdvanceIterators( m_llStartTime, false );
@@ -1818,6 +2285,8 @@ GameState::GameError MainScreen::Logic( void )
     if (!m_bPaused && m_llStartTime >= llMaxTime) {
         if (m_bDumpFrames)
             CloseHandle(m_hVideoPipe);
+        if (m_bRenderVideo)
+            FinishVideoRender();
         cPlayback.SetPaused(true, true);
     }
 
@@ -1866,6 +2335,7 @@ void MainScreen::UpdateState(int key, const thread_work_t& work)
 void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
 {
     m_dNPSNotes.clear();
+    m_dNPSHistory.clear();
 
     if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
     {
@@ -1880,7 +2350,11 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
     m_llStartTime = min(max(llStartTime, llFirstTime), llLastTime);
     m_llDisplayTime = m_llStartTime;
     if (m_llStartTime <= llFirstTime)
+    {
         m_fKeysTransition = 0.0f;
+        s_fTransitionPhase = 0.0f;
+        s_LastTransitionFrame = std::chrono::steady_clock::now();
+    }
     long long llEndTime = m_llStartTime + m_llTimeSpan;
 
     auto itBegin = m_vEvents.begin();
@@ -2337,82 +2811,137 @@ GameState::GameError MainScreen::Render()
         _stprintf_s(sTitle, TEXT("%ws (%.1lf%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), (m_dFPS / m_Timer.m_dFramerate) * 100.0);
         SetMainTitle(sTitle);
     }
+
+    if (m_bRenderVideo) {
+        // The raw stream was started with the render resolution; if the window
+        // was resized mid-render the capture would corrupt, so finish cleanly.
+        if ((int)m_pRenderer->GetBufferWidth() != s_FFCapW || (int)m_pRenderer->GetBufferHeight() != s_FFCapH) {
+            FinishVideoRender();
+            return Success;
+        }
+        auto* frame = m_pRenderer->Screenshot();
+        if (frame) {
+            DWORD dwBytes = static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4);
+            DWORD dwWritten = 0;
+            WriteFile(m_hFFPipeWrite, frame, dwBytes, &dwWritten, nullptr);
+        }
+        const std::wstring& name = m_MIDI.GetInfo().sFilename;
+        TCHAR sTitle[1024];
+        double dPct = (GetMaxTime() > GetMinTime()) ? (m_llStartTime - GetMinTime()) * 100.0 / (GetMaxTime() - GetMinTime()) : 0.0;
+        _stprintf_s(sTitle, TEXT("%ws (%.0f fps, %.1f%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), m_dFPS, dPct);
+        SetMainTitle(sTitle);
+        SetWindowText(g_hWndGfx, sTitle);
+
+        // Feed the Win32 progress window (throttled to ~10 updates per second):
+        // progress, output size, and the render speed the machine achieves.
+        static ULONGLONG s_ullLastProgUpdate = 0;
+        ULONGLONG ullNow = GetTickCount64();
+        if (ullNow - s_ullLastProgUpdate >= 100)
+        {
+            s_ullLastProgUpdate = ullNow;
+            VizSettings& viz2 = Config::GetConfig().GetVizSettings();
+            wchar_t sProg[512];
+            swprintf_s(sProg, L"Rendering %.1f%%\nOutput: %dx%d @ %d fps\nRender speed: %.0f fps",
+                dPct, viz2.iRenderWidth, viz2.iRenderHeight, viz2.iRenderFPS, m_dFPS);
+            UpdateRenderProgressWindow((int)(dPct * 10.0 + 0.5), sProg);
+        }
+    }
     return Success;
 }
 
 void MainScreen::RenderGlobals()
 {
+    m_fNotesX = m_fOffsetX + m_fTempOffsetX;
+    m_fNotesCX = m_pRenderer->GetBufferWidth() * m_fZoomX * m_fTempZoomX;
+    m_fNotesY = m_fOffsetY + m_fTempOffsetY;
+
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
     if ( m_eKeysShown == VisualSettings::All )
     {
         m_iStartNote = 0;
         m_iEndNote = 127;
+        m_fViewStartX = (float)MIDI::WhiteCount(0, 0);
+        m_fWhiteCX = m_fNotesCX / (float)MIDI::WhiteCount(0, 128);
     }
     else if ( m_eKeysShown == VisualSettings::Song )
     {
         m_iStartNote = mInfo.iMinNote;
         m_iEndNote = mInfo.iMaxNote;
+        float fStartCoord = (float)MIDI::WhiteCount(0, m_iStartNote) + (MIDI::IsSharp(m_iStartNote) ? SharpRatio / 2.0f : 0.0f);
+        float fEndCoord = (float)MIDI::WhiteCount(0, m_iEndNote + 1) + (MIDI::IsSharp(m_iEndNote) ? SharpRatio / 2.0f : 0.0f);
+        m_fViewStartX = fStartCoord;
+        m_fWhiteCX = m_fNotesCX / (fEndCoord - fStartCoord);
+    }
+    else if ( m_eKeysShown == VisualSettings::Custom )
+    {
+        float fStartCoord = (float)MIDI::WhiteCount(0, m_iStartNote) + (MIDI::IsSharp(m_iStartNote) ? SharpRatio / 2.0f : 0.0f);
+        float fEndCoord = (float)MIDI::WhiteCount(0, m_iEndNote + 1) + (MIDI::IsSharp(m_iEndNote) ? SharpRatio / 2.0f : 0.0f);
+        m_fViewStartX = fStartCoord;
+        m_fWhiteCX = m_fNotesCX / (fEndCoord - fStartCoord);
     }
     else if ( m_eKeysShown == VisualSettings::Transition )
     {
         const int iBaseStart = MIDI::A0;
         const int iBaseEnd = MIDI::C8;
 
-        if ( m_fKeysTransition < 1.0f )
-        {
-            int iRangeMin = iBaseStart;
-            int iRangeMax = iBaseEnd;
-            for ( size_t i = 0; i < 128; i++ )
-                for ( vector<int>::const_iterator it = m_vState[i].begin(); it != m_vState[i].end(); it++ )
-                {
-                    const int iNote = m_MIDI.GetEventParam1(m_vEvents[*it]);
-                    iRangeMin = min( iRangeMin, iNote );
-                    iRangeMax = max( iRangeMax, iNote );
-                }
-            for ( long long i = m_iStartPos; i <= m_iEndPos; i++ )
+        int iRangeMin = iBaseStart;
+        int iRangeMax = iBaseEnd;
+        for ( size_t i = 0; i < 128; i++ )
+            for ( vector<int>::const_iterator it = m_vState[i].begin(); it != m_vState[i].end(); it++ )
             {
-                const MIDIChannelEvent pEvent = m_vEvents[i];
-                if ( m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0 )
-                {
-                    const int iNote = m_MIDI.GetEventParam1(pEvent);
-                    iRangeMin = min( iRangeMin, iNote );
-                    iRangeMax = max( iRangeMax, iNote );
-                }
+                const int iNote = m_MIDI.GetEventParam1(m_vEvents[*it]);
+                iRangeMin = min( iRangeMin, iNote );
+                iRangeMax = max( iRangeMax, iNote );
             }
-
-            static bool s_bOutOfRangeTriggered = false;
-            if ( m_fKeysTransition == 0.0f ) s_bOutOfRangeTriggered = false;
-            if ( iRangeMin < iBaseStart || iRangeMax > iBaseEnd )
-                s_bOutOfRangeTriggered = true;
-
-            if ( s_bOutOfRangeTriggered )
+        for ( long long i = m_iStartPos; i <= m_iEndPos; i++ )
+        {
+            const MIDIChannelEvent pEvent = m_vEvents[i];
+            if ( m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0 )
             {
-                const float fDuration = ( m_eTransitionSpeed == VisualSettings::SmoothFast || m_eTransitionSpeed == VisualSettings::LinearFast ) ? 2.0f : 3.0f;
-                const float fDelta = min( max( ( float )( m_Timer.GetMicroSecs() ) / 1000000.0f, 1.0f / 60.0f ), 0.25f );
-                static float s_fLinearProgress = 0.0f;
-                if ( m_fKeysTransition == 0.0f ) s_fLinearProgress = 0.0f;
-
-                s_fLinearProgress = min( 1.0f, s_fLinearProgress + fDelta / fDuration );
-                if ( m_eTransitionSpeed == VisualSettings::SmoothSlow || m_eTransitionSpeed == VisualSettings::SmoothFast )
-                    m_fKeysTransition = s_fLinearProgress * s_fLinearProgress * ( 3.0f - 2.0f * s_fLinearProgress );
-                else
-                    m_fKeysTransition = s_fLinearProgress;
+                const int iNote = m_MIDI.GetEventParam1(pEvent);
+                iRangeMin = min( iRangeMin, iNote );
+                iRangeMax = max( iRangeMax, iNote );
             }
         }
 
-        m_iStartNote = ( int )floor( ( float )iBaseStart * ( 1.0f - m_fKeysTransition ) + 0.5f );
-        m_iEndNote = ( int )floor( ( float )iBaseEnd * ( 1.0f - m_fKeysTransition ) + 127.0f * m_fKeysTransition + 0.5f );
+        // Once notes outside the 88-key range are detected, transition to 128
+        // keys and stay there permanently until the song is stopped/reset.
+        // The phase only moves toward 1.0 (never back to 0.0) so the view
+        // never stutters from direction reversals mid-song.
+        const bool bOutOfRange = iRangeMin < iBaseStart || iRangeMax > iBaseEnd;
+
+        auto nowT = std::chrono::steady_clock::now();
+        const float fDt = min( 0.25f, ( float )std::chrono::duration<double>( nowT - s_LastTransitionFrame ).count() );
+        s_LastTransitionFrame = nowT;
+
+        // Target is 1.0 (128 keys) once out-of-range notes are seen, otherwise
+        // hold at whatever phase we've already reached (never zoom back).
+        const float fTarget = bOutOfRange ? 1.0f : s_fTransitionPhase;
+
+        const float fDuration = ( m_eTransitionSpeed == VisualSettings::SmoothFast || m_eTransitionSpeed == VisualSettings::LinearFast ) ? 1.0f : 2.0f;
+        const float fPhaseStep = fDt / fDuration;
+        s_fTransitionPhase += max( 0.0f, min( fPhaseStep, fTarget - s_fTransitionPhase ) );
+        const float fPhase = min( 1.0f, max( 0.0f, s_fTransitionPhase ) );
+        m_fKeysTransition = ( m_eTransitionSpeed == VisualSettings::SmoothSlow || m_eTransitionSpeed == VisualSettings::SmoothFast )
+            ? fPhase * fPhase * ( 3.0f - 2.0f * fPhase )
+            : fPhase;
+
+        const float f88Start = (float)MIDI::WhiteCount(0, MIDI::A0);      // 12.0f
+        const float f88End = (float)MIDI::WhiteCount(0, MIDI::C8 + 1);    // 64.0f
+        const float f128Start = (float)MIDI::WhiteCount(0, 0);            // 0.0f
+        const float f128End = (float)MIDI::WhiteCount(0, 128);            // 75.0f
+
+        m_fViewStartX = ( 1.0f - m_fKeysTransition ) * f88Start + m_fKeysTransition * f128Start;
+        const float fViewEndX = ( 1.0f - m_fKeysTransition ) * f88End + m_fKeysTransition * f128End;
+        const float fTotalSpan = fViewEndX - m_fViewStartX;
+        m_fWhiteCX = m_fNotesCX / fTotalSpan;
+
+        m_iStartNote = ( m_fKeysTransition > 0.001f ) ? 0 : MIDI::A0;
+        m_iEndNote = ( m_fKeysTransition > 0.001f ) ? 127 : MIDI::C8;
     }
 
-    m_fNotesX = m_fOffsetX + m_fTempOffsetX;
-    m_fNotesCX = m_pRenderer->GetBufferWidth() * m_fZoomX * m_fTempZoomX;
-
     m_iAllWhiteKeys = MIDI::WhiteCount( m_iStartNote, m_iEndNote + 1 );
-    float fBuffer = ( MIDI::IsSharp( m_iStartNote ) ? SharpRatio / 2.0f : 0.0f ) +
-                    ( MIDI::IsSharp( m_iEndNote ) ? SharpRatio / 2.0f : 0.0f );
-    m_fWhiteCX = m_fNotesCX / ( m_iAllWhiteKeys + fBuffer );
 
-    m_fNotesY = m_fOffsetY + m_fTempOffsetY;
     if ( !m_bShowKB )
         m_fNotesCY = static_cast< float >( m_pRenderer->GetBufferHeight() );
     else
@@ -2442,15 +2971,15 @@ void MainScreen::RenderLines()
 
     m_pRenderer->DrawRect( m_fNotesX, m_fNotesY, m_fNotesCX, m_fNotesCY, m_csBackground.iPrimaryRGB );
 
-    for ( int i = m_iStartNote + 1; i <= m_iEndNote; i++ )
+    for ( int i = 1; i <= 127; i++ )
         if ( !MIDI::IsSharp( i - 1 ) && !MIDI::IsSharp( i ) )
         {
-            int iWhiteKeys = MIDI::WhiteCount( m_iStartNote, i );
-            float fStartX = MIDI::IsSharp( m_iStartNote ) * SharpRatio / 2.0f;
-            float x = m_fNotesX + m_fWhiteCX * ( iWhiteKeys + fStartX );
-            x = floor( x + 0.5f ); // Needs to be rounded because of the gradient
-            m_pRenderer->DrawRect( x - 1.0f, m_fNotesY, 3.0f, m_fNotesCY,
-                m_csBackground.iDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iDarkRGB );
+            float x = m_fNotesX + ((float)MIDI::WhiteCount( 0, i ) - m_fViewStartX) * m_fWhiteCX;
+            if ( x >= m_fNotesX - 2.0f && x <= m_fNotesX + m_fNotesCX + 2.0f )
+            {
+                m_pRenderer->DrawRect( x - 1.0f, m_fNotesY, 3.0f, m_fNotesCY,
+                    m_csBackground.iDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iVeryDarkRGB, m_csBackground.iDarkRGB );
+            }
         }
 
     if (!m_MIDI.IsValid())
@@ -2622,20 +3151,22 @@ void MainScreen::RenderPianoRollStripNote(const MIDIChannelEvent pNote)
     m_pRenderer->PushPianoRollStripNoteData(BuildRenderNoteData(pNote));
 }
 
+float MainScreen::GetNoteCoord(int iNote)
+{
+    float fNudgeX = 0.0f;
+    if (MIDI::IsSharp(iNote))
+    {
+        MIDI::Note eNote = MIDI::NoteVal(iNote);
+        if (eNote == MIDI::CS || eNote == MIDI::FS) fNudgeX = -SharpRatio / 5.0f;
+        else if (eNote == MIDI::AS || eNote == MIDI::DS) fNudgeX = SharpRatio / 5.0f;
+        return (float)MIDI::WhiteCount(0, iNote) - SharpRatio / 2.0f + fNudgeX;
+    }
+    return (float)MIDI::WhiteCount(0, iNote);
+}
+
 void MainScreen::GenNoteXTable() {
-    const float fEdgeLeft = m_fNotesX;
-    const float fEdgeRight = m_fNotesX + m_fNotesCX - m_fWhiteCX;
     for (int i = 0; i <= 127; i++) {
-        int iWhiteKeys = MIDI::WhiteCount(m_iStartNote, i);
-        float fStartX = (MIDI::IsSharp(m_iStartNote) - MIDI::IsSharp(i)) * SharpRatio / 2.0f;
-        if (MIDI::IsSharp(i))
-        {
-            MIDI::Note eNote = MIDI::NoteVal(i);
-            if (eNote == MIDI::CS || eNote == MIDI::FS) fStartX -= SharpRatio / 5.0f;
-            else if (eNote == MIDI::AS || eNote == MIDI::DS) fStartX += SharpRatio / 5.0f;
-        }
-        const float fX = m_fNotesX + m_fWhiteCX * (iWhiteKeys + fStartX);
-        notex_table[i] = i < m_iStartNote ? fEdgeLeft : (i > m_iEndNote ? fEdgeRight : fX);
+        notex_table[i] = m_fNotesX + (GetNoteCoord(i) - m_fViewStartX) * m_fWhiteCX;
     }
 }
 
@@ -2705,61 +3236,58 @@ void MainScreen::RenderKeys()
 
     float fKeyGap = max( 1.0f, floor( m_fWhiteCX * 0.05f + 0.5f ) );
     float fKeyGap1 = fKeyGap - floor( fKeyGap / 2.0f + 0.5f );
-
-    int iStartRender = ( MIDI::IsSharp( m_iStartNote ) ? m_iStartNote - 1 : m_iStartNote );
-    int iEndRender = ( MIDI::IsSharp( m_iEndNote ) ? m_iEndNote + 1 : m_iEndNote );
-    float fStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * ( SharpRatio / 2.0f - 1.0f ) : 0.0f );
     float fSharpCY = fTopCY * 0.67f;
+    float fSharpTop = SharpRatio * 0.7f;
 
     if (Config::GetConfig().GetVizSettings().bColoredRibbon) {
-        float fRibX = m_fNotesX + fStartX;
         float fRibY = fKeysY + fTransitionCY;
-        for ( int i = iStartRender; i <= iEndRender; i++ )
+        for ( int i = 0; i <= 127; i++ )
             if ( !MIDI::IsSharp( i ) )
             {
                 if ( m_pNoteState[i] != -1 )
                 {
-                    MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
-                    const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
-                    const int iChannel = m_MIDI.GetEventChannel(pEvent);
-                    const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
-                    m_pRenderer->DrawRect( fRibX, fRibY, m_fWhiteCX, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                    float fRibX = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - m_fViewStartX) * m_fWhiteCX;
+                    if ( fRibX + m_fWhiteCX >= m_fNotesX && fRibX <= m_fNotesX + m_fNotesCX )
+                    {
+                        MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                        const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                        const int iChannel = m_MIDI.GetEventChannel(pEvent);
+                        const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
+                        m_pRenderer->DrawRect( fRibX, fRibY, m_fWhiteCX, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                    }
                 }
-                fRibX += m_fWhiteCX;
             }
-        iStartRender = ( m_iStartNote != MIDI::A0 && !MIDI::IsSharp( m_iStartNote ) && m_iStartNote > 0 && MIDI::IsSharp( m_iStartNote - 1 ) ? m_iStartNote - 1 : m_iStartNote );
-        iEndRender = ( m_iEndNote != MIDI::C8 && !MIDI::IsSharp( m_iEndNote ) && m_iEndNote < 127 && MIDI::IsSharp( m_iEndNote + 1 ) ? m_iEndNote + 1 : m_iEndNote );
-        float fSharpStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * SharpRatio / 2.0f : 0.0f );
-        fRibX = m_fNotesX + fSharpStartX;
-        for ( int i = iStartRender; i <= iEndRender; i++ )
-            if ( !MIDI::IsSharp( i ) )
-                fRibX += m_fWhiteCX;
-            else
+        for ( int i = 0; i <= 127; i++ )
+            if ( MIDI::IsSharp( i ) )
             {
                 if ( m_pNoteState[i] != -1 )
                 {
-                    MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
-                    const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
-                    const int iChannel = m_MIDI.GetEventChannel(pEvent);
-                    const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
                     float fNudgeX = 0.0;
                     MIDI::Note eNote = MIDI::NoteVal( i );
                     if ( eNote == MIDI::CS || eNote == MIDI::FS ) fNudgeX = -SharpRatio / 5.0f;
                     else if ( eNote == MIDI::AS || eNote == MIDI::DS ) fNudgeX = SharpRatio / 5.0f;
                     const float cx = m_fWhiteCX * SharpRatio;
-                    const float x = fRibX - m_fWhiteCX * ( SharpRatio / 2.0f - fNudgeX );
-                    m_pRenderer->DrawRect( x, fRibY, cx, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                    const float x = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - SharpRatio / 2.0f + fNudgeX - m_fViewStartX) * m_fWhiteCX;
+                    if ( x + cx >= m_fNotesX && x <= m_fNotesX + m_fNotesCX )
+                    {
+                        MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                        const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
+                        const int iChannel = m_MIDI.GetEventChannel(pEvent);
+                        const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
+                        m_pRenderer->DrawRect( x, fRibY, cx, fRedCY, cs.iDarkRGB, cs.iDarkRGB, cs.iPrimaryRGB, cs.iPrimaryRGB );
+                    }
                 }
             }
-        iStartRender = ( MIDI::IsSharp( m_iStartNote ) ? m_iStartNote - 1 : m_iStartNote );
-        iEndRender = ( MIDI::IsSharp( m_iEndNote ) ? m_iEndNote + 1 : m_iEndNote );
     }
 
-    float fCurX = m_fNotesX + fStartX;
     float fCurY = fKeysY + fTransitionCY + fRedCY + fSpacerCY;
-    for ( int i = iStartRender; i <= iEndRender; i++ )
+    for ( int i = 0; i <= 127; i++ )
         if ( !MIDI::IsSharp( i ) )
         {
+            float fCurX = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - m_fViewStartX) * m_fWhiteCX;
+            if ( fCurX + m_fWhiteCX < m_fNotesX - 10.0f || fCurX > m_fNotesX + m_fNotesCX + 10.0f )
+                continue;
+
             if ( m_pNoteState[i] == -1 )
             {
                 DWORD kbPrimary = darken32(m_csKBWhite.iPrimaryRGB, kb);
@@ -2799,24 +3327,14 @@ void MainScreen::RenderKeys()
                     m_pRenderer->DrawRect( fCurX + fKeyGap1 + fMXGap, fMY, fMCX, fCurY + fTopCY + fNearCY - 7.0f - fMY, csKBWhite.iDarkRGB );
                 }
             }
-            m_pRenderer->DrawRect( floor( fCurX + fKeyGap1 + m_fWhiteCX - fKeyGap + 0.5f ), fCurY, fKeyGap, fTopCY + fNearCY,
+            const float fDivX = fCurX + fKeyGap1 + m_fWhiteCX - fKeyGap;
+            m_pRenderer->DrawRect( fDivX, fCurY, fKeyGap, fTopCY + fNearCY,
                 darken32(m_csKBBackground.iVeryDarkRGB, kb), darken32(m_csKBBackground.iPrimaryRGB, kb),
                 darken32(m_csKBBackground.iPrimaryRGB, kb), darken32(m_csKBBackground.iVeryDarkRGB, kb) );
-
-            fCurX += m_fWhiteCX;
         }
 
-    iStartRender = ( m_iStartNote != MIDI::A0 && !MIDI::IsSharp( m_iStartNote ) && m_iStartNote > 0 && MIDI::IsSharp( m_iStartNote - 1 ) ? m_iStartNote - 1 : m_iStartNote );
-    iEndRender = ( m_iEndNote != MIDI::C8 && !MIDI::IsSharp( m_iEndNote ) && m_iEndNote < 127 && MIDI::IsSharp( m_iEndNote + 1 ) ? m_iEndNote + 1 : m_iEndNote );
-    fStartX = ( MIDI::IsSharp( m_iStartNote ) ? m_fWhiteCX * SharpRatio / 2.0f : 0.0f );
-
-    float fSharpTop = SharpRatio * 0.7f;
-    fCurX = m_fNotesX + fStartX;
-    fCurY = fKeysY + fTransitionCY + fRedCY + fSpacerCY;
-    for ( int i = iStartRender; i <= iEndRender; i++ )
-        if ( !MIDI::IsSharp( i ) )
-            fCurX += m_fWhiteCX;
-        else
+    for ( int i = 0; i <= 127; i++ )
+        if ( MIDI::IsSharp( i ) )
         {
             float fNudgeX = 0.0;
             MIDI::Note eNote = MIDI::NoteVal( i );
@@ -2824,7 +3342,10 @@ void MainScreen::RenderKeys()
             else if ( eNote == MIDI::AS || eNote == MIDI::DS ) fNudgeX = SharpRatio / 5.0f;
 
             const float cx = m_fWhiteCX * SharpRatio;
-            const float x = fCurX - m_fWhiteCX * ( SharpRatio / 2.0f - fNudgeX );
+            const float x = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - SharpRatio / 2.0f + fNudgeX - m_fViewStartX) * m_fWhiteCX;
+            if ( x + cx < m_fNotesX - 10.0f || x > m_fNotesX + m_fNotesCX + 10.0f )
+                continue;
+
             const float fSharpTopX1 = x + m_fWhiteCX * ( SharpRatio - fSharpTop ) / 2.0f;
             const float fSharpTopX2 = fSharpTopX1 + m_fWhiteCX * fSharpTop;
 
@@ -2898,10 +3419,17 @@ void MainScreen::RenderBorder()
     // Top, bottom, left, right
     const unsigned iBlack = 0x00000000;
     float fBufferCY = static_cast< float >( m_pRenderer->GetBufferHeight() );
+    float fBufferCX = static_cast< float >( m_pRenderer->GetBufferWidth() );
+
+    if ( m_fNotesX > 0.0f )
+        m_pRenderer->DrawRect( 0.0f, 0.0f, m_fNotesX, fBufferCY, iBlack );
+    if ( m_fNotesX + m_fNotesCX < fBufferCX )
+        m_pRenderer->DrawRect( m_fNotesX + m_fNotesCX, 0.0f, fBufferCX - (m_fNotesX + m_fNotesCX), fBufferCY, iBlack );
+
     m_pRenderer->DrawRect( m_fNotesX - 50.0f, m_fNotesY - 50.0f, m_fNotesCX + 100.0f, 50.0f, iBlack );
     m_pRenderer->DrawRect( m_fNotesX - 50.0f, m_fNotesY + fBufferCY, m_fNotesCX + 100.0f, 50.0f, iBlack );
-    m_pRenderer->DrawRect( m_fNotesX - m_fWhiteCX, m_fNotesY - 50.0f, m_fWhiteCX, fBufferCY + 100.0f, iBlack );
-    m_pRenderer->DrawRect( m_fNotesX + m_fNotesCX, m_fNotesY - 50.0f, m_fWhiteCX, fBufferCY + 100.0f, iBlack );
+    m_pRenderer->DrawRect( m_fNotesX - max(50.0f, m_fWhiteCX * 2.0f), m_fNotesY - 50.0f, max(50.0f, m_fWhiteCX * 2.0f), fBufferCY + 100.0f, iBlack );
+    m_pRenderer->DrawRect( m_fNotesX + m_fNotesCX, m_fNotesY - 50.0f, max(50.0f, m_fWhiteCX * 2.0f), fBufferCY + 100.0f, iBlack );
 
     const float fPad = 10.0f;
     const unsigned iBkg = m_csBackground.iPrimaryRGB;
@@ -2944,6 +3472,8 @@ void MainScreen::RenderText()
     m_pRenderer->BeginText();
 
     RenderStatus(iLines);
+    if (viz.bSysStats)
+        RenderSysStats();
     if (!m_sMarker.empty() && viz.bShowMarkers)
         RenderMarker(m_sMarker.c_str());
     if (m_bZoomMove)
@@ -2972,8 +3502,108 @@ void MainScreen::RenderStatusLine(int line, float width, float yOffset, float ri
     va_end(varargs);
 }
 
+//// Applies a true 3D perspective tilt (Y-axis yaw) and optional zoom scale to vertices in an ImDrawList range.
+static void Apply3DTilt(ImDrawList* dl, int vtx_start, int vtx_end, const ImVec2& center, float rotY, float scale = 1.0f, float dist = 700.0f)
+{
+    if (!dl || vtx_start < 0 || vtx_start >= vtx_end || vtx_end > dl->VtxBuffer.Size)
+        return;
+
+    const float cosY = cosf(rotY);
+    const float sinY = sinf(rotY);
+
+    ImDrawVert* vStart = dl->VtxBuffer.Data + vtx_start;
+    ImDrawVert* vEnd = dl->VtxBuffer.Data + vtx_end;
+
+    for (ImDrawVert* v = vStart; v < vEnd; ++v)
+    {
+        const float dx = (v->pos.x - center.x) * scale;
+        const float dy = (v->pos.y - center.y) * scale;
+
+        // 3D Y-axis rotation (depth yaw)
+        const float x3d = dx * cosY;
+        const float z3d = dx * sinY;
+
+        // 3D perspective projection
+        const float proj = dist / (dist + z3d);
+
+        v->pos.x = center.x + x3d * proj;
+        v->pos.y = center.y + dy * proj;
+    }
+}
+
+float MainScreen::GetStatsBounceScale() const
+{
+    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    if (!viz.bBounceStats || m_bPaused)
+        return 1.0f;
+
+    // Start bouncing only once the first notes have been played
+    if (!IsFreePlay() && m_MIDI.IsValid() && m_llStartTime < m_MIDI.GetInfo().llFirstNote)
+        return 1.0f;
+
+    long long curNps = 0;
+    for (size_t i = 0; i < m_dNPSNotes.size(); i++)
+        curNps += std::get<1>(m_dNPSNotes[i]);
+
+    long long maxNps = m_llMaxNPS;
+    if (curNps > maxNps)
+        maxNps = curNps;
+    if (maxNps <= 0)
+        maxNps = 1;
+
+    // Rule: if NPS is around viz.iBounceNPSThreshold % lower than max NPS
+    // (e.g. threshold = 90% means nps <= 10% of max NPS), bounce 2 beats per bar.
+    // Otherwise (e.g. 89% lower or better, nps > 10% of max NPS), bounce 4 beats per bar.
+    double lowActivityThresholdNps = (double)maxNps * (1.0 - (double)viz.iBounceNPSThreshold / 100.0);
+    bool bLowActivity = ((double)curNps <= lowActivityThresholdNps);
+
+    // Calculate beat position from current time / tick / BPM
+    double beats = 0.0;
+    int iDivision = m_MIDI.GetInfo().iDivision;
+    if (!(iDivision & 0x8000) && iDivision > 0 && m_iBeatType > 0)
+    {
+        int curTick = const_cast<MainScreen*>(this)->GetCurrentTick(m_llStartTime);
+        int ticksPerBeat = (iDivision * 4) / m_iBeatType;
+        if (ticksPerBeat > 0)
+            beats = (double)(curTick - m_iLastSignatureTick) / (double)ticksPerBeat;
+    }
+    else if (m_iMicroSecsPerBeat > 0)
+    {
+        beats = (double)(m_llStartTime - m_llLastTempoTime) / (double)m_iMicroSecsPerBeat;
+    }
+
+    int beatsPerMeasure = (m_iBeatsPerMeasure > 0) ? m_iBeatsPerMeasure : 4;
+    double beatInMeasure = fmod(beats, (double)beatsPerMeasure);
+    if (beatInMeasure < 0.0)
+        beatInMeasure += (double)beatsPerMeasure;
+
+    float phase = 0.0f;
+    if (bLowActivity)
+    {
+        // 2 beats per bar: bounce every 2 beats (half note in 4/4)
+        double u = fmod(beatInMeasure, 2.0) / 2.0;
+        if (u < 0.0) u += 1.0;
+        phase = (float)u;
+    }
+    else
+    {
+        // 4 beats per bar: bounce every 1 beat (quarter note in 4/4)
+        double u = fmod(beatInMeasure, 1.0);
+        if (u < 0.0) u += 1.0;
+        phase = (float)u;
+    }
+
+    // Zoom in and out very slightly with an exponent of fast to slow (cubic ease-out decay)
+    const float amplitude = 0.06f; // subtle ~6% peak zoom
+    float bounce = amplitude * powf(1.0f - phase, 3.0f);
+    return 1.0f + bounce;
+}
+
 void MainScreen::RenderStatus(int lines)
 {
+    auto dl = m_pRenderer->GetDrawList();
+    const int vtx_start = dl ? dl->VtxBuffer.Size : 0;
+
     // Time
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
@@ -3120,6 +3750,188 @@ void MainScreen::RenderStatus(int lines)
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Buffer:", buf);
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Underruns:", "%llu", PRE_MIDIAudio->GetBufferUnderruns());
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Voices:", "%d", PRE_MIDIAudio->m_iDefaultVoices);
+    }
+
+    if (auto drawList = m_pRenderer->GetDrawList())
+    {
+        int vtx_end = drawList->VtxBuffer.Size;
+        ImVec2 center((statusLeft + statusRight) * 0.5f, toolbarBottom + overlayH * 0.5f);
+        Apply3DTilt(drawList, vtx_start, vtx_end, center, -0.20f, GetStatsBounceScale(), 750.0f);
+    }
+}
+
+// Draws the blurred panel background the status overlay uses: a sampled image
+// of the scene blurred + gradient fades on each edge/corner + a dark scrim.
+static void DrawBlurPanel(Renderer* r, float left, float top, float right, float bottom, float pad)
+{
+    const float bw = (float)r->GetBufferWidth();
+    const float bh = (float)r->GetBufferHeight();
+    auto dl = r->GetDrawList();
+    const ImTextureID blurTexture = (ImTextureID)r->GetBlurTextureID();
+    if (!blurTexture)
+    {
+        dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom), 0x40000000);
+        return;
+    }
+    auto uv = [=](const ImVec2& p) { return ImVec2(p.x / bw, p.y / bh); };
+    auto quad = [&](const ImVec2& p1, const ImVec2& p2, const ImVec2& p3, const ImVec2& p4,
+                    ImU32 c1, ImU32 c2, ImU32 c3, ImU32 c4) {
+        dl->PushTextureID(blurTexture);
+        dl->PrimReserve(6, 6);
+        dl->PrimVtx(p1, uv(p1), c1);
+        dl->PrimVtx(p2, uv(p2), c2);
+        dl->PrimVtx(p3, uv(p3), c3);
+        dl->PrimVtx(p1, uv(p1), c1);
+        dl->PrimVtx(p3, uv(p3), c3);
+        dl->PrimVtx(p4, uv(p4), c4);
+        dl->PopTextureID();
+    };
+    const ImU32 op = IM_COL32(255, 255, 255, 255);
+    const ImU32 tr = IM_COL32(255, 255, 255, 0);
+    const float blurL = max(0.0f, left - pad), blurT = max(0.0f, top - pad);
+    const float blurR = min(bw, right + pad), blurB = min(bh, bottom + pad);
+
+    dl->AddImage(blurTexture, ImVec2(left, top), ImVec2(right, bottom),
+        uv(ImVec2(left, top)), uv(ImVec2(right, bottom)));
+
+    quad(ImVec2(left, blurT), ImVec2(right, blurT), ImVec2(right, top), ImVec2(left, top), tr, tr, op, op);
+    quad(ImVec2(left, bottom), ImVec2(right, bottom), ImVec2(right, blurB), ImVec2(left, blurB), op, op, tr, tr);
+    quad(ImVec2(blurL, top), ImVec2(left, top), ImVec2(left, bottom), ImVec2(blurL, bottom), tr, op, op, tr);
+    quad(ImVec2(right, top), ImVec2(blurR, top), ImVec2(blurR, bottom), ImVec2(right, bottom), op, tr, tr, op);
+    quad(ImVec2(blurL, blurT), ImVec2(left, blurT), ImVec2(left, top), ImVec2(blurL, top), tr, tr, op, tr);
+    quad(ImVec2(right, blurT), ImVec2(blurR, blurT), ImVec2(blurR, top), ImVec2(right, top), tr, tr, tr, op);
+    quad(ImVec2(blurL, bottom), ImVec2(left, bottom), ImVec2(left, blurB), ImVec2(blurL, blurB), tr, op, tr, tr);
+    quad(ImVec2(right, bottom), ImVec2(blurR, bottom), ImVec2(blurR, blurB), ImVec2(right, bottom), op, tr, tr, tr);
+
+    dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom), 0x40000000);
+}
+
+void MainScreen::RenderSysStats()
+{
+    static bool s_bDrawnLogged = false;
+    if (!s_bDrawnLogged)
+    {
+        s_bDrawnLogged = true;
+        HeartbeatLog("sysstats:panel drawn");
+    }
+    try
+    {
+        Config& config = Config::GetConfig();
+        VizSettings viz = config.GetVizSettings();
+    Renderer* r = m_pRenderer;
+    const float scale = viz.fUIScale;
+    const float bh = (float)r->GetBufferHeight();
+    const float bw = (float)r->GetBufferWidth();
+
+    auto dl = r->GetDrawList();
+    const int vtx_start = dl ? dl->VtxBuffer.Size : 0;
+
+    UpdateSysStats(r);
+
+    char cpuB[64], ramB[64], vramB[64], gpuB[64];
+    double usedGB = (double)(s_memEx.ullTotalPhys - s_memEx.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+    double totalGB = (double)s_memEx.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+    snprintf(cpuB, sizeof(cpuB) - 1, "%.0f%%", s_dCpuPct);
+    snprintf(ramB, sizeof(ramB) - 1, "%.1f / %.1f GB", usedGB, totalGB);
+    if (s_ullVramTotal > 0)
+        snprintf(vramB, sizeof(vramB) - 1, "%.1f / %.1f GB", (double)s_ullVramUsed / (1024.0 * 1024.0 * 1024.0), (double)s_ullVramTotal / (1024.0 * 1024.0 * 1024.0));
+    else
+        snprintf(vramB, sizeof(vramB) - 1, "--");
+    if (s_bGpuAvail.load())
+        snprintf(gpuB, sizeof(gpuB) - 1, "%.0f%%", s_fGpuPct.load());
+    else
+        snprintf(gpuB, sizeof(gpuB) - 1, "--");
+
+    const char* labels[4] = { "CPU:", "RAM:", "VRAM:", "GPU:" };
+    const char* vals[4] = { cpuB, ramB, vramB, gpuB };
+    float textW = 0.0f;
+    for (int i = 0; i < 4; i++)
+        textW = max(textW, ImGui::CalcTextSize(labels[i]).x + ImGui::CalcTextSize(vals[i]).x + 24.0f * scale);
+    const float graphH = 64.0f * scale;
+    const float panelW = max(200.0f * scale, textW);
+
+    const float contentTop = ImGui::GetFrameHeight() + 35.0f;
+    float toolbarBottom = contentTop + 10.0f;
+    if (viz.bDualPianoRoll)
+    {
+        const float stripH = max(190.0f, min(bh * 0.45f, bh * 0.28f));
+        toolbarBottom = 20.0f + 35.0f + stripH + 10.0f;
+    }
+
+    float panelLeft = 10.0f;
+    const float panelRight = panelLeft + panelW;
+
+    const float textH = (6 + 16 * 4) * scale;
+    const float overlayH = textH + graphH + 10.0f * scale;
+    const float panelTop = toolbarBottom;
+
+    DrawBlurPanel(r, panelLeft, panelTop, panelRight, panelTop + overlayH, 10.0f);
+
+    int cur_line = 0;
+    for (int i = 0; i < 4; i++)
+        RenderStatusLine(cur_line++, panelW, panelTop, panelRight, labels[i], "%s", vals[i]);
+
+    // NPS history graph: rolling 1s note-count samples, newest on the right.
+    const float graphTop = panelTop + (6 + 16 * 4) * scale + 4.0f * scale;
+    const ImVec2 g0(panelLeft + 6.0f * scale, graphTop);
+    const ImVec2 g1(panelRight - 6.0f * scale, graphTop + graphH);
+    if (!dl)
+        dl = r->GetDrawList();
+    dl->AddRectFilled(g0, g1, 0x30000000);
+    for (int gi = 0; gi <= 4; gi++)
+    {
+        float y = g0.y + (g1.y - g0.y) * gi / 4.0f;
+        dl->AddLine(ImVec2(g0.x, y), ImVec2(g1.x, y), 0x20FFFFFF);
+    }
+    const size_t n = m_dNPSHistory.size();
+    if (n > 0)
+    {
+        long long maxNps = 1;
+        for (size_t i = 0; i < n; i++)
+            maxNps = max(maxNps, m_dNPSHistory[i]);
+        const float target = max(100.0f, (float)(ceil((double)maxNps * 1.15 / 50.0) * 50.0));
+        static float s_fRange = 100.0f;
+        if (target > s_fRange)
+            s_fRange += (target - s_fRange) * 0.25f;
+        else
+            s_fRange += (target - s_fRange) * 0.5f;
+        if (s_fRange < 100.0f)
+            s_fRange = 100.0f;
+        const float yTop = s_fRange;
+        const float step = (g1.x - g0.x) / 600.0f;
+        ImVec2 pts[600];
+        for (size_t k = 0; k < n; k++)
+        {
+            float x0 = g1.x - (float)(n - k) * step;
+            float hgt = (float)m_dNPSHistory[k] / yTop * (g1.y - g0.y);
+            if (hgt > g1.y - g0.y)
+                hgt = g1.y - g0.y;
+            pts[k] = ImVec2(x0, g1.y - hgt);
+        }
+        for (size_t k = 0; k + 1 < n; k++)
+            dl->AddRectFilled(ImVec2(pts[k].x, pts[k].y), ImVec2(pts[k + 1].x, g1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddRectFilled(ImVec2(pts[n - 1].x, pts[n - 1].y), ImVec2(g1.x, g1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddPolyline(pts, (int)n, IM_COL32(255, 255, 255, 220), 0, 2.0f * scale);
+        char peakB[64];
+        snprintf(peakB, sizeof(peakB) - 1, "max %lld/s", (long long)yTop);
+        dl->AddText(ImVec2(g1.x - ImGui::CalcTextSize(peakB).x, graphTop - 14.0f * scale), 0xFF9A9A9A, peakB);
+    }
+
+    if (dl)
+    {
+        const int vtx_end = dl->VtxBuffer.Size;
+        const ImVec2 center((panelLeft + panelRight) * 0.5f, panelTop + overlayH * 0.5f);
+        Apply3DTilt(dl, vtx_start, vtx_end, center, 0.20f, GetStatsBounceScale(), 750.0f);
+    }
+    }
+    catch (...)
+    {
+        static bool s_bLogged = false;
+        if (!s_bLogged)
+        {
+            s_bLogged = true;
+            HeartbeatLog("sysstats:exception skipped");
+        }
     }
 }
 
@@ -3890,6 +4702,7 @@ GameState::GameError FreePlayScreen::Logic()
 
     m_dNPSNotes.push_back(make_tuple(m_llFreePlayTime, m_iFreePlayNoteCount));
     m_iFreePlayNoteCount = 0;
+
     while (!m_dNPSNotes.empty() && std::get<0>(m_dNPSNotes.front()) < m_llFreePlayTime - 1000000)
         m_dNPSNotes.pop_front();
 
@@ -3897,6 +4710,10 @@ GameState::GameError FreePlayScreen::Logic()
     for (size_t i = 0; i < m_dNPSNotes.size(); i++)
         lagNps += std::get<1>(m_dNPSNotes[i]);
     m_pRenderer->SetLagNPS(lagNps);
+
+    m_dNPSHistory.push_back(lagNps);
+    if ((int)m_dNPSHistory.size() > 600)
+        m_dNPSHistory.pop_front();
 
     m_pRenderer->ClearAndBeginScene(0xFF000000);
     RenderLines();

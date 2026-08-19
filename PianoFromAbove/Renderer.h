@@ -108,6 +108,7 @@ public:
     virtual HRESULT PresentBackend() = 0;
     virtual HRESULT WaitForGPU() = 0;
     virtual std::wstring GetAdapterName() = 0;
+    virtual bool GetAdapterVideoMemory(DWORDLONG& used, DWORDLONG& total) = 0;
     virtual void SetPipeline(Pipeline pipeline) = 0;
     virtual char* Screenshot() = 0;
     virtual void SetBackgroundBlur(float sigma) = 0;
@@ -199,6 +200,7 @@ public:
     bool m_bShowAbout = false;
     bool m_bShowSetResolution = false;
     bool m_bShowTrackSettings = false;
+    bool m_bShowRenderDialog = false;
 
     float m_fCorruption = 0.0f;
     bool m_bCorruptorRamp = false; // ramp corruption 0% -> slider value over the song
@@ -296,6 +298,7 @@ public:
     HRESULT PresentBackend() override;
     HRESULT WaitForGPU() override;
     std::wstring GetAdapterName() override;
+    bool GetAdapterVideoMemory(DWORDLONG& used, DWORDLONG& total) override;
     const wchar_t* GetModeName() const override { return L"DirectX 12"; }
     void SetPipeline(Pipeline pipeline) override;
     char* Screenshot() override;

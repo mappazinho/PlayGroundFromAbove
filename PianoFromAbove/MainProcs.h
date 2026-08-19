@@ -18,6 +18,11 @@ using namespace std;
 LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
 VOID SizeWindows( int iMainWidth, int iMainHeight );
 
+// Render progress window (plain Win32 popup, never captured in the video)
+VOID RequestCreateRenderProgressWindow();                 // main-thread create
+VOID RequestDestroyRenderProgressWindow();                // main-thread destroy
+VOID UpdateRenderProgressWindow( INT iPermille, const wchar_t *wText ); // thread-safe
+
 LRESULT WINAPI GfxProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
 
 VOID HandOffMsg( UINT msg, WPARAM wParam, LPARAM lParam );

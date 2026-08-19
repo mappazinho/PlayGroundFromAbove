@@ -153,7 +153,7 @@ bool Renderer::PresentPrelude() {
     // Lag Intensifier: throttle the frame rate by NPS tier. 1x does nothing.
     // 2x activates at >= 1M NPS, 3x halves that threshold, 4x halves it again.
     // FPS caps are randomly re-rolled once per second within the tier's range.
-    if (m_iLagIntensity > 1 && branch != 0) {
+    if (m_iLagIntensity > 1 && branch != 0 && !g_bVideoRendering) {
         const long long tier = 1000000LL >> (m_iLagIntensity - 1);
         int capMin, capMax;
         if (m_llLagNPS >= tier * 2) {
@@ -336,6 +336,29 @@ void Renderer::RenderImGuiFrame() {
         viz.bDisableUI = false;
     if (viz.bDisableUI) return;
 
+    // While a video render runs, draw only a slim song-progress bar at the
+    // top of the window. Everything else (menu bar, toolbar, dialogs, stats)
+    // would end up in the captured output; the render info lives in the
+    // separate Win32 progress window instead.
+    if (g_bVideoRendering) {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(vp->Size.x, 4.0f), ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGuiWindowFlags progFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+        if (ImGui::Begin("##RenderSongProgress", nullptr, progFlags))
+            ImGui::ProgressBar(m_fPlaybackPosition, ImVec2(-1, 0));
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+        return;
+    }
+
     auto& config = Config::GetConfig();
     auto& playback = config.GetPlaybackSettings();
     auto& view = config.GetViewSettings();
@@ -353,6 +376,9 @@ void Renderer::RenderImGuiFrame() {
                 PostMessage(g_hWnd, WM_COMMAND, ID_FILE_FREEPLAY, 0);
             if (ImGui::MenuItem("Close File", "Ctrl+W", false, playback.GetPlayMode() != GameState::Intro))
                 PostMessage(g_hWnd, WM_COMMAND, ID_FILE_CLOSEFILE, 0);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Render to Video...", nullptr, m_bShowRenderDialog, playback.GetPlayMode() != GameState::Intro))
+                m_bShowRenderDialog = true;
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Play")) {
@@ -444,6 +470,14 @@ void Renderer::RenderImGuiFrame() {
                 m_iLagIntensity = (unsigned)lag + 1;
             ImGui::Separator();
             ImGui::Checkbox("GPU Overclock Artifacts", &m_bOverclockArtifacts);
+            ImGui::Separator();
+            ImGui::Checkbox("Bounce stats to the beat", &viz.bBounceStats);
+            if (viz.bBounceStats) {
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
+                ImGui::Unindent();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("RenderMode")) {
@@ -927,6 +961,14 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImGui::Checkbox("Show Markers", &viz.bShowMarkers);
                     ImGui::Combo("Marker Encoding", (int*)&viz.eMarkerEncoding, "CP-1252 (Western)\0CP-932 (Japanese)\0UTF-8\0");
                     ImGui::Checkbox("Nerd Stats", &viz.bNerdStats);
+                    ImGui::Checkbox("Sys Stats", &viz.bSysStats);
+                    ImGui::Checkbox("Bounce stats to the beat", &viz.bBounceStats);
+                    if (viz.bBounceStats) {
+                        ImGui::Indent();
+                        ImGui::SetNextItemWidth(200);
+                        ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
+                        ImGui::Unindent();
+                    }
                     ImGui::Checkbox("Dump Frames", &viz.bDumpFrames);
                     ImGui::Checkbox("Disable UI (Reenable by pressing CTRL + ALT)", &viz.bDisableUI);
                     ImGui::Separator();
@@ -1002,6 +1044,395 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             }
             ImGui::End();
         }
+        ImGui::PopStyleColor();
+    }
+
+    if (m_bShowRenderDialog) {
+        ImGui::SetNextWindowSize(ImVec2(560, 530), ImGuiCond_FirstUseEver);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        if (ImGui::Begin("Render to Video", &m_bShowRenderDialog, ImGuiWindowFlags_NoCollapse)) {
+            if (m_BlurTextureID) {
+                ImVec2 wpos = ImGui::GetWindowPos();
+                ImVec2 wsize = ImGui::GetWindowSize();
+                float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
+                ImGui::GetWindowDrawList()->AddImage(m_BlurTextureID,
+                    wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y),
+                    ImVec2(wpos.x / bw, wpos.y / bh),
+                    ImVec2((wpos.x + wsize.x) / bw, (wpos.y + wsize.y) / bh));
+                ImGui::GetWindowDrawList()->AddRectFilled(wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y), 0x80000000);
+            }
+            const bool hasSong = VideoRenderSongLoaded();
+            const bool hasFFmpeg = !viz.sFFmpegDir.empty() &&
+                GetFileAttributesW((viz.sFFmpegDir + L"\\ffmpeg.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+            const bool canRender = hasSong && hasFFmpeg;
+
+            // --- Status Header ---
+            ImGui::BeginGroup();
+            {
+                // MIDI Status
+                ImGui::Text("MIDI Source:");
+                ImGui::SameLine(130);
+                if (hasSong)
+                    ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f), "[Ready] Song loaded in player");
+                else
+                    ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f), "[None] No MIDI file loaded");
+
+                // FFmpeg Status
+                ImGui::Text("FFmpeg Engine:");
+                ImGui::SameLine(130);
+                if (hasFFmpeg) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f), "[Ready] FFmpeg executable detected");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.95f, 0.4f, 0.4f, 1.0f), "[Missing] ffmpeg.exe not found");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Download"))
+                        ShellExecuteA(g_hWnd, "open", "https://ffmpeg.org/download.html", NULL, NULL, SW_SHOWNORMAL);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Auto-Detect")) {
+                        wchar_t exePath[MAX_PATH] = {};
+                        if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
+                            std::wstring dir = exePath;
+                            size_t sp = dir.find_last_of(L"\\/");
+                            if (sp != std::wstring::npos)
+                                dir = dir.substr(0, sp);
+                            if (GetFileAttributesW((dir + L"\\ffmpeg.exe").c_str()) != INVALID_FILE_ATTRIBUTES)
+                                viz.sFFmpegDir = dir;
+                        }
+                    }
+                }
+
+                // Audio track option
+                ImGui::Text("Audio Track:");
+                ImGui::SameLine(130);
+                ImGui::Checkbox("Include synthesized audio in export", &viz.bRenderIncludeAudio);
+            }
+            ImGui::EndGroup();
+
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // --- Tabbed Configuration ---
+            if (ImGui::BeginTabBar("##RenderTabBar", ImGuiTabBarFlags_None)) {
+                // TAB 1: Video & Resolution
+                if (ImGui::BeginTabItem("Video & Resolution")) {
+                    ImGui::Spacing();
+
+                    // Resolution Presets
+                    ImGui::Text("Resolution Preset:");
+                    static int resPreset = 0;
+                    if (viz.iRenderWidth == 1920 && viz.iRenderHeight == 1080) resPreset = 0;
+                    else if (viz.iRenderWidth == 2560 && viz.iRenderHeight == 1440) resPreset = 1;
+                    else if (viz.iRenderWidth == 3840 && viz.iRenderHeight == 2160) resPreset = 2;
+                    else if (viz.iRenderWidth == 1280 && viz.iRenderHeight == 720) resPreset = 3;
+                    else if (viz.iRenderWidth == m_iBufferWidth && viz.iRenderHeight == m_iBufferHeight) resPreset = 4;
+                    else resPreset = 5;
+
+                    const char* resPresetNames[] = {
+                        "1080p Full HD (1920 x 1080)",
+                        "1440p QHD (2560 x 1440)",
+                        "4K UHD (3840 x 2160)",
+                        "720p HD (1280 x 720)",
+                        "Match Window Size",
+                        "Custom Resolution"
+                    };
+
+                    if (ImGui::Combo("##resPresetCombo", &resPreset, resPresetNames, IM_ARRAYSIZE(resPresetNames))) {
+                        if (resPreset == 0) { viz.iRenderWidth = 1920; viz.iRenderHeight = 1080; }
+                        else if (resPreset == 1) { viz.iRenderWidth = 2560; viz.iRenderHeight = 1440; }
+                        else if (resPreset == 2) { viz.iRenderWidth = 3840; viz.iRenderHeight = 2160; }
+                        else if (resPreset == 3) { viz.iRenderWidth = 1280; viz.iRenderHeight = 720; }
+                        else if (resPreset == 4) { viz.iRenderWidth = max(128, m_iBufferWidth); viz.iRenderHeight = max(128, m_iBufferHeight); }
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Text("Dimensions (Pixels):");
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputInt("##renderWidth", &viz.iRenderWidth, 0, 0);
+                    viz.iRenderWidth = max(128, min(viz.iRenderWidth, 8192));
+                    ImGui::SameLine();
+                    ImGui::Text("x");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputInt("##renderHeight", &viz.iRenderHeight, 0, 0);
+                    viz.iRenderHeight = max(128, min(viz.iRenderHeight, 8192));
+
+                    // Aspect ratio indicator
+                    ImGui::SameLine();
+                    float aspect = (float)viz.iRenderWidth / (float)max(1, viz.iRenderHeight);
+                    if (fabsf(aspect - 16.0f / 9.0f) < 0.01f)
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[16:9]");
+                    else if (fabsf(aspect - 16.0f / 10.0f) < 0.01f)
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[16:10]");
+                    else if (fabsf(aspect - 4.0f / 3.0f) < 0.01f)
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[4:3]");
+                    else if (fabsf(aspect - 21.0f / 9.0f) < 0.02f)
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[21:9]");
+                    else
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[%.2f:1]", aspect);
+
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // Framerate
+                    ImGui::Text("Target Framerate:");
+                    ImGui::SetNextItemWidth(120);
+                    ImGui::InputInt("FPS##renderFps", &viz.iRenderFPS, 0, 0);
+                    viz.iRenderFPS = max(1, min(viz.iRenderFPS, 1000));
+                    ImGui::SameLine();
+                    ImGui::Text("Quick:");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("60"))  viz.iRenderFPS = 60;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("120")) viz.iRenderFPS = 120;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("144")) viz.iRenderFPS = 144;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("240")) viz.iRenderFPS = 240;
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Playback runs uncapped on GPU; video is encoded at this target rate.");
+
+                    ImGui::EndTabItem();
+                }
+
+                // TAB 2: Encoder & Quality
+                if (ImGui::BeginTabItem("Encoder & Quality")) {
+                    ImGui::Spacing();
+
+                    // Container format
+                    ImGui::Text("Container Format:");
+                    const char* formatNames[] = { "MP4 (.mp4 - Standard, recommended)", "MOV (.mov - Apple QuickTime)", "AVI (.avi - Audio Video Interleave)" };
+                    ImGui::Combo("##formatCombo", &viz.iRenderFormat, formatNames, IM_ARRAYSIZE(formatNames));
+                    viz.iRenderFormat = max(0, min(viz.iRenderFormat, 2));
+
+                    // Codec
+                    ImGui::Spacing();
+                    ImGui::Text("Video Codec:");
+                    const char* codecNames[] = { "H.264 / AVC (libx264 - Fast, maximum compatibility)", "H.265 / HEVC (libx265 - Better compression, higher CPU load)" };
+                    ImGui::Combo("##codecCombo", &viz.iRenderCodec, codecNames, IM_ARRAYSIZE(codecNames));
+                    viz.iRenderCodec = max(0, min(viz.iRenderCodec, 1));
+
+                    // Encoding preset
+                    ImGui::Spacing();
+                    ImGui::Text("Encoding Speed Preset:");
+                    static const char* sPresetNames[] = {
+                        "ultrafast (Fastest render, larger file)",
+                        "superfast",
+                        "veryfast",
+                        "faster",
+                        "fast",
+                        "medium (Default balance)",
+                        "slow",
+                        "slower",
+                        "veryslow (Slowest render, optimal quality)",
+                        "placebo"
+                    };
+                    viz.iRenderPreset = max(0, min(viz.iRenderPreset, 9));
+                    ImGui::Combo("##presetCombo", &viz.iRenderPreset, sPresetNames, IM_ARRAYSIZE(sPresetNames));
+
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // Rate Control
+                    ImGui::Text("Rate Control Mode:");
+                    if (ImGui::RadioButton("Constant Quality (CRF)", viz.iRenderBitrateMode == 1))
+                        viz.iRenderBitrateMode = 1;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Target Bitrate (CBR)", viz.iRenderBitrateMode == 0))
+                        viz.iRenderBitrateMode = 0;
+
+                    ImGui::Spacing();
+                    if (viz.iRenderBitrateMode == 1) {
+                        ImGui::SliderInt("CRF Factor", &viz.iRenderCRF, 0, 51);
+                        viz.iRenderCRF = max(0, min(viz.iRenderCRF, 51));
+                        if (viz.iRenderCRF <= 16)
+                            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.9f, 1.0f), "Mode: Near-lossless / Large file size");
+                        else if (viz.iRenderCRF <= 23)
+                            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Mode: High quality / Visually lossless (Recommended: 18)");
+                        else
+                            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.4f, 1.0f), "Mode: Higher compression / Compact file size");
+                    }
+                    else {
+                        ImGui::InputInt("Bitrate (Kbps)", &viz.iRenderBitrateKbps, 500, 2000);
+                        if (viz.iRenderBitrateKbps < 100)
+                            viz.iRenderBitrateKbps = 100;
+                        ImGui::SameLine();
+                        ImGui::Text("Quick:");
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("8M"))  viz.iRenderBitrateKbps = 8000;
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("16M")) viz.iRenderBitrateKbps = 16000;
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("30M")) viz.iRenderBitrateKbps = 30000;
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("60M")) viz.iRenderBitrateKbps = 60000;
+                    }
+
+                    ImGui::EndTabItem();
+                }
+
+                // TAB 3: Output & Advanced
+                if (ImGui::BeginTabItem("Output & Advanced")) {
+                    ImGui::Spacing();
+
+                    const char* sExt = viz.iRenderFormat == 1 ? "mov" : (viz.iRenderFormat == 2 ? "avi" : "mp4");
+                    static char sOut[MAX_PATH] = {};
+                    static bool sOutInit = false;
+                    if (!sOutInit) {
+                        std::string s = Util::WstringToString(viz.sRenderOutputPath);
+                        strncpy_s(sOut, s.c_str(), sizeof(sOut));
+                        sOutInit = true;
+                    }
+
+                    ImGui::Text("Output File Path:");
+                    ImGui::SetNextItemWidth(max(100.0f, ImGui::GetContentRegionAvail().x - 85.0f));
+                    if (ImGui::InputText("##outpath", sOut, sizeof(sOut)))
+                        viz.sRenderOutputPath = Util::StringToWstring(sOut);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##out", ImVec2(75, 0))) {
+                        OPENFILENAMEA ofn = {};
+                        char fn[1024] = {};
+                        ofn.lStructSize = sizeof(ofn);
+                        ofn.hwndOwner = g_hWnd;
+                        std::string filter = "Video files (*.";
+                        filter += sExt;
+                        filter += ")";
+                        filter += '\0';
+                        filter += "*.";
+                        filter += sExt;
+                        filter += '\0';
+                        filter += "All Files (*.*)";
+                        filter += '\0';
+                        filter += "*.*";
+                        filter += '\0';
+                        filter += '\0';
+                        ofn.lpstrFilter = filter.c_str();
+                        ofn.lpstrFile = fn;
+                        ofn.nMaxFile = sizeof(fn);
+                        ofn.lpstrDefExt = sExt;
+                        ofn.lpstrTitle = "Save render video as...";
+                        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT;
+                        if (GetSaveFileNameA(&ofn)) {
+                            viz.sRenderOutputPath = Util::StringToWstring(fn);
+                            strncpy_s(sOut, fn, sizeof(sOut));
+                        }
+                    }
+
+                    if (viz.sRenderOutputPath.empty())
+                        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Default: Video will be saved into the application folder.");
+
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // FFmpeg Folder Path
+                    static char sFfDir[MAX_PATH] = {};
+                    static bool sFfDirInit = false;
+                    if (!sFfDirInit) {
+                        std::string s = Util::WstringToString(viz.sFFmpegDir);
+                        strncpy_s(sFfDir, s.c_str(), sizeof(sFfDir));
+                        sFfDirInit = true;
+                    }
+
+                    ImGui::Text("FFmpeg Binary Location:");
+                    ImGui::SetNextItemWidth(max(100.0f, ImGui::GetContentRegionAvail().x - 85.0f));
+                    if (ImGui::InputText("##ffdir", sFfDir, sizeof(sFfDir)))
+                        viz.sFFmpegDir = Util::StringToWstring(sFfDir);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##ffdir", ImVec2(75, 0))) {
+                        OPENFILENAMEA ofn = {};
+                        char fn[1024] = {};
+                        ofn.lStructSize = sizeof(ofn);
+                        ofn.hwndOwner = g_hWnd;
+                        ofn.lpstrFilter = "Executables\0*.exe\0";
+                        ofn.lpstrFile = fn;
+                        ofn.nMaxFile = sizeof(fn);
+                        ofn.lpstrTitle = "Select ffmpeg.exe";
+                        ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                        if (GetOpenFileNameA(&ofn)) {
+                            std::string s = fn;
+                            size_t sp = s.find_last_of("\\/");
+                            if (sp != std::string::npos)
+                                s = s.substr(0, sp);
+                            viz.sFFmpegDir = Util::StringToWstring(s);
+                            strncpy_s(sFfDir, s.c_str(), sizeof(sFfDir));
+                        }
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    // Advanced Options
+                    ImGui::Checkbox("Enable custom FFmpeg arguments (advanced)", &viz.bRenderAdvanced);
+                    if (viz.bRenderAdvanced) {
+                        static char sAdv[4096] = {};
+                        static bool sAdvInit = false;
+                        if (!sAdvInit) {
+                            std::string s = Util::WstringToString(viz.sRenderAdvancedOptions);
+                            strncpy_s(sAdv, s.c_str(), sizeof(sAdv));
+                            sAdvInit = true;
+                        }
+                        ImGui::TextDisabled("Additional flags injected before video output:");
+                        if (ImGui::InputTextMultiline("##advOptions", sAdv, sizeof(sAdv), ImVec2(-1, 60)))
+                            viz.sRenderAdvancedOptions = Util::StringToWstring(sAdv);
+                    }
+
+                    ImGui::EndTabItem();
+                }
+
+                ImGui::EndTabBar();
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // --- Footer Area ---
+            const char* sExtLabel = viz.iRenderFormat == 1 ? "MOV" : (viz.iRenderFormat == 2 ? "AVI" : "MP4");
+            const char* sCodecLabel = viz.iRenderCodec == 1 ? "H.265" : "H.264";
+            if (viz.iRenderBitrateMode == 1) {
+                ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),
+                    "Profile: %dx%d @ %d FPS | %s (%s, CRF %d)",
+                    viz.iRenderWidth, viz.iRenderHeight, viz.iRenderFPS, sExtLabel, sCodecLabel, viz.iRenderCRF);
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),
+                    "Profile: %dx%d @ %d FPS | %s (%s, %d Kbps)",
+                    viz.iRenderWidth, viz.iRenderHeight, viz.iRenderFPS, sExtLabel, sCodecLabel, viz.iRenderBitrateKbps);
+            }
+
+            ImGui::Spacing();
+
+            if (g_bVideoRendering) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.2f, 0.2f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.3f, 0.3f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+                if (ImGui::Button("Stop Render", ImVec2(-FLT_MIN, 36)))
+                    StopVideoRender();
+                ImGui::PopStyleColor(3);
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Rendering in progress... (check main window title)");
+            }
+            else {
+                ImGui::BeginDisabled(!canRender);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.65f, 0.35f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.14f, 0.42f, 0.22f, 1.0f));
+                if (ImGui::Button("Start Render", ImVec2(-FLT_MIN, 36)))
+                    RequestVideoRender();
+                ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Starts video rendering. Renders as fast as possible on GPU until the song ends.");
+                ImGui::EndDisabled();
+
+                if (!canRender) {
+                    if (!hasSong)
+                        ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1.0f), "* Load a MIDI file to render (File -> Open Song...)");
+                    if (!hasFFmpeg)
+                        ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1.0f), "* Configure FFmpeg directory in Output & Advanced tab");
+                }
+            }
+        }
+        ImGui::End();
         ImGui::PopStyleColor();
     }
 

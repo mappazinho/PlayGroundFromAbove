@@ -21,15 +21,11 @@ AudioBufferStream::AudioBufferStream(MIDIAudio* source)
 	m_maAudioSource = source;
 }
 
-// ------- loudmax stuff -------
-bool reduceHighPitch = false;
-double loudnessL = 1;
-double loudnessR = 1;
-double velocityR = 0;
-double velocityL = 0;
-double strength = 1;
-double minThresh = 0.4;
-double velocityThresh = 1;
+// ------- loudmax parameters -------
+static const bool reduceHighPitch = false;
+static const double strength = 1.0;
+static const double minThresh = 0.4;
+static const double velocityThresh = 1.0;
 
 int AudioBufferStream::Read(float* buffer, int offset, int count)
 {
@@ -217,62 +213,80 @@ void AudioBufferStream::CopyRepeatTail(MIDIAudio* src, float* buffer, int offset
 		src->m_iRepeatOffset += takeFrames;
 	}
 }
-
 // read with loudmax
 int AudioBufferStream::ReadLM(float* buffer, int offset, int count)
 {
-	double attack = 48000 * m_maAudioSource->m_dAttack;
-	double falloff = 48000 * m_maAudioSource->m_dRelease;
-
 	int read = Read(buffer, offset, count);
-	int end = offset + read;
+	m_maAudioSource->ApplyLoudMax(buffer + offset, read / 2, m_maAudioSource->m_liveLimiter);
+	return read;
+}
 
-	if (read % 2 != 0) {}
-	for (int i = offset; i < end; i += 2)
+// LoudMax-style level processor: normalizes by a smoothed loudness envelope
+// (attack/release from the pre-render audio settings), plus an optional
+// high-velocity rolloff and the playback volume. Runs independently on the ring chunks the
+// output device pulls (real-time) AND on the render's WAV capture with separate state instances,
+// so live playback and video rendering never clobber each other.
+void MIDIAudio::ApplyLoudMax(float* buffer, int frames, LoudMaxState& state)
+{
+	double attack = 48000.0 * m_dAttack;
+	double falloff = 48000.0 * m_dRelease;
+
+	for (int i = 0; i < frames; i++)
 	{
-		double l = (double)fabs(buffer[i]);
-		double r = (double)fabs(buffer[i + 1]);
+		int o = i * 2;
+		double l = (double)fabs(buffer[o]);
+		double r = (double)fabs(buffer[o + 1]);
 
-		if (loudnessL > l) loudnessL = (loudnessL * falloff + l) / (falloff + 1.0);
-		else loudnessL = (loudnessL * attack + l) / (attack + 1.0);
+		if (state.loudnessL > l) state.loudnessL = (state.loudnessL * falloff + l) / (falloff + 1.0);
+		else state.loudnessL = (state.loudnessL * attack + l) / (attack + 1.0);
 
-		if (loudnessR > r) loudnessR = (loudnessR * falloff + r) / (falloff + 1.0);
-		else loudnessR = (loudnessR * attack + r) / (attack + 1.0);
+		if (state.loudnessR > r) state.loudnessR = (state.loudnessR * falloff + r) / (falloff + 1.0);
+		else state.loudnessR = (state.loudnessR * attack + r) / (attack + 1.0);
 
-		if (loudnessL < minThresh) loudnessL = minThresh;
-		if (loudnessR < minThresh) loudnessR = minThresh;
+		if (state.loudnessL < minThresh) state.loudnessL = minThresh;
+		if (state.loudnessR < minThresh) state.loudnessR = minThresh;
 
-		l = buffer[i] / (loudnessL * strength + 2.0 * (1 - strength)) / 2.0;
-		r = buffer[i + 1] / (loudnessR * strength + 2.0 * (1 - strength)) / 2.0;
+		double nl = buffer[o] / (state.loudnessL * strength + 2.0 * (1.0 - strength)) / 2.0;
+		double nr = buffer[o + 1] / (state.loudnessR * strength + 2.0 * (1.0 - strength)) / 2.0;
 
-		if (i != offset)
+		if (!state.firstChunk || i != 0)
 		{
-			double dl = std::abs((double)buffer[i] - l);
-			double dr = std::abs((double)buffer[i + 1] - r);
+			double dl = std::abs((double)buffer[o] - nl);
+			double dr = std::abs((double)buffer[o + 1] - nr);
 
-			if (velocityL > dl)
-				velocityL = (velocityL * falloff + dl) / (falloff + 1.0);
+			if (state.velocityL > dl)
+				state.velocityL = (state.velocityL * falloff + dl) / (falloff + 1.0);
 			else
-				velocityL = (velocityL * attack + dl) / (attack + 1.0);
+				state.velocityL = (state.velocityL * attack + dl) / (attack + 1.0);
 
-			if (velocityR > dr)
-				velocityR = (velocityR * falloff + dr) / (falloff + 1.0);
+			if (state.velocityR > dr)
+				state.velocityR = (state.velocityR * falloff + dr) / (falloff + 1.0);
 			else
-				velocityR = (velocityR * attack + dr) / (attack + 1.0);
+				state.velocityR = (state.velocityR * attack + dr) / (attack + 1.0);
 		}
 
 		if (reduceHighPitch)
 		{
-			if (velocityL > velocityThresh)
-				l = l / velocityL * velocityThresh;
-			if (velocityR > velocityThresh)
-				r = r / velocityR * velocityThresh;
+			if (state.velocityL > velocityThresh)
+				nl = nl / state.velocityL * velocityThresh;
+			if (state.velocityR > velocityThresh)
+				nr = nr / state.velocityR * velocityThresh;
 		}
 
-		*(buffer + i) = (float)(l * g_preVolume);
-		*(buffer + i + 1) = (float)(r * g_preVolume);
+		buffer[o] = (float)(nl * g_preVolume.load());
+		buffer[o + 1] = (float)(nr * g_preVolume.load());
 	}
-	return read;
+	state.firstChunk = false;
+}
+
+void MIDIAudio::WriteWavChunk(const float* rawSrc, int frames)
+{
+	if (!m_pWavFile || frames <= 0) return;
+	std::vector<float> wavBuf((size_t)frames * 2);
+	memcpy(wavBuf.data(), rawSrc, (size_t)frames * 2 * sizeof(float));
+	ApplyLoudMax(wavBuf.data(), frames, m_wavLimiter);
+	fwrite(wavBuf.data(), sizeof(float), (size_t)(frames * 2), m_pWavFile);
+	m_lWavDataBytes += (long)(frames * 2) * (long)sizeof(float);
 }
 
 void MIDIAudio::WrappedCopy(float* src, int pos, int srcCount, float *dst, int pos2, int count)
@@ -306,6 +320,7 @@ void MIDIAudio::Reset()
 	m_iBufferWritePos = 0;
 	m_iBufferReadPos = 0;
 	m_dReadFraction = 0.0;
+	m_liveLimiter.Reset();
 }
 
 void MIDIAudio::SetReadSpeed(double dSpeed)
@@ -327,13 +342,26 @@ bool MIDIAudio::BassWriteWrapped(BASSMIDI* bass, int start, int count)
 	count *= 2;
 	if (start + count > m_iBufferLength)
 	{
-		bass->Read(m_fAudioBuffer, start, m_iBufferLength - start);
-		count -= m_iBufferLength - start;
+		int part1 = m_iBufferLength - start;
+		bass->Read(m_fAudioBuffer, start, part1);
+		if (m_pWavFile)
+		{
+			WriteWavChunk(m_fAudioBuffer + start, part1 / 2);
+		}
+		count -= part1;
 		bass->Read(m_fAudioBuffer, 0, count);
+		if (m_pWavFile)
+		{
+			WriteWavChunk(m_fAudioBuffer, count / 2);
+		}
 	}
 	else
 	{
 		bass->Read(m_fAudioBuffer, start, count);
+		if (m_pWavFile)
+		{
+			WriteWavChunk(m_fAudioBuffer + start, count / 2);
+		}
 	}
 
 	// Diagnostic: RMS of the chunk just pulled from the synth. A chunk that
@@ -674,6 +702,7 @@ void MIDIAudio::Start(double time, std::vector<MIDIChannelEvent>* events, double
 	m_qLastSynthPos = 0;
 	m_iFrozenFrames = 0;
 	m_dStartTime = time;
+	m_liveLimiter.Reset();
 	m_pMIDI = events ? m_pMIDI : nullptr;
 	m_tGeneratorThread = new std::thread([this, speed, time, events, start] { GeneratorFunc(speed, time, events, start); });
 	m_bAudioStarted = true;
@@ -686,6 +715,50 @@ void MIDIAudio::Stop()
 	m_bPaused = true;
 	m_iBufferWritePos = 0;
 	m_iBufferReadPos = 0;
+}
+
+void MIDIAudio::StartWavRecording(const wchar_t* path)
+{
+	StopWavRecording();
+	m_wavLimiter.Reset();
+	m_pWavFile = _wfopen(path, L"wb");
+	if (!m_pWavFile)
+	{
+		PRE_DbgLog("WAV: open failed: %ls", path);
+		return;
+	}
+	m_lWavDataBytes = 0;
+	unsigned char hdr[44] = {};
+	memcpy(hdr, "RIFF", 4);
+	memcpy(hdr + 8, "WAVE", 4);
+	memcpy(hdr + 12, "fmt ", 4);
+	hdr[16] = 16; // fmt chunk size
+	hdr[20] = 3; hdr[21] = 0;  // WAVE_FORMAT_IEEE_FLOAT
+	hdr[22] = 2; hdr[23] = 0;  // 2 channels
+	hdr[24] = 0x80; hdr[25] = 0xBB; hdr[26] = 0; hdr[27] = 0; // 48000 Hz
+	unsigned int uiByteRate = 48000 * 2 * 4;
+	memcpy(hdr + 28, &uiByteRate, 4);
+	hdr[32] = 8; hdr[33] = 0;  // block align (2ch * 4 bytes)
+	hdr[34] = 32; hdr[35] = 0; // 32 bits per sample
+	memcpy(hdr + 36, "data", 4);
+	fwrite(hdr, 1, 44, m_pWavFile);
+	PRE_DbgLog("WAV: recording started: %ls", path);
+}
+
+void MIDIAudio::StopWavRecording()
+{
+	if (!m_pWavFile)
+		return;
+	fflush(m_pWavFile);
+	unsigned int uiDataBytes = (unsigned int)m_lWavDataBytes;
+	fseek(m_pWavFile, 40, SEEK_SET);
+	fwrite(&uiDataBytes, 4, 1, m_pWavFile);
+	unsigned int uiFileBytes = uiDataBytes + 36;
+	fseek(m_pWavFile, 4, SEEK_SET);
+	fwrite(&uiFileBytes, 4, 1, m_pWavFile);
+	fclose(m_pWavFile);
+	m_pWavFile = nullptr;
+	PRE_DbgLog("WAV: recording stopped (%u bytes)", uiDataBytes);
 }
 
 void MIDIAudio::SyncPlayer(double time, double speed)

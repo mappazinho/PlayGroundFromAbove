@@ -228,6 +228,7 @@ void VizSettings::LoadDefaultValues() {
     this->bShowMarkers = true;
     this->eMarkerEncoding = MarkerEncoding::CP1252;
     this->bNerdStats = false;
+    this->bSysStats = false;
     this->sSplashMIDI = L"";
     this->bVisualizePitchBends = false;
     this->bDualPianoRoll = false;
@@ -257,6 +258,22 @@ void VizSettings::LoadDefaultValues() {
     this->bDisableUI = false;
     this->fUIScale = 1.0f;
     this->sUIFont = L"";
+    this->bBounceStats = false;
+    this->iBounceNPSThreshold = 90;
+    this->sFFmpegDir = L"";
+    this->iRenderWidth = 1920;
+    this->iRenderHeight = 1080;
+    this->iRenderFPS = 60;
+    this->iRenderFormat = 0;
+    this->iRenderCodec = 0;
+    this->iRenderPreset = 2;
+    this->iRenderBitrateMode = 1;
+    this->iRenderBitrateKbps = 8000;
+    this->iRenderCRF = 18;
+    this->sRenderOutputPath = L"";
+    this->bRenderIncludeAudio = true;
+    this->bRenderAdvanced = false;
+    this->sRenderAdvancedOptions = L"";
 }
 
 void AudioSettings::LoadMIDIDevices()
@@ -471,6 +488,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bShowMarkers = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("NerdStats", &iAttrVal) == TIXML_SUCCESS)
         bNerdStats = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("SysStats", &iAttrVal) == TIXML_SUCCESS)
+        bSysStats = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("VisualizePitchBends", &iAttrVal) == TIXML_SUCCESS)
         bVisualizePitchBends = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)
@@ -537,6 +556,41 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         fUIScale = 1.0f;
     txViz->QueryStringAttribute("UIFont", &sTempStr);
     sUIFont = Util::StringToWstring(sTempStr);
+    if (txViz->QueryIntAttribute("BounceStats", &iAttrVal) == TIXML_SUCCESS)
+        bBounceStats = (iAttrVal != 0);
+    txViz->QueryIntAttribute("BounceNPSThreshold", &iBounceNPSThreshold);
+    iBounceNPSThreshold = max(0, min(iBounceNPSThreshold, 100));
+    sTempStr = "";
+    txViz->QueryStringAttribute("FFmpegDir", &sTempStr);
+    sFFmpegDir = Util::StringToWstring(sTempStr);
+    txViz->QueryIntAttribute("RenderWidth", &iRenderWidth);
+    iRenderWidth = max(320, min(iRenderWidth, 7680));
+    txViz->QueryIntAttribute("RenderHeight", &iRenderHeight);
+    iRenderHeight = max(240, min(iRenderHeight, 4320));
+    txViz->QueryIntAttribute("RenderFPS", &iRenderFPS);
+    iRenderFPS = max(60, min(iRenderFPS, 500));
+    txViz->QueryIntAttribute("RenderFormat", &iRenderFormat);
+    iRenderFormat = max(0, min(iRenderFormat, 2));
+    txViz->QueryIntAttribute("RenderCodec", &iRenderCodec);
+    iRenderCodec = max(0, min(iRenderCodec, 1));
+    txViz->QueryIntAttribute("RenderPreset", &iRenderPreset);
+    iRenderPreset = max(0, min(iRenderPreset, 9));
+    txViz->QueryIntAttribute("RenderBitrateMode", &iRenderBitrateMode);
+    iRenderBitrateMode = max(0, min(iRenderBitrateMode, 1));
+    txViz->QueryIntAttribute("RenderBitrateKbps", &iRenderBitrateKbps);
+    iRenderBitrateKbps = max(0, min(iRenderBitrateKbps, 1000000));
+    txViz->QueryIntAttribute("RenderCRF", &iRenderCRF);
+    iRenderCRF = max(0, min(iRenderCRF, 51));
+    sTempStr = "";
+    txViz->QueryStringAttribute("RenderOutputPath", &sTempStr);
+    sRenderOutputPath = Util::StringToWstring(sTempStr);
+    if (txViz->QueryIntAttribute("RenderIncludeAudio", &iAttrVal) == TIXML_SUCCESS)
+        bRenderIncludeAudio = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("RenderAdvanced", &iAttrVal) == TIXML_SUCCESS)
+        bRenderAdvanced = (iAttrVal != 0);
+    sTempStr = "";
+    txViz->QueryStringAttribute("RenderAdvancedOptions", &sTempStr);
+    sRenderAdvancedOptions = Util::StringToWstring(sTempStr);
 
     int r, g, b = 0;
     TiXmlElement* txBarColor = txViz->FirstChildElement("BarColor");
@@ -683,6 +737,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("ShowMarkers", bShowMarkers);
     txViz->SetAttribute("MarkerEncoding", eMarkerEncoding);
     txViz->SetAttribute("NerdStats", bNerdStats);
+    txViz->SetAttribute("SysStats", bSysStats);
     txViz->SetAttribute("SplashMIDI", Util::WstringToString(sSplashMIDI));
     txViz->SetAttribute("VisualizePitchBends", bVisualizePitchBends);
     txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);
@@ -711,6 +766,25 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("DisableUI", bDisableUI);
     txViz->SetDoubleAttribute("UIScale", fUIScale);
     txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));
+    txViz->SetAttribute("BounceStats", bBounceStats);
+    txViz->SetAttribute("BounceNPSThreshold", iBounceNPSThreshold);
+    if (sFFmpegDir.length() > 0)
+        txViz->SetAttribute("FFmpegDir", Util::WstringToString(sFFmpegDir));
+    txViz->SetAttribute("RenderWidth", iRenderWidth);
+    txViz->SetAttribute("RenderHeight", iRenderHeight);
+    txViz->SetAttribute("RenderFPS", iRenderFPS);
+    txViz->SetAttribute("RenderFormat", iRenderFormat);
+    txViz->SetAttribute("RenderCodec", iRenderCodec);
+    txViz->SetAttribute("RenderPreset", iRenderPreset);
+    txViz->SetAttribute("RenderBitrateMode", iRenderBitrateMode);
+    txViz->SetAttribute("RenderBitrateKbps", iRenderBitrateKbps);
+    txViz->SetAttribute("RenderCRF", iRenderCRF);
+    if (sRenderOutputPath.length() > 0)
+        txViz->SetAttribute("RenderOutputPath", Util::WstringToString(sRenderOutputPath));
+    txViz->SetAttribute("RenderIncludeAudio", bRenderIncludeAudio);
+    txViz->SetAttribute("RenderAdvanced", bRenderAdvanced);
+    if (sRenderAdvancedOptions.length() > 0)
+        txViz->SetAttribute("RenderAdvancedOptions", Util::WstringToString(sRenderAdvancedOptions));
 
     TiXmlElement* txBarColor = new TiXmlElement("BarColor");
     txViz->LinkEndChild(txBarColor);

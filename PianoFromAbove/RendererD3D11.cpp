@@ -986,6 +986,20 @@ std::wstring D3D11Renderer::GetAdapterName() {
     return L"None";
 }
 
+bool D3D11Renderer::GetAdapterVideoMemory(DWORDLONG& used, DWORDLONG& total) {
+    used = 0;
+    total = 0;
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (!m_pAdapter || FAILED(m_pAdapter.As(&adapter3)))
+        return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return false;
+    used = info.CurrentUsage;
+    total = info.Budget;
+    return true;
+}
+
 void D3D11Renderer::UploadPerFrameConstants() {
     // The shaders only declare proj + the 14 floats (120 bytes); the fMT pair
     // at the tail of RootConstants is ignored by them.
@@ -1362,24 +1376,44 @@ void D3D11Renderer::DrawPianoRollStripBackground() {
     const float stripH = max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripBottom = stripTop + stripH;
     const float fadeBottom = min((float)m_iBufferHeight, stripBottom + 40.0f);
+    const float fadeTop = max(0.0f, stripTop - 40.0f);
     const D3D11_RECT stripScissor = {
         0,
         (LONG)floor(stripTop),
         m_iBufferWidth,
         min(m_iBufferHeight, (LONG)ceil(fadeBottom)),
     };
+    const D3D11_RECT topScissor = {
+        0,
+        (LONG)floor(fadeTop),
+        m_iBufferWidth,
+        (LONG)ceil(stripTop),
+    };
 
     const BackgroundConstants backgroundConstants = {
         .fadeStart = stripBottom,
         .fadeEnd = fadeBottom,
         .fadeEnabled = 1.0f,
-        .padding = 1.0f,
+        .padding = 1.0f, // fade mode 1: alpha = smoothstep -> blur in the strip, fading out toward fade_end (bottom edge)
     };
     SetPipeline(Pipeline::Background);
     m_pContext->UpdateSubresource(m_pBackgroundConstants.Get(), 0, nullptr, &backgroundConstants, 0, 0);
     ID3D11ShaderResourceView* blurSRV = m_pBlurOutputSRV.Get();
     m_pContext->PSSetShaderResources(0, 1, &blurSRV);
     m_pContext->RSSetScissorRects(1, &stripScissor);
+    m_pContext->Draw(3, 0);
+
+    // Top-edge fade, symmetric to the bottom one: the blurred background fades
+    // out over the 40 px band above the strip.
+    const BackgroundConstants topConstants = {
+        .fadeStart = fadeTop,
+        .fadeEnd = stripTop,
+        .fadeEnabled = 1.0f,
+        .padding = 0.0f, // fade mode 0: alpha = 1 - smoothstep -> sharp above, blur fading in toward fade_start (top edge)
+    };
+    m_pContext->UpdateSubresource(m_pBackgroundConstants.Get(), 0, nullptr, &topConstants, 0, 0);
+    m_pContext->PSSetShaderResources(0, 1, &blurSRV);
+    m_pContext->RSSetScissorRects(1, &topScissor);
     m_pContext->Draw(3, 0);
     m_pContext->RSSetScissorRects(1, &m_FullScissor);
 }

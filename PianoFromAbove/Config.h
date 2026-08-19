@@ -211,6 +211,7 @@ struct VizSettings : public ISettings {
     bool bShowMarkers;
     enum MarkerEncoding { CP1252, CP932, UTF8 } eMarkerEncoding;
     bool bNerdStats;
+    bool bSysStats;
     std::wstring sSplashMIDI;
     bool bVisualizePitchBends;
     bool bDualPianoRoll;
@@ -232,6 +233,20 @@ struct VizSettings : public ISettings {
     DWORD dwRibbonBaseColor;
     bool bDumpFrames;
     int iBarColor;
+    std::wstring sFFmpegDir;
+    int iRenderWidth;
+    int iRenderHeight;
+    int iRenderFPS;
+    int iRenderFormat;      // 0=mp4 1=mov 2=avi
+    int iRenderCodec;       // 0=H.264 1=H.265
+    int iRenderPreset;      // 0..9 = ultrafast..placebo
+    int iRenderBitrateMode; // 0=constant 1=variable (CRF)
+    int iRenderBitrateKbps;
+    int iRenderCRF;
+    std::wstring sRenderOutputPath;
+    bool bRenderIncludeAudio;
+    bool bRenderAdvanced;
+    std::wstring sRenderAdvancedOptions;
     std::wstring sBackground;
     float fBGBlur;
     float fBGOpacity;
@@ -240,6 +255,8 @@ struct VizSettings : public ISettings {
     bool bDisableUI;
     float fUIScale;
     std::wstring sUIFont;
+    bool bBounceStats;
+    int iBounceNPSThreshold;
 };
 
 class Config : public ISettings

@@ -217,6 +217,8 @@
 #define ID_GRAPHICS_RESET               40171
 #define ID_VIEW_NOLIBRARYHERE           40172
 #define ID_VIEW_SETWINDOWSIZE           40173
+#define ID_FILE_RENDERVIDEO             40177
+#define ID_FILE_STOPRENDER              40178
 #define ID__UPDATE                      40174
 #define ID_UPDATE                       40175
 #define ID_UPDATE_TRACKCOLORS           40176

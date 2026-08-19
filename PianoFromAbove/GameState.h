@@ -189,12 +189,18 @@ public:
     bool m_bUseCustomAudio = false;
     wstring m_sCustomAudioPath;
 
+    // Video render: capture playback + prerendered audio into an mp4 via FFmpeg.
+    void StartVideoRender();
+    void BeginVideoRender();
+    void FinishVideoRender();
+
 protected:
     void InitColors();
     void InitState();
 
     void UpdateState(int key, const thread_work_t& work);
     void JumpTo(long long llStartTime, bool bUpdateGUI = true);
+
     void PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange);
     void ApplyMarker(unsigned char* data, size_t size);
     void AdvanceIterators( long long llTime, bool bIsJump );
@@ -225,6 +231,8 @@ protected:
 void RenderText();
     void RenderStatusLine(int line, float width, float yOffset, float rightEdge, const char* left, const char* format, ...);
     void RenderStatus(int lines);
+    void RenderSysStats();
+    float GetStatsBounceScale() const;
     void RenderMarker(const char* str);
     void RenderMessage( LPRECT prcMsg, TCHAR *sMsg );
 
@@ -293,6 +301,8 @@ void RenderText();
     vector< TrackSettings > m_vTrackSettings;
     float m_pBends[16] = {};
     deque<tuple<long long, long long>> m_dNPSNotes;
+    deque<long long> m_dNPSHistory;
+    long long m_llMaxNPS = 1;
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;
     float m_fLastBGBlur = -1.0f;
@@ -308,12 +318,20 @@ void RenderText();
     float m_fNotesX, m_fNotesY, m_fNotesCX, m_fNotesCY; // Notes position
     int m_iAllWhiteKeys; // Number of white keys are on the screen
     float m_fWhiteCX; // Width of the white keys
+    float m_fViewStartX = 0.0f; // Start position in white-key units
+    static float GetNoteCoord(int iNote); // Coordinate of note iNote in white-key units
     long long m_llRndStartTime; // Rounded start time to make stuff drop at the same time
     uint64_t m_aSkipRender[4];
     
     bool m_bDumpFrames = false;
     std::vector<unsigned char> m_vImageData;
     HANDLE m_hVideoPipe;
+
+    // Video render state (FFmpeg capture)
+    bool m_bRenderVideo = false;
+    HANDLE m_hFFPipeWrite = NULL;
+    HANDLE m_hFFProc = NULL;
+    std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
 
     // Debug assertion fail workaround
     bool m_bNextMarkerInited = false;

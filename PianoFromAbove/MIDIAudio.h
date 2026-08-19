@@ -6,6 +6,7 @@
 #include <mutex>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 #include "bassmidi/bass.h"
 #include "bassmidi/bassmidi.h"
@@ -49,6 +50,25 @@ public:
 	double m_dAttack = 1.0;
 	double m_dRelease = 0.005;
 
+	struct LoudMaxState {
+		double loudnessL = 1.0;
+		double loudnessR = 1.0;
+		double velocityL = 0.0;
+		double velocityR = 0.0;
+		bool firstChunk = true;
+
+		void Reset() {
+			loudnessL = 1.0;
+			loudnessR = 1.0;
+			velocityL = 0.0;
+			velocityR = 0.0;
+			firstChunk = true;
+		}
+	};
+
+	LoudMaxState m_liveLimiter;
+	LoudMaxState m_wavLimiter;
+
 	double m_iVelThreshLow = 0;
 	int m_iVelThreshUpp = 127;
 
@@ -57,6 +77,12 @@ public:
 	double m_dReadFraction = 0.0;
 
 	void SetReadSpeed(double dSpeed);
+
+	// LoudMax-style level processor (same math as AudioBufferStream::ReadLM).
+	// Applied by the normal playback path AND to the render's WAV capture with
+	// independent limiter states, so live audio and video rendering don't clobber each other.
+	void ApplyLoudMax(float* buffer, int frames, LoudMaxState& state);
+	void WriteWavChunk(const float* rawSrc, int frames);
 
 	double m_dBufferSeconds = 0.0;
 	double m_dPlayerTime = 0.0;
@@ -78,6 +104,13 @@ public:
 
 	bool m_bPaused = true;
 	bool m_bRequestedAudioCancel = false;
+
+	// WAV recording for the video render: while open, every chunk the read
+	// path pulls from the generator is also appended to the file (48 kHz stereo
+	// IEEE float). Started before the generator restarts, so the file starts
+	// exactly at the rendered timeline's first sample.
+	void StartWavRecording(const wchar_t* path);
+	void StopWavRecording();
 
 	friend class AudioBufferStream;
 	AudioBufferStream m_asAudioStream;
@@ -159,4 +192,7 @@ private:
 	// keeps filling with zeros - the prerender death signature.
 	QWORD m_qLastSynthPos = 0;
 	int m_iFrozenFrames = 0;
+
+	FILE* m_pWavFile = nullptr;
+	long m_lWavDataBytes = 0;
 };
