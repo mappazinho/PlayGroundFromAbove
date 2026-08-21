@@ -15,6 +15,8 @@
 #include "NoteVertexShader11.h"
 #include "BackgroundPixelShader11.h"
 #include "BackgroundVertexShader11.h"
+#include "ChunkQuadPixelShader11.h"
+#include "ChunkQuadVertexShader11.h"
 #include "BlurShader11.h"
 #include "BloomExtractShader11.h"
 #include "BloomPixelShader11.h"
@@ -155,6 +157,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     if (FAILED(res))
         return std::make_tuple(res, "CreatePixelShader (background)");
 
+    // Create image buffer chunk quad shaders
+    res = m_pDevice->CreateVertexShader(g_pChunkQuadVertexShader11, sizeof(g_pChunkQuadVertexShader11), nullptr, &m_pChunkQuadVS);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateVertexShader (chunk quad)");
+    res = m_pDevice->CreatePixelShader(g_pChunkQuadPixelShader11, sizeof(g_pChunkQuadPixelShader11), nullptr, &m_pChunkQuadPS);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreatePixelShader (chunk quad)");
+
     // Rect input layout (POSITION float2 + COLOR B8G8R8A8_UNORM)
     D3D11_INPUT_ELEMENT_DESC rect_vertex_input[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -271,6 +281,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pVignetteConstants);
     if (FAILED(res))
         return std::make_tuple(res, "CreateBuffer (vignette constants)");
+    cb_desc.ByteWidth = 128; // D3D11RootConstants layout
+    res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pChunkConstants);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBuffer (chunk constants)");
+    cb_desc.ByteWidth = 80; // proj + quadPos + quadSize
+    res = m_pDevice->CreateBuffer(&cb_desc, nullptr, &m_pChunkQuadConstants);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBuffer (chunk quad constants)");
 
     // Fixed size data buffer (t1)
     D3D11_BUFFER_DESC fixed_desc = {};
@@ -291,6 +309,16 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreateShaderResourceView(m_pFixedBuffer.Get(), &srv_desc, &m_pFixedSRV);
     if (FAILED(res))
         return std::make_tuple(res, "CreateShaderResourceView (fixed)");
+
+    // Chunk-relative fixed size data buffer (t1 during image buffer bakes)
+    res = m_pDevice->CreateBuffer(&fixed_desc, nullptr, &m_pChunkFixedBuffer);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBuffer (chunk fixed)");
+    srv_desc.BufferEx.FirstElement = 0;
+    srv_desc.BufferEx.NumElements = 1;
+    res = m_pDevice->CreateShaderResourceView(m_pChunkFixedBuffer.Get(), &srv_desc, &m_pChunkFixedSRV);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateShaderResourceView (chunk fixed)");
 
     // Track color buffer (t2)
     D3D11_BUFFER_DESC tc_desc = {};
@@ -619,6 +647,23 @@ void D3D11Renderer::ReleaseDeviceResources() {
     m_pNotePS.Reset();
     m_pBackgroundVS.Reset();
     m_pBackgroundPS.Reset();
+    m_pChunkQuadVS.Reset();
+    m_pChunkQuadPS.Reset();
+    for (unsigned i = 0; i < ChunkPoolSize; i++) {
+        m_pChunkTextures[i].Reset();
+        m_pChunkRTVs[i].Reset();
+        m_pChunkSRVs[i].Reset();
+    }
+    m_pChunkDepth.Reset();
+    m_pChunkDSV.Reset();
+    m_pChunkConstants.Reset();
+    m_pChunkFixedBuffer.Reset();
+    m_pChunkFixedSRV.Reset();
+    m_pChunkQuadConstants.Reset();
+    m_iChunkWidth = 0;
+    m_iChunkHeight = 0;
+    for (auto& entry : m_ChunkCache)
+        entry.chunk = ImageBufferInvalidChunk;
     m_pBlurCS.Reset();
     m_pBloomExtractCS.Reset();
     m_pBloomPS.Reset();
@@ -657,10 +702,12 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
+    ImageBufferBeginFrame();
 
     // Upload fixed size constants if they changed
     if (memcmp(&m_FixedConstants, &m_OldFixedConstants, sizeof(FixedSizeConstants))) {
         memcpy(&m_OldFixedConstants, &m_FixedConstants, sizeof(FixedSizeConstants));
+        ImageBufferNotifyFixedChanged();
         m_pContext->UpdateSubresource(m_pFixedBuffer.Get(), 0, nullptr, &m_FixedConstants, 0, 0);
     }
 
@@ -670,6 +717,7 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
         const size_t bytes = (m_uTrackColorsDirtyEnd - m_uTrackColorsDirtyBegin) * 16 * sizeof(TrackColor);
         m_uTrackColorsDirtyBegin = SIZE_MAX;
         m_uTrackColorsDirtyEnd = 0;
+        ImageBufferNotifyTrackColorsChanged();
         D3D11_BOX box = {
             (UINT)beginBytes, 0, 0,
             (UINT)(beginBytes + bytes), 1, 1,
@@ -723,7 +771,11 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     }
 
     D3D11_MAPPED_SUBRESOURCE note_map = {};
-    if (!m_vNotesIntermediate.empty()) {
+    if (ImageBufferCanRender() && (!m_vChunkBuilds.empty() || !m_vChunkQuads.empty())) {
+        res = RenderImageBuffer();
+        if (FAILED(res))
+            return res;
+    } else if (!m_vNotesIntermediate.empty()) {
         const size_t total = m_vNotesIntermediate.size();
         const size_t noteLimit = m_bUnlimitedNotes
             ? total
@@ -1478,6 +1530,192 @@ void D3D11Renderer::DrawPianoRollStrip() {
 
     m_RootConstants = savedRoot;
     SetPipeline(Pipeline::Note);
+}
+
+HRESULT D3D11Renderer::EnsureChunkResources(int slot, int W, int H) {
+    if (W <= 0 || H <= 0)
+        return S_OK;
+    if (m_pChunkTextures[slot]) {
+        D3D11_TEXTURE2D_DESC desc;
+        m_pChunkTextures[slot]->GetDesc(&desc);
+        if (desc.Width == (UINT)W && desc.Height == (UINT)H)
+            return S_OK;
+        m_pChunkTextures[slot].Reset();
+        m_pChunkRTVs[slot].Reset();
+        m_pChunkSRVs[slot].Reset();
+    }
+
+    D3D11_TEXTURE2D_DESC tex_desc = {};
+    tex_desc.Width = (UINT)W;
+    tex_desc.Height = (UINT)H;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = 1;
+    tex_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tex_desc.SampleDesc = { 1, 0 };
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT res = m_pDevice->CreateTexture2D(&tex_desc, nullptr, &m_pChunkTextures[slot]);
+    if (FAILED(res))
+        return res;
+    res = m_pDevice->CreateRenderTargetView(m_pChunkTextures[slot].Get(), nullptr, &m_pChunkRTVs[slot]);
+    if (FAILED(res))
+        return res;
+    res = m_pDevice->CreateShaderResourceView(m_pChunkTextures[slot].Get(), nullptr, &m_pChunkSRVs[slot]);
+    if (FAILED(res))
+        return res;
+
+    // Shared chunk depth buffer (all chunks share the same dims while cached)
+    if (!m_pChunkDepth || m_iChunkWidth != W || m_iChunkHeight != H) {
+        m_pChunkDepth.Reset();
+        m_pChunkDSV.Reset();
+        D3D11_TEXTURE2D_DESC depth_desc = {};
+        depth_desc.Width = (UINT)W;
+        depth_desc.Height = (UINT)H;
+        depth_desc.MipLevels = 1;
+        depth_desc.ArraySize = 1;
+        depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+        depth_desc.SampleDesc = { 1, 0 };
+        depth_desc.Usage = D3D11_USAGE_DEFAULT;
+        depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        res = m_pDevice->CreateTexture2D(&depth_desc, nullptr, &m_pChunkDepth);
+        if (FAILED(res))
+            return res;
+        res = m_pDevice->CreateDepthStencilView(m_pChunkDepth.Get(), nullptr, &m_pChunkDSV);
+        if (FAILED(res))
+            return res;
+        m_iChunkWidth = W;
+        m_iChunkHeight = H;
+    }
+
+    return S_OK;
+}
+
+HRESULT D3D11Renderer::RenderImageBuffer() {
+    const int W = (int)round(m_RootConstants.notes_cx);
+    const int H = (int)round(m_RootConstants.notes_cy);
+    if (W <= 0 || H <= 0)
+        return S_OK;
+
+    // Chunk-relative root constants: [0,W]x[0,H] maps to NDC, no warp.
+    D3D11RootConstants chunkRoot = {};
+    memcpy(&chunkRoot, &m_RootConstants, min(sizeof(chunkRoot), sizeof(m_RootConstants)));
+    chunkRoot.proj[0][0] = 2.0f / (float)W;  chunkRoot.proj[0][1] = 0; chunkRoot.proj[0][2] = 0; chunkRoot.proj[0][3] = 0;
+    chunkRoot.proj[1][0] = 0; chunkRoot.proj[1][1] = -2.0f / (float)H; chunkRoot.proj[1][2] = 0; chunkRoot.proj[1][3] = 0;
+    chunkRoot.proj[2][0] = 0; chunkRoot.proj[2][1] = 0; chunkRoot.proj[2][2] = 0.5f; chunkRoot.proj[2][3] = 0;
+    chunkRoot.proj[3][0] = -1; chunkRoot.proj[3][1] = 1; chunkRoot.proj[3][2] = 0.5f; chunkRoot.proj[3][3] = 1;
+    chunkRoot.notes_y = 0;
+    chunkRoot.notes_cy = (float)H;
+    chunkRoot.notes_x = 0;
+    chunkRoot.notes_cx = (float)W;
+    chunkRoot.stripMode = 0;
+    chunkRoot.fWarp = 0;
+    chunkRoot.fWarpTime = 0;
+    chunkRoot.fWarpSeedX = 0;
+    chunkRoot.fWarpSeedY = 0;
+
+    FixedSizeConstants chunkFixed;
+    ImageBufferBuildChunkFixed(chunkFixed);
+
+    for (const auto& req : m_vChunkBuilds) {
+        if (ImageBufferGetChunkSlot(req.chunk) >= 0)
+            continue; // already baked this frame
+
+        const int slot = ImageBufferAllocateSlot();
+        if (slot < 0)
+            break; // pool exhausted; drop the rest
+
+        HRESULT res = EnsureChunkResources(slot, W, H);
+        if (FAILED(res))
+            return res;
+
+        m_pContext->OMSetRenderTargets(1, m_pChunkRTVs[slot].GetAddressOf(), m_pChunkDSV.Get());
+        D3D11_VIEWPORT chunk_viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+        m_pContext->RSSetViewports(1, &chunk_viewport);
+        D3D11_RECT chunk_scissor = { 0, 0, W, H };
+        m_pContext->RSSetScissorRects(1, &chunk_scissor);
+
+        float clear_color[4] = { 0, 0, 0, 1 }; // alpha 1 = transparent under the inverted blend
+        m_pContext->ClearRenderTargetView(m_pChunkRTVs[slot].Get(), clear_color);
+        m_pContext->ClearDepthStencilView(m_pChunkDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+        SetPipeline(Pipeline::Note);
+        m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &chunkRoot, 0, 0);
+        m_pContext->UpdateSubresource(m_pChunkFixedBuffer.Get(), 0, nullptr, &chunkFixed, 0, 0);
+        m_pContext->VSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());
+        m_pContext->PSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());
+
+        // Chunk notes go into [0, count) of the note buffer (free in image buffer mode)
+        if (req.noteCount > 0) {
+            D3D11_MAPPED_SUBRESOURCE note_map = {};
+            res = m_pContext->Map(m_pNoteBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &note_map);
+            if (FAILED(res))
+                return res;
+            memcpy(note_map.pData, &m_vChunkNotes[req.noteOffset], (size_t)req.noteCount * sizeof(NoteData));
+            m_pContext->Unmap(m_pNoteBuffer.Get(), 0);
+
+            ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pChunkFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pNoteSRV.Get() };
+            m_pContext->VSSetShaderResources(0, 4, bindSRVs);
+            m_pContext->DrawIndexed((UINT)req.noteCount * 6, 0, 0);
+        }
+
+        ImageBufferMarkBaked(slot, req.chunk);
+    }
+
+    // Restore the main render target / viewport / scissor
+    m_pContext->OMSetRenderTargets(1, m_pRTVs[m_uFrameIndex].GetAddressOf(), m_pDSV.Get());
+    m_pContext->RSSetViewports(1, &m_Viewport);
+    m_pContext->RSSetScissorRects(1, &m_FullScissor);
+
+    // Draw the chunk quads
+    if (!m_vChunkQuads.empty()) {
+        struct ChunkQuadConstants {
+            float proj[4][4];
+            float quadPos[2];
+            float quadSize[2];
+        };
+        ChunkQuadConstants quadConstants = {};
+        memcpy(quadConstants.proj, m_RootConstants.proj, sizeof(quadConstants.proj));
+
+        const float notesX = m_RootConstants.notes_x;
+        const float notesY = m_RootConstants.notes_y;
+        const float notesCX = m_RootConstants.notes_cx;
+        const float notesCY = m_RootConstants.notes_cy;
+        const D3D11_RECT notes_scissor = {
+            (LONG)round(notesX), (LONG)round(notesY),
+            (LONG)round(notesX + notesCX), (LONG)round(notesY + notesCY),
+        };
+
+        m_pContext->VSSetShader(m_pChunkQuadVS.Get(), nullptr, 0);
+        m_pContext->PSSetShader(m_pChunkQuadPS.Get(), nullptr, 0);
+        m_pContext->IASetInputLayout(nullptr);
+        m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_pContext->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+        m_pContext->IASetIndexBuffer(m_pIndexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+        m_pContext->RSSetState(m_pRasterizer.Get());
+        m_pContext->OMSetBlendState(m_pBlendInverted.Get(), nullptr, 0xFFFFFFFF);
+        m_pContext->OMSetDepthStencilState(m_pDepthDisabled.Get(), 0);
+        m_pContext->VSSetConstantBuffers(0, 1, m_pChunkQuadConstants.GetAddressOf());
+
+        for (const auto& quad : m_vChunkQuads) {
+            const int slot = ImageBufferGetChunkSlot(quad.chunk);
+            if (slot < 0)
+                continue; // not baked this frame (shouldn't happen)
+            quadConstants.quadPos[0] = notesX;
+            quadConstants.quadPos[1] = quad.yTop;
+            quadConstants.quadSize[0] = notesCX;
+            quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+            m_pContext->RSSetScissorRects(1, &notes_scissor);
+            m_pContext->UpdateSubresource(m_pChunkQuadConstants.Get(), 0, nullptr, &quadConstants, 0, 0);
+            m_pContext->PSSetShaderResources(0, 1, m_pChunkSRVs[slot].GetAddressOf());
+            m_pContext->DrawIndexed(6, 0, 0);
+        }
+
+        // Restore bindings for any later pass that relies on the defaults
+        m_pContext->VSSetConstantBuffers(0, 1, m_pPerFrameConstants.GetAddressOf());
+        m_pContext->PSSetShaderResources(0, 1, nullptr);
+    }
+
+    return S_OK;
 }
 
 void D3D11Renderer::ImGuiBackendNewFrame() {

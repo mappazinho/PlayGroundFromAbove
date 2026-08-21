@@ -11,12 +11,17 @@
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <Shlobj.h>
+#include <psapi.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <ctime>
 #include <shlwapi.h>
 #include <winhttp.h>
 #include <regex>
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #include "MainProcs.h"
 #include "Globals.h"
@@ -27,6 +32,7 @@
 #include "Renderer.h"
 #include "Misc.h"
 #include "MIDIPreRenderPlayer.h"
+#include "EmbeddedDLL.h"
 
 // Yes, I know you shouldn't store build numbers as doubles
 constexpr double BUILD_VERSION = 20240112;
@@ -124,14 +130,60 @@ static int WriteCrashLog(EXCEPTION_POINTERS* ep) {
         }
     }
 
-    wchar_t msg[12288];
+    {
+        wchar_t ctxStack[8192] = L"";
+        size_t ctxLen = 0;
+        CONTEXT walkCtx = *ctx;
+        STACKFRAME64 sf = {};
+        sf.AddrPC.Offset = walkCtx.Rip;
+        sf.AddrPC.Mode = AddrModeFlat;
+        sf.AddrStack.Offset = walkCtx.Rsp;
+        sf.AddrStack.Mode = AddrModeFlat;
+        sf.AddrFrame.Offset = walkCtx.Rbp;
+        sf.AddrFrame.Mode = AddrModeFlat;
+        for (int i = 0; i < 40 && ctxLen < _countof(ctxStack) - 128; i++)
+        {
+            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(),
+                             &sf, &walkCtx, NULL, NULL, NULL, NULL))
+                break;
+            if (sf.AddrPC.Offset == 0) break;
+            HMODULE hFrameMod = NULL;
+            wchar_t fname[MAX_PATH] = L"";
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)sf.AddrPC.Offset, &hFrameMod))
+            {
+                wchar_t fp[MAX_PATH] = L"";
+                GetModuleFileNameW(hFrameMod, fp, MAX_PATH);
+                wchar_t* fs = wcsrchr(fp, L'\\');
+                if (fs) wmemmove(fname, fs + 1, wcslen(fs + 1) + 1);
+                ctxLen += _snwprintf_s(ctxStack + ctxLen, _countof(ctxStack) - ctxLen, _TRUNCATE,
+                    L"  0x%016llX  %s+0x%llX\n",
+                    (unsigned long long)sf.AddrPC.Offset, fname,
+                    (unsigned long long)sf.AddrPC.Offset - (unsigned long long)(DWORD_PTR)hFrameMod);
+            }
+            else
+            {
+                ctxLen += _snwprintf_s(ctxStack + ctxLen, _countof(ctxStack) - ctxLen, _TRUNCATE,
+                    L"  0x%016llX  <unknown module>\n", (unsigned long long)sf.AddrPC.Offset);
+            }
+        }
+        if (ctxLen > 0)
+        {
+            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
+                L"\nFaulting thread stack (from context):\n%ls", ctxStack);
+        }
+    }
+
+    wchar_t msg[65536];
     _snwprintf_s(msg, _countof(msg), _TRUNCATE,
         L"PlayGroundFromAbove has crashed.\n\n"
         L"Exception:  0x%08X  (%s)\n"
         L"Address:    0x%016llX\n"
         L"Module:     %s\n"
         L"Module Base: 0x%016llX\n"
-        L"Fault Offset: 0x%08llX\n\n"
+        L"Fault Offset: 0x%08llX\n"
+        L"Thread:     %lu\n\n"
         L"Registers:\n"
         L"  RAX=%016llX  RBX=%016llX\n"
         L"  RCX=%016llX  RDX=%016llX\n"
@@ -140,13 +192,14 @@ static int WriteCrashLog(EXCEPTION_POINTERS* ep) {
         L"  RIP=%016llX  EFLAGS=%08X\n\n"
         L"Call stack:\n"
         L"%s"
-        L"\nAbort = Quit, Ignore = Try to continue.",
+        L"\nLoaded modules:\n",
         er->ExceptionCode,
         ExceptionCodeString(er->ExceptionCode),
         (unsigned long long)ctx->Rip,
         modulePath,
         llModBase,
         llFaultOffset,
+        GetCurrentThreadId(),
         (unsigned long long)ctx->Rax,
         (unsigned long long)ctx->Rbx,
         (unsigned long long)ctx->Rcx,
@@ -158,6 +211,34 @@ static int WriteCrashLog(EXCEPTION_POINTERS* ep) {
         (unsigned long long)ctx->Rip,
         ctx->EFlags,
         stackBuf);
+
+    {
+        size_t len = wcslen(msg);
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery((LPCVOID)ctx->Rip, &mbi, sizeof(mbi)))
+        {
+            len += _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE,
+                L"\nRIP region: Base=0x%016llX Size=0x%llX State=0x%X Protect=0x%X Type=0x%X\n",
+                (unsigned long long)(DWORD_PTR)mbi.BaseAddress,
+                (unsigned long long)mbi.RegionSize, (unsigned)mbi.State,
+                (unsigned)mbi.Protect, (unsigned)mbi.Type);
+        }
+        HMODULE hMods[256];
+        DWORD cbNeeded = 0;
+        if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded))
+        {
+            DWORD n = cbNeeded / sizeof(HMODULE);
+            if (n > 256) n = 256;
+            for (DWORD i = 0; i < n && len < _countof(msg) - 600; i++)
+            {
+                wchar_t mpath[MAX_PATH] = L"";
+                GetModuleFileNameW(hMods[i], mpath, MAX_PATH);
+                len += _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE,
+                    L"  0x%016llX  %ls\n", (unsigned long long)(DWORD_PTR)hMods[i], mpath);
+            }
+        }
+        _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE, L"\nAbort = Quit, Ignore = Try to continue.");
+    }
 
     wchar_t logPath[MAX_PATH];
     if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
@@ -301,52 +382,9 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
     return 0;
 }
 
-// Runtime DLLs and config (SDL2/BASS) live in %APPDATA%\PlayGroundFromAbove rather
-// than next to the exe. The DLLs are delay-loaded, so on first launch we migrate
-// any copies found beside the exe into that folder and load them from there.
-static bool EnsureAppDataRuntime()
-{
-    wchar_t szAppData[MAX_PATH] = {};
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, szAppData)))
-        return false;
-
-    std::wstring dir = std::wstring(szAppData) + L"\\" L"PlayGroundFromAbove";
-    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES)
-        if (!CreateDirectoryW(dir.c_str(), NULL))
-            return false;
-
-    static const wchar_t* const s_runtimeDLLs[] = { L"SDL2.dll", L"bass.dll", L"bassmidi.dll" };
-
-    wchar_t szExe[MAX_PATH] = {};
-    GetModuleFileNameW(NULL, szExe, MAX_PATH);
-    std::wstring exeDir(szExe);
-    size_t lastSlash = exeDir.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos)
-        exeDir.resize(lastSlash + 1);
-    else
-        exeDir.clear();
-
-    for (const wchar_t* dll : s_runtimeDLLs) {
-        std::wstring dst = dir + L"\\" + dll;
-        if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            std::wstring src = exeDir + dll;
-            if (GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES)
-                CopyFileW(src.c_str(), dst.c_str(), FALSE);
-        }
-        if (!LoadLibraryW(dst.c_str())) {
-            wchar_t msg[1024];
-            _snwprintf_s(msg, _TRUNCATE, L"Failed to load %ls from:\n%ls\n\nError %u",
-                         dll, dst.c_str(), (unsigned)GetLastError());
-            MessageBoxW(NULL, msg, L"PlayGroundFromAbove - Missing Runtime", MB_OK | MB_ICONERROR);
-            return false;
-        }
-    }
-    return true;
-}
-
 INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdShow )
 {
-    if (!EnsureAppDataRuntime())
+    if (!InitEmbeddedDLLs(hInstance))
         return 1;
 
     AddVectoredExceptionHandler(1, VectoredCrashHandler);
@@ -440,17 +478,46 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
 
     if ( lpszCmdLine && lpszCmdLine[0] )
     {
-        int iLen = MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, NULL, 0 );
-        if ( iLen > 1 )
+        // Tokenize the command line (quotes respected)
+        std::vector<std::wstring> tokens;
         {
-            std::wstring wsPath( (size_t)iLen, L'\0' );
-            MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, &wsPath[0], iLen );
-            wsPath.resize( wsPath.size() - 1 ); // drop the trailing NUL
-            while ( !wsPath.empty() && ( wsPath.front() == L'"' || wsPath.front() == L' ' ) )
-                wsPath.erase( wsPath.begin() );
-            while ( !wsPath.empty() && ( wsPath.back() == L'"' || wsPath.back() == L' ' ) )
-                wsPath.pop_back();
-            PlayFile( wsPath, false );
+            std::wstring cmdLine( (size_t)MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, NULL, 0 ), L'\0' );
+            MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, &cmdLine[0], (int)cmdLine.size() );
+            cmdLine.resize( cmdLine.size() - 1 );
+            bool inQuotes = false;
+            std::wstring cur;
+            for ( wchar_t c : cmdLine )
+            {
+                if ( c == L'"' ) { inQuotes = !inQuotes; continue; }
+                if ( c == L' ' && !inQuotes ) { if ( !cur.empty() ) { tokens.push_back( cur ); cur.clear(); } }
+                else cur += c;
+            }
+            if ( !cur.empty() ) tokens.push_back( cur );
+        }
+
+        if ( tokens.size() >= 4 && tokens[0] == L"-repro" )
+        {
+            // -repro "<midiA>" "<audio>" "<midiB>" [delaySecs]
+            g_bReproCustomAudio = true;
+            g_sReproCustomAudioPath = tokens[2];
+            double delaySecs = ( tokens.size() >= 5 ) ? wcstod( tokens[4].c_str(), NULL ) : 2.0;
+            PRE_DbgLog( "REPRO: open A='%ls' audio='%ls' B='%ls' delay=%g",
+                        tokens[1].c_str(), tokens[2].c_str(), tokens[3].c_str(), delaySecs );
+            PlayFile( tokens[1], true );
+            // After the delay, open song B plainly (WM_REPRO_OPEN handler).
+            struct ReproDelayArgs { double secs; std::wstring* path; };
+            ReproDelayArgs* pArgs = new ReproDelayArgs{ delaySecs, new std::wstring( tokens[3] ) };
+            CreateThread( NULL, 0, []( LPVOID p ) -> DWORD {
+                ReproDelayArgs* a = (ReproDelayArgs*)p;
+                Sleep( (DWORD)( a->secs * 1000.0 ) );
+                PostMessage( g_hWnd, WM_REPRO_OPEN, 0, (LPARAM)a->path );
+                delete a;
+                return 0;
+            }, pArgs, 0, NULL );
+        }
+        else if ( !tokens.empty() )
+        {
+            PlayFile( tokens[0], false );
         }
     }
 
@@ -473,6 +540,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
 
     UnregisterClass( CLASSNAME, wc.hInstance );
     CoUninitialize();
+    FreeEmbeddedDLLs();
     return 0;
 }
 

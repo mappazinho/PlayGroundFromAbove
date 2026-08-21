@@ -452,7 +452,7 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 	{
 		g_bGenDead = true;
 		PRE_DbgLog("GEN abort: stream create failed, no audio this pass");
-		bass->~BASSMIDI();
+		delete bass;
 		return;
 	}
 	int dBgSent = 0;
@@ -680,7 +680,7 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 		std::chrono::duration<double, std::milli>(clock_t::now() - tGenStart).count(),
 		iDensPeak, dDensPeakT);
 
-	bass->~BASSMIDI();
+	delete bass;
 }
 
 void MIDIAudio::KillLastGenerator()

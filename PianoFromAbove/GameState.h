@@ -193,6 +193,7 @@ public:
     void StartVideoRender();
     void BeginVideoRender();
     void FinishVideoRender();
+    void RestoreMainWindowAfterRender();
 
 protected:
     void InitColors();
@@ -224,6 +225,8 @@ protected:
     void RenderNote(MIDIChannelEvent pNote);
     void RenderPianoRollStripNote(MIDIChannelEvent pNote);
     virtual NoteData BuildRenderNoteData(MIDIChannelEvent pNote) const;
+    void RenderNotesImageBuffer();
+    NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
     void GenNoteXTable();
     float GetNoteX( int iNote );
     void RenderKeys();
@@ -332,6 +335,15 @@ void RenderText();
     HANDLE m_hFFPipeWrite = NULL;
     HANDLE m_hFFProc = NULL;
     std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
+    // BeginVideoRender is deferred to the top of Logic() (the click happens
+    // inside Logic's ImGui pass), and the swapchain resize itself goes through
+    // the main window's WM_SIZE -> drain -> ResetDevice path (the same one
+    // maximize/restore uses): the window is resized to the render resolution
+    // first, so the swapchain always matches its window. Forcing ResizeBuffers
+    // to a size that doesn't match the window hung the driver (TDR).
+    bool m_bRenderPending = false;
+    bool m_bRenderMainRectSaved = false;
+    RECT m_rcRenderMainSaved = {};
 
     // Debug assertion fail workaround
     bool m_bNextMarkerInited = false;

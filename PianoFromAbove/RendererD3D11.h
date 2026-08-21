@@ -98,6 +98,22 @@ private:
     ComPtr<ID3D11PixelShader> m_pBloomPS;
     ComPtr<ID3D11PixelShader> m_pVignettePS;
 
+    // Image buffer (pre-rendered note chunks)
+    ComPtr<ID3D11Texture2D> m_pChunkTextures[ChunkPoolSize];
+    ComPtr<ID3D11RenderTargetView> m_pChunkRTVs[ChunkPoolSize];
+    ComPtr<ID3D11ShaderResourceView> m_pChunkSRVs[ChunkPoolSize];
+    ComPtr<ID3D11Texture2D> m_pChunkDepth;
+    ComPtr<ID3D11DepthStencilView> m_pChunkDSV;
+    int m_iChunkWidth = 0, m_iChunkHeight = 0;
+    ComPtr<ID3D11VertexShader> m_pChunkQuadVS;
+    ComPtr<ID3D11PixelShader> m_pChunkQuadPS;
+    ComPtr<ID3D11Buffer> m_pChunkConstants;     // b0 during chunk bake (D3D11RootConstants layout)
+    ComPtr<ID3D11Buffer> m_pChunkFixedBuffer;   // chunk-relative fixed constants (t1 during bake)
+    ComPtr<ID3D11ShaderResourceView> m_pChunkFixedSRV;
+    ComPtr<ID3D11Buffer> m_pChunkQuadConstants; // b0 during chunk quad pass (proj + quadPos + quadSize)
+    HRESULT EnsureChunkResources(int slot, int W, int H);
+    HRESULT RenderImageBuffer();
+
     ComPtr<ID3D11InputLayout> m_pRectInputLayout;
     ComPtr<ID3D11Buffer> m_pIndexBuffer;
 

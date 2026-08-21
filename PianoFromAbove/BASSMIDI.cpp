@@ -5,9 +5,11 @@
 #include <sstream>
 
 static WAVEFORMATEX m_wfWaveFormatStatic = WAVEFORMATEX{};
-static BASS_MIDI_FONTEX* m_bmFontArr = (BASS_MIDI_FONTEX*)malloc(sizeof(BASS_MIDI_FONTEX));
+static BASS_MIDI_FONTEX* m_bmFontArr = nullptr;
 static std::mutex sfLock;
 static std::mutex m_bmMutex;
+
+extern bool g_bReproCustomAudio;
 
 void BASSMIDI::InitBASS(WAVEFORMATEX format) {
 	m_wfWaveFormatStatic = format;
@@ -25,7 +27,7 @@ BASSMIDI::BASSMIDI(int voices, bool nofx = true) {
 		0x800000,
 		m_wfWaveFormatStatic.nSamplesPerSec);
 
-	if (m_hsHandle == -1)
+	if (m_hsHandle == -1 || m_hsHandle == 0)
 	{
 		int err = BASS_ErrorGetCode();
 		PRE_DbgLog("STREAMCREATE failed err=%d", err);
@@ -41,7 +43,8 @@ BASSMIDI::BASSMIDI(int voices, bool nofx = true) {
 
 	{
 		sfLock.lock();
-		BASS_MIDI_StreamSetFonts(m_hsHandle, m_bmFontArr, 1);
+		if (m_bmFontArr != NULL && m_bmFontArr[0].font != 0)
+			BASS_MIDI_StreamSetFonts(m_hsHandle, m_bmFontArr, 1);
 		sfLock.unlock();
 	}
 	
@@ -145,10 +148,63 @@ void BASSMIDI::FreeSoundfont()
 {
 	if (m_bmFontArr != NULL)
 	{
-		BASS_MIDI_FontFree((*m_bmFontArr).font);
-		free(m_bmFontArr); // i forgot this for the entire lifetime of this mod. damn
+		if (m_bmFontArr[0].font != 0)
+			BASS_MIDI_FontFree(m_bmFontArr[0].font);
+		free(m_bmFontArr);
 		m_bmFontArr = NULL;
 	}
+}
+
+// ---- memory-backed soundfont loading ----------------------------------------
+// Some bass.dll builds in the wild cannot open files by path (BASS_ERROR_FILEOPEN
+// from BASS_MIDI_FontInit / BASS_StreamCreateFile even for valid files). Loading
+// the sf2 into memory and handing it to BASS via BASS_MIDI_FontInitUser sidesteps
+// that entirely and is identical in behaviour for BASSMIDI synthesis.
+struct SfMemState { const unsigned char* p; QWORD len; QWORD pos; };
+static SfMemState g_sfMem;
+
+static void CALLBACK SfMemClose(void* user) { (void)user; g_sfMem.pos = 0; }
+static QWORD CALLBACK SfMemLen(void* user) { (void)user; return g_sfMem.len; }
+static DWORD CALLBACK SfMemRead(void* buffer, DWORD length, void* user)
+{
+	(void)user;
+	QWORD avail = g_sfMem.len - g_sfMem.pos;
+	DWORD n = (DWORD)((avail < (QWORD)length) ? avail : (QWORD)length);
+	if (n) { memcpy(buffer, g_sfMem.p + g_sfMem.pos, n); g_sfMem.pos += n; }
+	return n;
+}
+static BOOL CALLBACK SfMemSeek(QWORD offset, void* user)
+{
+	(void)user;
+	if (offset > g_sfMem.len) return FALSE;
+	g_sfMem.pos = offset;
+	return TRUE;
+}
+
+static HSOUNDFONT LoadSoundfontMem(const std::wstring& path)
+{
+	HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) return 0;
+	LARGE_INTEGER liSize = {};
+	GetFileSizeEx(hFile, &liSize);
+	if (liSize.QuadPart <= 0 || liSize.QuadPart > (LONGLONG)0x7FFFFFFF) { CloseHandle(hFile); return 0; }
+	unsigned char* pBuf = (unsigned char*)malloc((size_t)liSize.QuadPart);
+	if (!pBuf) { CloseHandle(hFile); return 0; }
+	DWORD dwRead = 0;
+	BOOL bOk = ReadFile(hFile, pBuf, (DWORD)liSize.QuadPart, &dwRead, NULL);
+	CloseHandle(hFile);
+	if (!bOk || dwRead != (DWORD)liSize.QuadPart) { free(pBuf); return 0; }
+
+	g_sfMem.p = pBuf;
+	g_sfMem.len = liSize.QuadPart;
+	g_sfMem.pos = 0;
+	BASS_FILEPROCS procs = { SfMemClose, SfMemLen, SfMemRead, SfMemSeek };
+	HSOUNDFONT font = BASS_MIDI_FontInitUser(&procs, NULL, 0);
+	if (font == 0) free(pBuf);
+	// BASS keeps the font data alive via the procs until FontFree; the buffer is
+	// intentionally leaked (tiny: <1KB) rather than freed while BASS may still
+	// touch it during teardown races.
+	return font;
 }
 
 void BASSMIDI::LoadSoundfont(const wchar_t* path)
@@ -157,16 +213,17 @@ void BASSMIDI::LoadSoundfont(const wchar_t* path)
 	{
 		sfLock.lock();
 		FreeSoundfont();
-		BASS_MIDI_FONTEX* fonts = (BASS_MIDI_FONTEX*)malloc(sizeof(BASS_MIDI_FONTEX));
-
 		HSOUNDFONT font = 0;
 		if (!resolvedPath.empty())
 		{
 			font = BASS_MIDI_FontInit(resolvedPath.c_str(), 0);
+			if (font == 0)
+				font = LoadSoundfontMem(resolvedPath);
 		}
 
 		if (font != 0)
 		{
+			BASS_MIDI_FONTEX* fonts = (BASS_MIDI_FONTEX*)calloc(1, sizeof(BASS_MIDI_FONTEX));
 			fonts[0].font = font;
 			fonts[0].spreset = -1;
 			fonts[0].sbank = -1;
@@ -175,9 +232,11 @@ void BASSMIDI::LoadSoundfont(const wchar_t* path)
 			fonts[0].dbanklsb = 0;
 
 			BASS_MIDI_FontLoad(font, -1, -1);
+			m_bmFontArr = fonts;
 		}
 		else
 		{
+			m_bmFontArr = NULL;
 			if (!resolvedPath.empty())
 			{
 				std::wstringstream err;
@@ -185,8 +244,6 @@ void BASSMIDI::LoadSoundfont(const wchar_t* path)
 				MessageBoxW(NULL, err.str().c_str(), L"Soundfont Load Error", MB_ICONWARNING);
 			}
 		}
-
-		m_bmFontArr = fonts;
 		sfLock.unlock();
 	}
 }

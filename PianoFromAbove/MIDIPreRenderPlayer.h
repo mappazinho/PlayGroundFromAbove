@@ -23,7 +23,10 @@ extern void PRE_Reset();
 // SDL audio callback.
 extern void PRE_FillAudio(void* udata, Uint8* stream, int len);
 
-// True when the SDL audio callback hasn't fired for >2s (device stalled: the whole
+// Updates the watchdog timestamp so paused/unstarted audio does not trigger false stall detections.
+extern void PRE_TouchAudio();
+
+// True when the SDL audio callback hasn't fired for >2.5s while active (device stalled: the whole
 // process keeps running but no sound is produced). Poll from the game thread only.
 extern bool PRE_AudioStalled();
 

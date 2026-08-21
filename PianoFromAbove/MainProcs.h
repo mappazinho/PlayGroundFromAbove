@@ -41,3 +41,10 @@ VOID SetPlayMode( INT ePlayMode );
 VOID SetPlayPauseStop( BOOL bPlay, BOOL bPause, BOOL bStop );
 BOOL PlayFile( const wstring &sFile, bool bCustomSettings = false );
 VOID CheckActivity( BOOL bIsActive, POINT *ptNew = NULL, BOOL bToggleEnable = false );
+
+// Test hook (crash repro driver): -repro "<midiA>" "<audio>" "<midiB>" [delaySecs]
+// on the command line opens song A with custom audio, then plain-opens song B
+// while A plays. Inert unless the switch is used.
+extern bool g_bReproCustomAudio;
+extern std::wstring g_sReproCustomAudioPath;
+#define WM_REPRO_OPEN (WM_APP + 0x203)

@@ -260,6 +260,7 @@ void VizSettings::LoadDefaultValues() {
     this->sUIFont = L"";
     this->bBounceStats = false;
     this->iBounceNPSThreshold = 90;
+    this->bImageBufferNotes = false;
     this->sFFmpegDir = L"";
     this->iRenderWidth = 1920;
     this->iRenderHeight = 1080;
@@ -272,6 +273,7 @@ void VizSettings::LoadDefaultValues() {
     this->iRenderCRF = 18;
     this->sRenderOutputPath = L"";
     this->bRenderIncludeAudio = true;
+    this->bRenderShowPreview = true;
     this->bRenderAdvanced = false;
     this->sRenderAdvancedOptions = L"";
 }
@@ -560,6 +562,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bBounceStats = (iAttrVal != 0);
     txViz->QueryIntAttribute("BounceNPSThreshold", &iBounceNPSThreshold);
     iBounceNPSThreshold = max(0, min(iBounceNPSThreshold, 100));
+    if (txViz->QueryIntAttribute("ImageBufferNotes", &iAttrVal) == TIXML_SUCCESS)
+        bImageBufferNotes = (iAttrVal != 0);
     sTempStr = "";
     txViz->QueryStringAttribute("FFmpegDir", &sTempStr);
     sFFmpegDir = Util::StringToWstring(sTempStr);
@@ -586,6 +590,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     sRenderOutputPath = Util::StringToWstring(sTempStr);
     if (txViz->QueryIntAttribute("RenderIncludeAudio", &iAttrVal) == TIXML_SUCCESS)
         bRenderIncludeAudio = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("RenderShowPreview", &iAttrVal) == TIXML_SUCCESS)
+        bRenderShowPreview = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("RenderAdvanced", &iAttrVal) == TIXML_SUCCESS)
         bRenderAdvanced = (iAttrVal != 0);
     sTempStr = "";
@@ -768,6 +774,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));
     txViz->SetAttribute("BounceStats", bBounceStats);
     txViz->SetAttribute("BounceNPSThreshold", iBounceNPSThreshold);
+    txViz->SetAttribute("ImageBufferNotes", bImageBufferNotes);
     if (sFFmpegDir.length() > 0)
         txViz->SetAttribute("FFmpegDir", Util::WstringToString(sFFmpegDir));
     txViz->SetAttribute("RenderWidth", iRenderWidth);
@@ -782,6 +789,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     if (sRenderOutputPath.length() > 0)
         txViz->SetAttribute("RenderOutputPath", Util::WstringToString(sRenderOutputPath));
     txViz->SetAttribute("RenderIncludeAudio", bRenderIncludeAudio);
+    txViz->SetAttribute("RenderShowPreview", bRenderShowPreview);
     txViz->SetAttribute("RenderAdvanced", bRenderAdvanced);
     if (sRenderAdvancedOptions.length() > 0)
         txViz->SetAttribute("RenderAdvancedOptions", Util::WstringToString(sRenderAdvancedOptions));

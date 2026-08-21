@@ -137,9 +137,12 @@ public:
 	MIDIAudio(int bufferLength);
 	~MIDIAudio()
 	{
-		//Stop();
 		KillLastGenerator();
-		delete &m_asAudioStream;
+		if (m_fAudioBuffer)
+		{
+			free(m_fAudioBuffer);
+			m_fAudioBuffer = nullptr;
+		}
 	}
 
 	void Start(double time, std::vector<MIDIChannelEvent>* events, double speed, int start = 0);

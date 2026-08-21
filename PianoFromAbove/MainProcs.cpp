@@ -42,6 +42,12 @@ bool g_bBootedFallback = false;
 bool g_bForceWARP = false;
 const wchar_t* g_pwszRenderMode = L"DirectX 12";
 
+// ---- Test hook (crash repro driver) ----------------------------------------
+// `-repro "<midiA>" "<audio>" "<midiB>" [delaySecs]` automates: open song A
+// with custom audio, then plain-open song B while A plays. Inert unless used.
+bool g_bReproCustomAudio = false;
+std::wstring g_sReproCustomAudioPath;
+
 // ---- Render progress window -------------------------------------------------
 // A plain Win32 popup that shows the render progress, output size, and render
 // speed while a video render runs. It is a separate top-level window, so it is
@@ -199,6 +205,16 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
         case WM_RENDERPROG_DESTROY:
             DestroyRenderProgressWindow();
             return 0;
+        case WM_REPRO_OPEN:
+        {
+            std::wstring* pPath = (std::wstring*)lParam;
+            if (pPath)
+            {
+                PlayFile(*pPath, false);
+                delete pPath;
+            }
+            return 0;
+        }
         case WM_COMMAND:
         {
             int iId = LOWORD( wParam );
@@ -629,7 +645,17 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
 
     if ( bCustomSettings )
     {
-        if (!GetCustomSettings(pGameState))
+        if (g_bReproCustomAudio && !g_sReproCustomAudioPath.empty())
+        {
+            pGameState->SetChannelSettings(
+                vector< bool >(),
+                vector< bool >(),
+                vector< unsigned >( cVisual.colors, cVisual.colors + sizeof( cVisual.colors ) / sizeof( cVisual.colors[0] ) ) );
+            pGameState->m_bUseCustomAudio = true;
+            pGameState->m_sCustomAudioPath = g_sReproCustomAudioPath;
+            PRE_DbgLog("PlayFile: REPRO custom audio path '%ls'", g_sReproCustomAudioPath.c_str());
+        }
+        else if (!GetCustomSettings(pGameState))
         {
             PRE_DbgLog("PlayFile: custom dialog cancelled");
             g_bShowLoading = false;

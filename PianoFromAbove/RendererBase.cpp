@@ -281,6 +281,122 @@ HRESULT Renderer::SetLimitFPS(bool bLimitFPS) {
     return S_OK;
 }
 
+// --- Image buffer (pre-rendered note chunks) --------------------------------
+
+void Renderer::ImageBufferBeginFrame() {
+    m_vChunkNotes.clear();
+    m_vChunkBuilds.clear();
+    m_vChunkQuads.clear();
+    m_uImageBufferFrame++;
+
+    m_bImageBufferCanRender = false;
+    // Warp moves every vertex every frame; the baked chunks would be stale.
+    if (m_RootConstants.fWarp > 0.0f)
+        return;
+
+    ChunkCacheKey key = {};
+    key.width = m_iBufferWidth;
+    key.height = m_iBufferHeight;
+    key.deflate = m_RootConstants.deflate;
+    key.notes_y = m_RootConstants.notes_y;
+    key.notes_cy = m_RootConstants.notes_cy;
+    key.white_cx = m_RootConstants.white_cx;
+    key.timespan = m_RootConstants.timespan;
+    key.stripTimeSpan = m_RootConstants.stripTimeSpan;
+    key.fWarp = m_RootConstants.fWarp;
+    key.fWarpSeedX = m_RootConstants.fWarpSeedX;
+    key.fWarpSeedY = m_RootConstants.fWarpSeedY;
+    key.notes_x = m_RootConstants.notes_x;
+    key.notes_cx = m_RootConstants.notes_cx;
+    key.fMT = m_RootConstants.fMT;
+    key.fMTTilt = m_RootConstants.fMTTilt;
+    key.corruption = m_fCorruption;
+    key.eventCount = m_ullImageBufferEventCount;
+    key.fixedStamp = m_uImageBufferFixedStamp;
+    key.trackColorStamp = m_uImageBufferTrackColorStamp;
+
+    if (!(key == m_ImageBufferKey)) {
+        // Any key change (view, song state, constants, corruption amount, ...)
+        // invalidates every cached chunk.
+        for (auto& entry : m_ChunkCache)
+            entry.chunk = ImageBufferInvalidChunk;
+        m_ImageBufferKey = key;
+    }
+    m_bImageBufferCanRender = true;
+}
+
+int Renderer::ImageBufferGetChunkSlot(long long chunk) const {
+    for (unsigned i = 0; i < ChunkPoolSize; i++)
+        if (m_ChunkCache[i].chunk == chunk)
+            return (int)i;
+    return -1;
+}
+
+int Renderer::ImageBufferAllocateSlot() {
+    int slot = -1;
+    for (unsigned i = 0; i < ChunkPoolSize; i++)
+        if (m_ChunkCache[i].chunk == ImageBufferInvalidChunk) {
+            slot = (int)i;
+            break;
+        }
+    if (slot < 0) {
+        // LRU eviction
+        unsigned oldest = UINT_MAX;
+        for (unsigned i = 0; i < ChunkPoolSize; i++)
+            if (m_ChunkCache[i].lastUsed < oldest) {
+                oldest = m_ChunkCache[i].lastUsed;
+                slot = (int)i;
+            }
+    }
+    if (slot >= 0)
+        m_ChunkCache[slot].chunk = ImageBufferInvalidChunk - 1; // in-use
+    return slot;
+}
+
+void Renderer::ImageBufferMarkBaked(int slot, long long chunk) {
+    if (slot < 0 || slot >= (int)ChunkPoolSize)
+        return;
+    m_ChunkCache[slot].chunk = chunk;
+    m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
+}
+
+unsigned Renderer::ImageBufferGetCachedCount() const {
+    unsigned count = 0;
+    for (unsigned i = 0; i < ChunkPoolSize; i++) {
+        if (m_ChunkCache[i].chunk != ImageBufferInvalidChunk &&
+            m_ChunkCache[i].chunk != ImageBufferInvalidChunk - 1) {
+            count++;
+        }
+    }
+    return count;
+}
+
+bool Renderer::ImageBufferChunkCached(long long chunk) const {
+    return ImageBufferGetChunkSlot(chunk) >= 0;
+}
+
+void Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount) {
+    if (!notes)
+        noteCount = 0;
+    noteCount = min(noteCount, (unsigned)MaxNotesPerPass);
+    if (m_vChunkNotes.size() + noteCount > MaxNotesPerPass)
+        return;
+    m_vChunkBuilds.push_back({ chunk, (unsigned)m_vChunkNotes.size(), noteCount });
+    if (notes && noteCount > 0)
+        m_vChunkNotes.insert(m_vChunkNotes.end(), notes, notes + noteCount);
+}
+
+void Renderer::ImageBufferDrawChunk(long long chunk, float yTop, float yBottom) {
+    m_vChunkQuads.push_back({ chunk, yTop, yBottom });
+}
+
+void Renderer::ImageBufferBuildChunkFixed(FixedSizeConstants& out) const {
+    out = m_FixedConstants;
+    const float notes_x = m_RootConstants.notes_x;
+    for (int i = 0; i < 128; i++)
+        out.note_x[i] -= notes_x;
+}
+
 bool Renderer::LoadBackgroundBitmap(std::wstring path) {
     if (!s_pWICFactory) {
         if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&s_pWICFactory))))
@@ -490,6 +606,11 @@ void Renderer::RenderImGuiFrame() {
             ImGui::EndDisabled();
             ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
             ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
+            ImGui::Checkbox("Image Buffer Notes", &viz.bImageBufferNotes);
+            if (viz.bImageBufferNotes) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%u/64)", ImageBufferGetCachedCount());
+            }
             ImGui::Separator();
             ImGui::Checkbox("Bloom", &viz.bBloom);
             if (viz.bBloom) {
@@ -609,9 +730,10 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
 
-                bool muted = playback.GetMute();
-                if (ImGui::Button(muted ? "Unmute" : "Mute", ImVec2(55, 0)))
-                    playback.ToggleMute(true);
+                int volPct = (int)(playback.GetVolume() * 100.0 + 0.5);
+                ImGui::SetNextItemWidth(70);
+                if (ImGui::SliderInt("##vol", &volPct, 0, 100, "%d%%"))
+                    playback.SetVolume(volPct / 100.0, true);
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
 
@@ -1106,6 +1228,13 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 ImGui::Text("Audio Track:");
                 ImGui::SameLine(130);
                 ImGui::Checkbox("Include synthesized audio in export", &viz.bRenderIncludeAudio);
+                ImGui::Text("Preview:");
+                ImGui::SameLine(130);
+                ImGui::Checkbox("Show preview window while rendering", &viz.bRenderShowPreview);
+                ImGui::SameLine();
+                ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Disable to render headless: no preview window is shown, only the progress window. Slightly faster.");
             }
             ImGui::EndGroup();
 

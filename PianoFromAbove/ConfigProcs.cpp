@@ -660,6 +660,8 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             }
 
             CheckDlgButton( hWnd, IDC_CHECK2, Config::GetConfig().m_bPianoOverride ? BST_CHECKED : BST_UNCHECKED );
+            CheckDlgButton( hWnd, IDC_CHECK3, BST_UNCHECKED );
+            SetDlgItemText( hWnd, IDC_AUDIOFILE, TEXT("") );
             EnableWindow( GetDlgItem( hWnd, IDC_AUDIOFILE ), FALSE );
             EnableWindow( GetDlgItem( hWnd, IDC_BROWSEAUDIO ), FALSE );
 
@@ -905,9 +907,11 @@ INT_PTR WINAPI TracksProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     }
                     else
                         PRE_DbgLog( "TrackSettings OK: custom audio NOT enabled" );
+                    EndDialog( hWnd, IDOK );
+                    return TRUE;
                 }
                 case IDCANCEL:
-			        EndDialog( hWnd, iId );
+			        EndDialog( hWnd, IDCANCEL );
 			        return TRUE;
             }
 		    break;

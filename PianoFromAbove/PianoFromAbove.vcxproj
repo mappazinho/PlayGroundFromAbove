@@ -131,8 +131,8 @@
   </PropertyGroup>
   <ItemGroup>
     <PostBuildEvent Include="deploy">
-      <Message>Deploying bass/SDL2 runtime and soundfont.</Message>
-      <Command>xcopy /y /d /q "$(ProjectDir)bass.dll" "$(OutDir)" &amp; xcopy /y /d /q "$(ProjectDir)bassmidi.dll" "$(OutDir)" &amp; xcopy /y /d /q "$(ProjectDir)SDL2.dll" "$(OutDir)" &amp; if not exist "$(OutDir)Soundfonts" mkdir "$(OutDir)Soundfonts" &amp; if exist "$(ProjectDir)Soundfonts" xcopy /y /d /q "$(ProjectDir)Soundfonts\*" "$(OutDir)Soundfonts\." &amp; exit 0</Command>
+      <Message>Deploying soundfont.</Message>
+      <Command>if not exist "$(OutDir)Soundfonts" mkdir "$(OutDir)Soundfonts" &amp; if exist "$(ProjectDir)Soundfonts" xcopy /y /d /q "$(ProjectDir)Soundfonts\*" "$(OutDir)Soundfonts\." &amp; exit 0</Command>
     </PostBuildEvent>
   </ItemGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">
@@ -376,6 +376,8 @@
     <ClInclude Include="lzma\version.h" />
     <ClInclude Include="lzma\vli.h" />
     <ClInclude Include="MainProcs.h" />
+    <ClInclude Include="MemoryModule.h" />
+    <ClInclude Include="EmbeddedDLL.h" />
     <ClInclude Include="MIDI.h" />
     <ClInclude Include="MIDIAudio.h" />
     <ClInclude Include="MIDIPreRenderPlayer.h" />
@@ -391,6 +393,8 @@
   <ItemGroup>
     <ClCompile Include="Config.cpp" />
     <ClCompile Include="ConfigProcs.cpp" />
+    <ClCompile Include="MemoryModule.cpp" />
+    <ClCompile Include="EmbeddedDLL.cpp" />
     <ClCompile Include="BASSMIDI.cpp" />
     <ClCompile Include="GameState.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -515,6 +519,52 @@
       <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)NoteVertexShader.h</HeaderFileOutput>
       <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">$(ProjectDir)NoteVertexShader.h</HeaderFileOutput>
       <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+      </ObjectFileOutput>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">5.1</ShaderModel>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Release|x64'">5.1</ShaderModel>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">5.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="chunkquad_ps.hlsl">
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Pixel</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">Pixel</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Pixel</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Pixel</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Pixel</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|Win32'">Pixel</ShaderType>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">g_pChunkQuadPixelShader</VariableName>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)ChunkQuadPixelShader.h</HeaderFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+      </ObjectFileOutput>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">g_pChunkQuadPixelShader</VariableName>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">g_pChunkQuadPixelShader</VariableName>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)ChunkQuadPixelShader.h</HeaderFileOutput>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">$(ProjectDir)ChunkQuadPixelShader.h</HeaderFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+      </ObjectFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">
+      </ObjectFileOutput>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">5.1</ShaderModel>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Release|x64'">5.1</ShaderModel>
+      <ShaderModel Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">5.1</ShaderModel>
+    </FxCompile>
+    <FxCompile Include="chunkquad_vs.hlsl">
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Vertex</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">Vertex</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Vertex</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Vertex</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Vertex</ShaderType>
+      <ShaderType Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|Win32'">Vertex</ShaderType>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">g_pChunkQuadVertexShader</VariableName>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)ChunkQuadVertexShader.h</HeaderFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+      </ObjectFileOutput>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">g_pChunkQuadVertexShader</VariableName>
+      <VariableName Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">g_pChunkQuadVertexShader</VariableName>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)ChunkQuadVertexShader.h</HeaderFileOutput>
+      <HeaderFileOutput Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">$(ProjectDir)ChunkQuadVertexShader.h</HeaderFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+      </ObjectFileOutput>
+      <ObjectFileOutput Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">
       </ObjectFileOutput>
       <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">5.1</ShaderModel>
       <ShaderModel Condition="'$(Configuration)|$(Platform)'=='Release|x64'">5.1</ShaderModel>

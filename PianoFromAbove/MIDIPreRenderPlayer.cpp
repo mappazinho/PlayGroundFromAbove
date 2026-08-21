@@ -169,12 +169,6 @@ static bool PRE_OpenDevice()
 
 int PRE_InitAudio()
 {
- // Fresh diagnostics each run.
-	wchar_t path[MAX_PATH] = {};
-	GetTempPathW(_countof(path), path);
-	wcscat_s(path, L"pfa_prerender.log");
-	DeleteFileW(path);
-
  // WASAPI over DirectSound: the directsound waveout thread can park forever on a
  // dead buffer event after a display/GPU hiccup (observed: callback stops, process
  // alive, silence). WASAPI's audio thread waits on a shutdown event too, so device

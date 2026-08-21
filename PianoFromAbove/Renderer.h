@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <tuple>
+#include <limits>
 #include <wincodec.h>
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_win32.h"
@@ -80,6 +81,33 @@ constexpr unsigned MaxTrackColors = 65536;
 struct FixedSizeConstants {
     float note_x[128];
     float bends[16];
+};
+
+// Image buffer cache key: everything that changes the baked chunk content.
+// fWarpTime is deliberately excluded (it advances every frame; warp disables
+// the image buffer entirely).
+struct ChunkCacheKey {
+    int width = 0;
+    int height = 0;
+    float deflate = 0, notes_y = 0, notes_cy = 0, white_cx = 0, timespan = 0;
+    float stripTimeSpan = 0;
+    float fWarp = 0, fWarpSeedX = 0, fWarpSeedY = 0;
+    float notes_x = 0, notes_cx = 0, fMT = 0, fMTTilt = 0;
+    float corruption = 0;
+    unsigned long long eventCount = 0;
+    unsigned fixedStamp = 0;
+    unsigned trackColorStamp = 0;
+    bool operator==(const ChunkCacheKey& o) const {
+        return width == o.width && height == o.height &&
+            deflate == o.deflate && notes_y == o.notes_y && notes_cy == o.notes_cy &&
+            white_cx == o.white_cx && timespan == o.timespan &&
+            stripTimeSpan == o.stripTimeSpan && fWarp == o.fWarp &&
+            fWarpSeedX == o.fWarpSeedX && fWarpSeedY == o.fWarpSeedY &&
+            notes_x == o.notes_x && notes_cx == o.notes_cx &&
+            fMT == o.fMT && fMTTilt == o.fMTTilt &&
+            corruption == o.corruption && eventCount == o.eventCount &&
+            fixedStamp == o.fixedStamp && trackColorStamp == o.trackColorStamp;
+    }
 };
 
 class D3D11Renderer;
@@ -195,6 +223,34 @@ public:
         m_fRibbonX = x; m_fRibbonY = y; m_fRibbonCX = cx; m_fRibbonCY = cy;
     }
 
+    // --- Image buffer (pre-rendered note chunks) -----------------------------
+    // Pre-renders fixed-size chunks of the note roll into offscreen textures
+    // and draws them as scrolling textured quads, replacing per-note vertex
+    // dispatch with a handful of quad draws in high note-density playback.
+    static constexpr unsigned ChunkPoolSize = 64;
+    static constexpr long long ImageBufferInvalidChunk = (std::numeric_limits<long long>::max)();
+
+    struct ChunkBuildRequest {
+        long long chunk;
+        unsigned noteOffset;
+        unsigned noteCount;
+    };
+    struct ChunkQuad {
+        long long chunk;
+        float yTop;
+        float yBottom;
+    };
+
+    void ImageBufferBeginFrame(); // cache-key/validity bookkeeping; clears per-frame lists
+    bool ImageBufferCanRender() const { return m_bImageBufferCanRender; }
+    bool ImageBufferChunkCached(long long chunk) const;
+    unsigned ImageBufferGetCachedCount() const;
+    void ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount);
+    void ImageBufferDrawChunk(long long chunk, float yTop, float yBottom);
+    void ImageBufferSetEventCount(unsigned long long count) { m_ullImageBufferEventCount = count; }
+    void ImageBufferNotifyFixedChanged() { m_uImageBufferFixedStamp++; }
+    void ImageBufferNotifyTrackColorsChanged() { m_uImageBufferTrackColorStamp++; }
+
     // --- Shared UI/state, public for the game states to poke at --------------
     bool m_bShowPreferences = false;
     bool m_bShowAbout = false;
@@ -255,6 +311,26 @@ protected:
     std::vector<NoteData> m_vNotesIntermediate;
     std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
     int m_iRectSplit = -1;
+
+    // Image buffer shared state (backend keeps the GPU resources)
+    struct ChunkCacheEntry {
+        long long chunk = ImageBufferInvalidChunk;
+        unsigned lastUsed = 0;
+    };
+    ChunkCacheEntry m_ChunkCache[ChunkPoolSize] = {};
+    ChunkCacheKey m_ImageBufferKey;
+    bool m_bImageBufferCanRender = false;
+    unsigned m_uImageBufferFixedStamp = 0;
+    unsigned m_uImageBufferTrackColorStamp = 0;
+    unsigned long long m_ullImageBufferEventCount = 0;
+    unsigned m_uImageBufferFrame = 0;
+    std::vector<NoteData> m_vChunkNotes;
+    std::vector<ChunkBuildRequest> m_vChunkBuilds;
+    std::vector<ChunkQuad> m_vChunkQuads;
+    int ImageBufferGetChunkSlot(long long chunk) const;
+    int ImageBufferAllocateSlot();
+    void ImageBufferMarkBaked(int slot, long long chunk);
+    void ImageBufferBuildChunkFixed(FixedSizeConstants& out) const;
 
     ImDrawList* m_pDrawList = nullptr;
     float m_fLastUIScale = 1.0f;
@@ -342,6 +418,8 @@ private:
     ComPtr<ID3D12PipelineState> m_pNotePipelineState;
 ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12PipelineState> m_pBackgroundPipelineState;
+    ComPtr<ID3D12RootSignature> m_pChunkQuadRootSignature;
+    ComPtr<ID3D12PipelineState> m_pChunkQuadPipelineState;
     ComPtr<ID3D12RootSignature> m_pBloomRootSignature;
     ComPtr<ID3D12PipelineState> m_pBloomPipelineState;
     ComPtr<ID3D12RootSignature> m_pVignetteRootSignature;
@@ -357,6 +435,24 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pGenericUpload;
     ComPtr<ID3D12Resource> m_pFixedBuffer;
     ComPtr<ID3D12Resource> m_pTrackColorBuffer;
+
+    // Image buffer (pre-rendered note chunks)
+    ComPtr<ID3D12DescriptorHeap> m_pChunkRTVHeap;
+    UINT m_uChunkRTVSize = 0;
+    ComPtr<ID3D12DescriptorHeap> m_pChunkSRVHeap; // shader-visible
+    ComPtr<ID3D12DescriptorHeap> m_pChunkDSVHeap;
+    ComPtr<ID3D12Resource> m_pChunkTextures[ChunkPoolSize];
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ChunkRTVCPU[ChunkPoolSize] = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ChunkSRVCPU[ChunkPoolSize] = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE m_ChunkSRVGPU[ChunkPoolSize] = {};
+    D3D12_RESOURCE_STATES m_ChunkStates[ChunkPoolSize] = {};
+    ComPtr<ID3D12Resource> m_pChunkDepth;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ChunkDSVCPU = {};
+    int m_iChunkWidth = 0, m_iChunkHeight = 0;
+    ComPtr<ID3D12Resource> m_pChunkFixedBuffer; // chunk-relative fixed constants (t1 during bake)
+    ComPtr<ID3D12Resource> m_pChunkFixedUpload;
+    HRESULT EnsureChunkResources(int slot, int W, int H);
+    HRESULT RenderImageBuffer();
 
     UINT m_uFrameIndex = 0;
     UINT64 m_pFenceValues[FrameCount] = {};

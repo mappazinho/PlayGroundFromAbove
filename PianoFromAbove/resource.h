@@ -21,6 +21,9 @@
 #define IDD_ABOUT                       138
 #define IDB_LOCK                        146
 #define IDR_SPLASHMIDI                  149
+#define IDR_DLL_BASS                    160
+#define IDR_DLL_BASSMIDI                161
+#define IDR_DLL_SDL2                    162
 #define IDD_LOADING                     153
 #define IDD_SETRESOLUTION               158
 #define IDC_TRACKS                      1001

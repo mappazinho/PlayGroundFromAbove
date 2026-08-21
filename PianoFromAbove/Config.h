@@ -245,6 +245,7 @@ struct VizSettings : public ISettings {
     int iRenderCRF;
     std::wstring sRenderOutputPath;
     bool bRenderIncludeAudio;
+    bool bRenderShowPreview;
     bool bRenderAdvanced;
     std::wstring sRenderAdvancedOptions;
     std::wstring sBackground;
@@ -257,6 +258,7 @@ struct VizSettings : public ISettings {
     std::wstring sUIFont;
     bool bBounceStats;
     int iBounceNPSThreshold;
+    bool bImageBufferNotes;
 };
 
 class Config : public ISettings
