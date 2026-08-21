@@ -3446,7 +3446,7 @@ void MainScreen::RenderNotesImageBuffer()
 
     std::vector<NoteData> chunkNotes;
     unsigned lookaheadBakes = 0;
-    const unsigned maxLookaheadBakesPerFrame = 4;
+    const unsigned maxLookaheadBakesPerFrame = 8;
 
     auto BakeChunk = [&](long long k) {
         if (m_pRenderer->ImageBufferChunkCached(k))

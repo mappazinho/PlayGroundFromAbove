@@ -295,17 +295,11 @@ void Renderer::ImageBufferBeginFrame() {
         return;
 
     ChunkCacheKey key = {};
-    key.width = m_iBufferWidth;
-    key.height = m_iBufferHeight;
+    key.width = (int)round(m_RootConstants.notes_cx);
+    key.height = (int)round(m_RootConstants.notes_cy);
     key.deflate = m_RootConstants.deflate;
-    key.notes_y = m_RootConstants.notes_y;
-    key.notes_cy = m_RootConstants.notes_cy;
     key.white_cx = m_RootConstants.white_cx;
     key.timespan = m_RootConstants.timespan;
-    key.stripTimeSpan = m_RootConstants.stripTimeSpan;
-    key.fWarp = m_RootConstants.fWarp;
-    key.fWarpSeedX = m_RootConstants.fWarpSeedX;
-    key.fWarpSeedY = m_RootConstants.fWarpSeedY;
     key.notes_x = m_RootConstants.notes_x;
     key.notes_cx = m_RootConstants.notes_cx;
     key.fMT = m_RootConstants.fMT;
@@ -316,8 +310,7 @@ void Renderer::ImageBufferBeginFrame() {
     key.trackColorStamp = m_uImageBufferTrackColorStamp;
 
     if (!(key == m_ImageBufferKey)) {
-        // Any key change (view, song state, constants, corruption amount, ...)
-        // invalidates every cached chunk.
+        // Content-affecting change invalidates every cached chunk.
         for (auto& entry : m_ChunkCache)
             entry.chunk = ImageBufferInvalidChunk;
         m_ImageBufferKey = key;
