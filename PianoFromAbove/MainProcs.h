@@ -14,6 +14,8 @@
 #include <string>
 using namespace std;
 
+class Renderer;
+
 // Message handlers for the main windows
 LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
 VOID SizeWindows( int iMainWidth, int iMainHeight );
@@ -47,6 +49,7 @@ VOID CheckActivity( BOOL bIsActive, POINT *ptNew = NULL, BOOL bToggleEnable = fa
 // the MIDI/image-buffer lifetime.
 VOID ImageBufferPrewarmPlaybackRequested( BOOL bPlaying );
 BOOL ImageBufferPrewarmPlaybackHold();
+VOID ImageBufferPrewarmRendererSeen( Renderer *pRenderer );
 
 // Test hook (crash repro driver): -repro "<midiA>" "<audio>" "<midiB>" [delaySecs]
 // on the command line opens song A with custom audio, then plain-opens song B
