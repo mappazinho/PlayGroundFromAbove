@@ -34,9 +34,6 @@ static void MPD3D12ClearRenderTargetView(Renderer*, ID3D12GraphicsCommandList*,
 static void MPD3D12ClearDepthStencilView(Renderer*, ID3D12GraphicsCommandList*,
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
 
-// The legacy backend still performs all normal D3D12 work. These narrow hooks
-// substitute the persistent slot/depth state only while a multipass chunk pass
-// is active.
 #define ImageBufferAllocateSlot() ImageBufferMPBeginBackend(this)
 #define ImageBufferMarkBaked(slot, chunk) do { \
     if (ImageBufferMPRequestFinalize(this)) Renderer::ImageBufferMarkBaked((slot), (chunk)); \
@@ -56,6 +53,7 @@ static void MPD3D12ClearDepthStencilView(Renderer*, ID3D12GraphicsCommandList*,
 #undef ImageBufferAllocateSlot
 
 struct MPD3D12DepthPool {
+    ID3D12Device* deviceTag = nullptr;
     ComPtr<ID3D12DescriptorHeap> heap;
     UINT descriptorSize = 0;
     ComPtr<ID3D12Resource> depth[Renderer::ChunkPoolSize];
@@ -79,6 +77,10 @@ static D3D12_CPU_DESCRIPTOR_HANDLE MPD3D12EnsureDepth(Renderer* renderer, ID3D12
         return none;
 
     auto& pool = MPD3D12Pools()[renderer];
+    if (pool.deviceTag != device) {
+        pool = MPD3D12DepthPool{};
+        pool.deviceTag = device;
+    }
     if (!pool.heap) {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -161,7 +163,7 @@ static void MPD3D12ClearRenderTargetView(Renderer* renderer, ID3D12GraphicsComma
     if (!cmd)
         return;
     if (ImageBufferMPBackendActive(renderer) && !ImageBufferMPRequestClear(renderer))
-        return; // continuation pass: preserve the color accumulated earlier
+        return;
     cmd->ClearRenderTargetView(rtv, color, rectCount, rects);
 }
 
@@ -176,7 +178,7 @@ static void MPD3D12ClearDepthStencilView(Renderer* renderer, ID3D12GraphicsComma
         return;
     }
     if (!ImageBufferMPRequestClear(renderer))
-        return; // continuation pass: preserve depth so LESS ordering spans passes
+        return;
 
     auto& pool = MPD3D12Pools()[renderer];
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = pool.activeDSV.ptr ? pool.activeDSV : originalDSV;

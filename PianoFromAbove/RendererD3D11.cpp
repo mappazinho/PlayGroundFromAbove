@@ -47,6 +47,7 @@ static void MPD3D11ClearDepthStencilView(Renderer*, ID3D11DeviceContext*, ID3D11
 #undef ImageBufferAllocateSlot
 
 struct MPD3D11DepthPool {
+    ID3D11Device* deviceTag = nullptr;
     ComPtr<ID3D11Texture2D> depth[Renderer::ChunkPoolSize];
     ComPtr<ID3D11DepthStencilView> dsv[Renderer::ChunkPoolSize];
     int width[Renderer::ChunkPoolSize] = {};
@@ -67,6 +68,10 @@ static ID3D11DepthStencilView* MPD3D11EnsureDepth(Renderer* renderer, ID3D11Devi
         return nullptr;
 
     auto& pool = MPD3D11Pools()[renderer];
+    if (pool.deviceTag != device) {
+        pool = MPD3D11DepthPool{};
+        pool.deviceTag = device;
+    }
     if (pool.depth[slot] && pool.dsv[slot] && pool.width[slot] == W && pool.height[slot] == H)
         return pool.dsv[slot].Get();
 
