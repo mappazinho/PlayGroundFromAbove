@@ -16,11 +16,20 @@
 #include "MIDIPreRenderPlayer.h"
 #include <d3d9types.h>
 #include "ImageBufferMultipass.h"
+#include "ImageBufferOverlapIndex.h"
 
-// The lambda itself remains unchanged. Only its calls are routed through the
-// multipass CPU staging cache so a dense chunk is scanned/converted once, not
-// once per 200k-note GPU slice. The macro's self-reference intentionally names
-// the original local lambda (recursive macro expansion is suppressed).
-#define CollectChunk(k) ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, CollectChunk, (k))
+// Keep the multipass CPU staging behavior, but replace the legacy collector's
+// global-longest-note backscan with the block overlap index. The original local
+// CollectChunk lambda remains in GameStateLegacy.inc for source compatibility;
+// function-like macro expansion only intercepts its call sites.
+#define CollectChunk(k) ([&]() { \
+    auto ImageBufferIndexedCollector = [&](long long imageBufferChunk) { \
+        ImageBufferOverlapCollect(this, m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, bTickMode, \
+            [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \
+                return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \
+            }); \
+    }; \
+    ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferIndexedCollector, (k)); \
+}())
 #include "GameStateLegacy.inc"
 #undef CollectChunk
