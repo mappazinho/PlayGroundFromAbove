@@ -27,6 +27,7 @@ struct ImageBufferPrewarmGpuState {
     bool initialized = false;
     bool cacheRequired = false;
     bool playRequested = false;
+    bool wakeIssued = false;
     size_t cached = 0;
     size_t total = 0;
     std::vector<long long> chunks;
@@ -228,6 +229,14 @@ static void DrawImageBufferPrewarmProgress(
 #include "GameStateLegacy.inc"
 #undef CollectChunk
 
+VOID ImageBufferPrewarmRendererSeen(Renderer* pRenderer)
+{
+    if (!pRenderer)
+        return;
+    std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
+    s_ImageBufferPrewarmGpu.renderer = pRenderer;
+}
+
 VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
 {
     if (!bPlaying) {
@@ -254,17 +263,20 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
     if (screen && !screen->IsFreePlay() && screen->IsValid() && !screen->IsDiscarded())
         owner = screen;
 
+    const ImageBufferPreparedProgress cpu = ImageBufferPreparedGetFullProgress();
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
-        if (s_ImageBufferPrewarmGpu.owner != owner) {
+        const bool ownerChanged = s_ImageBufferPrewarmGpu.owner != owner;
+        if (ownerChanged) {
             s_ImageBufferPrewarmGpu.owner = owner;
-            s_ImageBufferPrewarmGpu.renderer = nullptr;
             s_ImageBufferPrewarmGpu.initialized = false;
             s_ImageBufferPrewarmGpu.cacheRequired = false;
             s_ImageBufferPrewarmGpu.cached = 0;
             s_ImageBufferPrewarmGpu.total = 0;
             s_ImageBufferPrewarmGpu.chunks.clear();
         }
+        if (ownerChanged || !cpu.initialized)
+            s_ImageBufferPrewarmGpu.wakeIssued = false;
         s_ImageBufferPrewarmGpu.playRequested = true;
     }
     ImageBufferPreparedArmPlaybackGate(owner);
@@ -295,6 +307,7 @@ BOOL ImageBufferPrewarmPlaybackHold()
     if (!screen || screen->IsFreePlay() || !screen->IsValid() || screen->IsDiscarded())
         return FALSE;
 
+    Renderer* wakeRenderer = nullptr;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         if (!s_ImageBufferPrewarmGpu.playRequested)
@@ -303,6 +316,21 @@ BOOL ImageBufferPrewarmPlaybackHold()
             s_ImageBufferPrewarmGpu.owner = screen;
         if (s_ImageBufferPrewarmGpu.owner != screen)
             return FALSE;
+
+        // If the visible/lookahead cache was already complete before the option
+        // was enabled, no CollectChunk call would exist to start full-song prep.
+        // Force one cache generation restart on the requested Play transition;
+        // the next render then enters the normal collector and schedules prep.
+        if (!s_ImageBufferPrewarmGpu.initialized &&
+            !s_ImageBufferPrewarmGpu.wakeIssued &&
+            s_ImageBufferPrewarmGpu.renderer) {
+            s_ImageBufferPrewarmGpu.wakeIssued = true;
+            wakeRenderer = s_ImageBufferPrewarmGpu.renderer;
+        }
+    }
+    if (wakeRenderer) {
+        wakeRenderer->ImageBufferInvalidate();
+        return TRUE;
     }
 
     if (ImageBufferPreparedShouldHoldPlayback(screen))
