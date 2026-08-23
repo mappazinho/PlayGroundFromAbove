@@ -3474,7 +3474,7 @@ void MainScreen::RenderNotesImageBuffer()
     // reach back over the longest note in the song (plus the corruption
     // margin), otherwise lookahead chunks bake with missing bars.
     const long long maxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
-    const long long backScan = max(E, maxLen);
+    const long long backScan = maxLen + E;
 
     // Collects notes for visible chunks that could not be queued for baking
     // (per-frame note budget hit); they are drawn through the normal path.
@@ -3493,14 +3493,17 @@ void MainScreen::RenderNotesImageBuffer()
             [&](MIDIChannelEvent lhs, long long rhs) {
                 return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;
             });
-        for (auto it = itLo; it != m_vEvents.end(); it++) {
-            const long long tRaw = bTickMode ? m_MIDI.GetEventAbsT(*it) : m_MIDI.GetEventTime(*it);
-            if (tRaw >= chunkEnd + E)
-                break;
+        auto itHi = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkEnd + E,
+            [&](MIDIChannelEvent lhs, long long rhs) {
+                return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;
+            });
+        // Same ordering as regular RenderNotes(): newest -> oldest. Equal-depth
+        // repeated notes otherwise lose against an older note with depth LESS.
+        for (auto it = itHi; it != itLo; ) {
+            --it;
             if (m_MIDI.GetEventChannelEventType(*it) != MIDI::NoteOn ||
                 m_MIDI.GetEventParam2(*it) <= 0 || !m_MIDI.EventHasSister(*it))
                 continue;
-
             NoteData data = BuildChunkNoteData(*it, chunkStart);
             if (data.pos < (float)T && data.pos + max(data.length, 0.0f) >= 0.0f)
                 chunkNotes.push_back(data);
