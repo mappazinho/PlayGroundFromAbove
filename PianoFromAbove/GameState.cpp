@@ -262,14 +262,14 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
 
 // Prewarm cannot depend on RenderNotesImageBuffer(): while Play is gated the
 // song can sit in its empty pre-roll, where RenderNotes() returns before image
-// buffers are touched. Prime the dense CPU set at frame start and, once it is
-// ready, submit one dense GPU bake per held frame. This makes both preparation
-// stages independent of the current visible-note window.
-#define ClearAndBeginScene(...) ([&](auto* imageBufferPrewarmSelf) -> HRESULT { \
+// buffers are touched. Preserve the renderer member call, then run a
+// MainScreen-only preparation/bake step immediately after the frame begins.
+// This avoids rewriting the token after `->`, which is invalid C++.
+#define ClearAndBeginScene(...) ClearAndBeginScene(__VA_ARGS__); \
+([&](auto* imageBufferPrewarmSelf) { \
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
-    bool imageBufferPrewarmActive = false; \
     if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
-        imageBufferPrewarmActive = !imageBufferPrewarmSelf->m_bDiscarded && \
+        const bool imageBufferPrewarmActive = !imageBufferPrewarmSelf->m_bDiscarded && \
             ImageBufferPreparedGetWaitBeforePlayback() && \
             Config::GetConfig().GetVizSettings().bImageBufferNotes && \
             !g_bVideoRendering && \
@@ -281,12 +281,6 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
             } \
             imageBufferPrewarmSelf->m_pRenderer->ImageBufferSetEventCount( \
                 (unsigned long long)imageBufferPrewarmSelf->m_vEvents.size()); \
-        } \
-    } \
-    const HRESULT imageBufferPrewarmClearResult = \
-        imageBufferPrewarmSelf->m_pRenderer->ClearAndBeginScene(__VA_ARGS__); \
-    if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
-        if (imageBufferPrewarmActive && SUCCEEDED(imageBufferPrewarmClearResult)) { \
             if (!imageBufferPrewarmSelf->m_pRenderer->ImageBufferCanRender()) { \
                 ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
                 UpdateImageBufferPrewarmGpuProgress( \
@@ -365,7 +359,6 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
             } \
         } \
     } \
-    return imageBufferPrewarmClearResult; \
 }(this))
 #define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer)
 #include "GameStateLegacy.inc"
