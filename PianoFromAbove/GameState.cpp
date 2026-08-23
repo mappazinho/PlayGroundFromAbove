@@ -132,16 +132,17 @@ static void DrawImageBufferPrewarmProgress(
         return;
 
     const ImageBufferPreparedProgress cpu = ImageBufferPreparedGetFullProgress();
-    if (!cpu.initialized || cpu.unsupported)
-        return;
 
+    bool playRequested = false;
     bool gpuStage = false;
+    bool initializing = false;
     size_t done = cpu.done;
     size_t total = cpu.total;
     size_t failed = cpu.failed;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
-        if (cpu.done >= cpu.total && s_ImageBufferPrewarmGpu.cacheRequired) {
+        playRequested = s_ImageBufferPrewarmGpu.playRequested;
+        if (cpu.initialized && cpu.done >= cpu.total && s_ImageBufferPrewarmGpu.cacheRequired) {
             gpuStage = true;
             done = s_ImageBufferPrewarmGpu.cached;
             total = s_ImageBufferPrewarmGpu.total;
@@ -149,7 +150,18 @@ static void DrawImageBufferPrewarmProgress(
         }
     }
 
-    if (total == 0 || done >= total)
+    if (!cpu.initialized) {
+        if (!playRequested)
+            return;
+        initializing = true;
+        done = 0;
+        total = 1;
+        failed = 0;
+    } else if (cpu.unsupported) {
+        return;
+    }
+
+    if (!initializing && (total == 0 || done >= total))
         return;
 
     const float scale = (std::max)(Config::GetConfig().GetVizSettings().fUIScale, 0.5f);
@@ -175,7 +187,9 @@ static void DrawImageBufferPrewarmProgress(
         IM_COL32(235, 235, 235, 230), rounding);
 
     char text[128];
-    if (gpuStage) {
+    if (initializing) {
+        sprintf_s(text, "Initializing dense image buffers...");
+    } else if (gpuStage) {
         sprintf_s(text, "Baking dense image buffers  %zu / %zu", done, total);
     } else if (failed > 0) {
         sprintf_s(text, "Preparing dense image buffers  %zu / %zu  (%zu fallback)",
@@ -188,6 +202,17 @@ static void DrawImageBufferPrewarmProgress(
     const float ty = y0 - textSize.y - 3.0f * scale;
     draw->AddText(ImVec2(tx + 1.0f, ty + 1.0f), IM_COL32(0, 0, 0, 220), text);
     draw->AddText(ImVec2(tx, ty), IM_COL32(255, 255, 255, 255), text);
+}
+
+// RenderText() resets the same ImDrawList used by the note pass. Draw the
+// indicator only after EndText so the reset cannot erase it before Present.
+static void DrawImageBufferPrewarmProgressLate(Renderer* renderer)
+{
+    if (!renderer)
+        return;
+    const float bufferW = (float)renderer->GetBufferWidth();
+    const float bufferH = (float)renderer->GetBufferHeight();
+    DrawImageBufferPrewarmProgress(renderer, 0.0f, bufferW, bufferH * 0.75f);
 }
 
 // Dense chunks use a separate CPU preparation path. Sparse chunks keep the
@@ -219,14 +244,14 @@ static void DrawImageBufferPrewarmProgress(
         this, m_pRenderer, m_vEvents, m_MIDI, chunkNotes, (k), \
         kFirst, kLast, kMax, T, E, bTickMode, fCorrupt, \
         m_vTrackSettings.size(), imageBufferPrepRows); \
-    if ((k) == kFirst) { \
+    if ((k) == kFirst) \
         UpdateImageBufferPrewarmGpuProgress(this, m_pRenderer, T, E, bTickMode); \
-        DrawImageBufferPrewarmProgress(m_pRenderer, m_fNotesX, m_fNotesCX, notesY + notesCY); \
-    } \
     if (!imageBufferPreparedHandled) \
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferExactCollector, (k)); \
 }())
+#define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer)
 #include "GameStateLegacy.inc"
+#undef EndText
 #undef CollectChunk
 
 VOID ImageBufferPrewarmRendererSeen(Renderer* pRenderer)
