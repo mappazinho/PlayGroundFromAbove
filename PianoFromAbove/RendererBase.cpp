@@ -102,8 +102,15 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         state.chunk = chunk;
         state.cursor = 0;
         state.notes.clear();
-        if (noteCount > 0)
+        if (noteCount > 0) {
             state.notes.assign(notes, notes + noteCount);
+            // Generation initialization above may have reset the marker written
+            // by GameState's first real CollectChunk call. Preserve that fact so
+            // a same-frame second call supplies fallback notes instead of being
+            // mistaken for the skippable first collection of the next frame.
+            state.collectChunk = chunk;
+            state.collectCalls = 1;
+        }
         state.total = state.notes.size();
     } else if (noteCount > 0 && noteCount != state.total) {
         // The same chunk should be stable within a cache generation. If its
@@ -111,6 +118,8 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         state.cursor = 0;
         state.notes.assign(notes, notes + noteCount);
         state.total = state.notes.size();
+        state.collectChunk = chunk;
+        state.collectCalls = 1;
     }
 
     if (state.cursor > state.total)
