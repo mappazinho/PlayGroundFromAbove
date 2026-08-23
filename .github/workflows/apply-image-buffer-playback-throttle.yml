@@ -1,0 +1,93 @@
+name: Apply image buffer playback throttle
+
+on:
+  push:
+    branches: [fix/image-buffer-playback-stutter]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/image-buffer-playback-stutter
+          fetch-depth: 0
+
+      - name: Throttle rolling chunk pre-bakes
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('PianoFromAbove/GameState.cpp')
+          s = p.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected one match, got {n}')
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              '''    // Lookahead pre-buffering up to ChunkPoolSize (64) chunks ahead or end of song
+    long long kMax = kLast;
+    if (!m_vEvents.empty()) {
+        const long long tMax = bTickMode ? m_MIDI.GetEventAbsT(m_vEvents.back()) : m_MIDI.GetEventTime(m_vEvents.back());
+        const long long kSongEnd = (long long)ceil((double)tMax / (double)T);
+        kMax = min(kFirst + (long long)Renderer::ChunkPoolSize - 1, max(kLast, kSongEnd));
+    }
+
+    std::vector<NoteData> chunkNotes;
+    unsigned lookaheadBakes = 0;
+    const unsigned maxLookaheadBakesPerFrame = 8;''',
+              '''    // Do not keep a moving 64-chunk bake treadmill while the song is
+    // playing. A short horizon is enough to hide normal chunk creation and,
+    // once it is filled, background work becomes nearly idle until playback
+    // crosses a chunk boundary. Paused playback may warm a larger window.
+    const long long lookaheadChunks = m_bPaused ? 24LL : 6LL;
+    long long kMax = kLast;
+    if (!m_vEvents.empty()) {
+        const long long tMax = bTickMode ? m_MIDI.GetEventAbsT(m_vEvents.back()) : m_MIDI.GetEventTime(m_vEvents.back());
+        const long long kSongEnd = (long long)ceil((double)tMax / (double)T);
+        kMax = min(kLast + lookaheadChunks, max(kLast, kSongEnd));
+    }
+
+    std::vector<NoteData> chunkNotes;
+    unsigned lookaheadBakes = 0;
+    // Active playback must not spend the frame baking a pile of future
+    // textures. When paused we can warm several chunks without causing audio /
+    // visual hitching; during playback, allow one background bake at most.
+    const unsigned maxLookaheadBakesPerFrame = m_bPaused ? 4u : 1u;''',
+              'lookahead throttle')
+
+          replace_once(
+              '''    for (long long k = kFirst; k <= kLast; k++) {
+        if (!BakeChunk(k)) {
+            CollectChunk(k);
+            for (NoteData data : chunkNotes) {''',
+              '''    for (long long k = kFirst; k <= kLast; k++) {
+        if (!BakeChunk(k)) {
+            // BakeChunk already collected this chunk. Re-scanning a huge
+            // visible chunk here doubled the CPU hitch on budget/size failure.
+            for (NoteData data : chunkNotes) {''',
+              'avoid duplicate visible collection')
+
+          p.write_text(s, encoding='utf-8')
+          Path('.github/workflows/apply-image-buffer-playback-throttle.yml').unlink()
+
+      - name: Validate and commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F "lookaheadChunks = m_bPaused ? 24LL : 6LL" PianoFromAbove/GameState.cpp
+          grep -F "maxLookaheadBakesPerFrame = m_bPaused ? 4u : 1u" PianoFromAbove/GameState.cpp
+          grep -F "Re-scanning a huge" PianoFromAbove/GameState.cpp
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Throttle image buffer lookahead during playback"
+          git push origin HEAD:fix/image-buffer-playback-stutter
