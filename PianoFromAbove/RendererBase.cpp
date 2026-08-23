@@ -1,6 +1,7 @@
 #include "Globals.h"
 #include "Renderer.h"
 #include "ImageBufferMultipass.h"
+#include "ImageBufferPreparedChunks.h"
 
 // Compile the existing shared renderer unchanged under a legacy name for the
 // one method this file replaces.
@@ -10,6 +11,12 @@
 
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount)
 {
+    // A dense chunk owned by the CPU preparation queue deliberately supplies no
+    // notes until its compact representation is ready. Do not let an empty
+    // request become a permanently cached blank texture.
+    if (ImageBufferPreparedRenderPending(this, chunk))
+        return false;
+
     if (!notes)
         noteCount = 0;
     if (ImageBufferChunkCached(chunk))
@@ -104,17 +111,11 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         state.notes.clear();
         if (noteCount > 0) {
             state.notes.assign(notes, notes + noteCount);
-            // Generation initialization above may have reset the marker written
-            // by GameState's first real CollectChunk call. Preserve that fact so
-            // a same-frame second call supplies fallback notes instead of being
-            // mistaken for the skippable first collection of the next frame.
             state.collectChunk = chunk;
             state.collectCalls = 1;
         }
         state.total = state.notes.size();
     } else if (noteCount > 0 && noteCount != state.total) {
-        // The same chunk should be stable within a cache generation. If its
-        // source count changes anyway, rebuild the CPU staging copy from zero.
         state.cursor = 0;
         state.notes.assign(notes, notes + noteCount);
         state.total = state.notes.size();
@@ -149,8 +150,5 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
     state.requestFinalize = (state.cursor + passCount >= state.total);
     state.frameNotes += passCount;
 
-    // Partial textures deliberately remain absent from ImageBufferGetChunkSlot.
-    // Visible callers therefore take the existing normal-note fallback until
-    // the final pass is recorded and the backend marks this slot baked.
     return state.requestFinalize;
 }
