@@ -1,0 +1,41 @@
+name: Apply dense image-buffer ordering fix
+on:
+  push:
+    branches: [fix/image-buffer-dense-hot-preload]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/image-buffer-dense-hot-preload
+          fetch-depth: 0
+      - name: Patch
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('PianoFromAbove/GameState.cpp')
+          s=p.read_text(encoding='utf-8')
+          a='    const long long backScan = max(E, maxLen);'
+          b='    const long long backScan = maxLen + E;'
+          assert s.count(a)==1, s.count(a)
+          s=s.replace(a,b,1)
+          a='''        auto itLo = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkStart - backScan,\n            [&](MIDIChannelEvent lhs, long long rhs) {\n                return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;\n            });\n        for (auto it = itLo; it != m_vEvents.end(); it++) {\n            const long long tRaw = bTickMode ? m_MIDI.GetEventAbsT(*it) : m_MIDI.GetEventTime(*it);\n            if (tRaw >= chunkEnd + E)\n                break;\n            if (m_MIDI.GetEventChannelEventType(*it) != MIDI::NoteOn ||\n                m_MIDI.GetEventParam2(*it) <= 0 || !m_MIDI.EventHasSister(*it))\n                continue;\n\n            NoteData data = BuildChunkNoteData(*it, chunkStart);\n            if (data.pos < (float)T && data.pos + max(data.length, 0.0f) >= 0.0f)\n                chunkNotes.push_back(data);\n        }'''
+          b='''        auto itLo = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkStart - backScan,\n            [&](MIDIChannelEvent lhs, long long rhs) {\n                return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;\n            });\n        auto itHi = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkEnd + E,\n            [&](MIDIChannelEvent lhs, long long rhs) {\n                return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;\n            });\n        // Same ordering as regular RenderNotes(): newest -> oldest. Equal-depth\n        // repeated notes otherwise lose against an older note with depth LESS.\n        for (auto it = itHi; it != itLo; ) {\n            --it;\n            if (m_MIDI.GetEventChannelEventType(*it) != MIDI::NoteOn ||\n                m_MIDI.GetEventParam2(*it) <= 0 || !m_MIDI.EventHasSister(*it))\n                continue;\n            NoteData data = BuildChunkNoteData(*it, chunkStart);\n            if (data.pos < (float)T && data.pos + max(data.length, 0.0f) >= 0.0f)\n                chunkNotes.push_back(data);\n        }'''
+          assert s.count(a)==1, s.count(a)
+          p.write_text(s.replace(a,b,1),encoding='utf-8')
+          Path('.github/workflows/apply-dense-order-v2.yml').unlink()
+      - name: Commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F "for (auto it = itHi; it != itLo; )" PianoFromAbove/GameState.cpp
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Preserve dense repeated notes in image buffer"
+          git push origin HEAD:fix/image-buffer-dense-hot-preload
