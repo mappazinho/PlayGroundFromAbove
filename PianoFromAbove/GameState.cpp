@@ -23,6 +23,7 @@
 
 struct ImageBufferPrewarmGpuState {
     const void* owner = nullptr;
+    Renderer* renderer = nullptr;
     bool initialized = false;
     bool cacheRequired = false;
     bool playRequested = false;
@@ -33,6 +34,18 @@ struct ImageBufferPrewarmGpuState {
 
 static std::mutex s_ImageBufferPrewarmGpuMutex;
 static ImageBufferPrewarmGpuState s_ImageBufferPrewarmGpu;
+
+static size_t CountImageBufferPrewarmCached(
+    Renderer* renderer, const std::vector<long long>& chunks)
+{
+    if (!renderer)
+        return 0;
+    size_t cached = 0;
+    for (long long chunk : chunks)
+        if (renderer->ImageBufferChunkCached(chunk))
+            ++cached;
+    return cached;
+}
 
 static void UpdateImageBufferPrewarmGpuProgress(
     const void* owner,
@@ -51,6 +64,7 @@ static void UpdateImageBufferPrewarmGpuProgress(
     if (cpu.unsupported) {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         s_ImageBufferPrewarmGpu.owner = owner;
+        s_ImageBufferPrewarmGpu.renderer = renderer;
         s_ImageBufferPrewarmGpu.initialized = true;
         s_ImageBufferPrewarmGpu.cacheRequired = false;
         s_ImageBufferPrewarmGpu.cached = 0;
@@ -94,16 +108,14 @@ static void UpdateImageBufferPrewarmGpuProgress(
         }
     }
 
-    size_t cached = 0;
-    if (requireGpu) {
-        for (long long chunk : denseChunks)
-            if (renderer->ImageBufferChunkCached(chunk))
-                ++cached;
-    }
+    const size_t cached = requireGpu
+        ? CountImageBufferPrewarmCached(renderer, denseChunks)
+        : 0;
 
     std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
     const bool keepPlayRequest = s_ImageBufferPrewarmGpu.playRequested;
     s_ImageBufferPrewarmGpu.owner = owner;
+    s_ImageBufferPrewarmGpu.renderer = renderer;
     s_ImageBufferPrewarmGpu.initialized = true;
     s_ImageBufferPrewarmGpu.cacheRequired = requireGpu && !denseChunks.empty();
     s_ImageBufferPrewarmGpu.cached = cached;
@@ -246,6 +258,7 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         if (s_ImageBufferPrewarmGpu.owner != owner) {
             s_ImageBufferPrewarmGpu.owner = owner;
+            s_ImageBufferPrewarmGpu.renderer = nullptr;
             s_ImageBufferPrewarmGpu.initialized = false;
             s_ImageBufferPrewarmGpu.cacheRequired = false;
             s_ImageBufferPrewarmGpu.cached = 0;
@@ -302,9 +315,12 @@ BOOL ImageBufferPrewarmPlaybackHold()
         // whether a texture-cache stage is required for this song.
         if (!s_ImageBufferPrewarmGpu.initialized)
             return TRUE;
-        if (s_ImageBufferPrewarmGpu.cacheRequired &&
-            s_ImageBufferPrewarmGpu.cached < s_ImageBufferPrewarmGpu.total)
-            return TRUE;
+        if (s_ImageBufferPrewarmGpu.cacheRequired) {
+            s_ImageBufferPrewarmGpu.cached = CountImageBufferPrewarmCached(
+                s_ImageBufferPrewarmGpu.renderer, s_ImageBufferPrewarmGpu.chunks);
+            if (s_ImageBufferPrewarmGpu.cached < s_ImageBufferPrewarmGpu.total)
+                return TRUE;
+        }
         s_ImageBufferPrewarmGpu.playRequested = false;
     }
     return FALSE;
