@@ -84,14 +84,13 @@ struct FixedSizeConstants {
 };
 
 // Image buffer cache key: everything that changes the baked chunk content.
-// fWarpTime is deliberately excluded (it advances every frame; warp disables
-// the image buffer entirely).
+// Warp fields are deliberately excluded: nonzero warp disables the image
+// buffer, and the warp seeds are randomized every frame even while warp is 0.
 struct ChunkCacheKey {
     int width = 0;
     int height = 0;
     float deflate = 0, notes_y = 0, notes_cy = 0, white_cx = 0, timespan = 0;
     float stripTimeSpan = 0;
-    float fWarp = 0, fWarpSeedX = 0, fWarpSeedY = 0;
     float notes_x = 0, notes_cx = 0, fMT = 0, fMTTilt = 0;
     float corruption = 0;
     unsigned long long eventCount = 0;
@@ -101,8 +100,7 @@ struct ChunkCacheKey {
         return width == o.width && height == o.height &&
             deflate == o.deflate && notes_y == o.notes_y && notes_cy == o.notes_cy &&
             white_cx == o.white_cx && timespan == o.timespan &&
-            stripTimeSpan == o.stripTimeSpan && fWarp == o.fWarp &&
-            fWarpSeedX == o.fWarpSeedX && fWarpSeedY == o.fWarpSeedY &&
+            stripTimeSpan == o.stripTimeSpan &&
             notes_x == o.notes_x && notes_cx == o.notes_cx &&
             fMT == o.fMT && fMTTilt == o.fMTTilt &&
             corruption == o.corruption && eventCount == o.eventCount &&
@@ -247,7 +245,8 @@ public:
     unsigned ImageBufferGetCachedCount() const;
     bool ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount);
     void ImageBufferDrawChunk(long long chunk, float yTop, float yBottom);
-    void ImageBufferSetEventCount(unsigned long long count) { m_ullImageBufferEventCount = count; }
+    void ImageBufferSetEventCount(unsigned long long count);
+    void ImageBufferInvalidate();
     void ImageBufferNotifyFixedChanged() { m_uImageBufferFixedStamp++; }
     void ImageBufferNotifyTrackColorsChanged() { m_uImageBufferTrackColorStamp++; }
 
@@ -316,10 +315,12 @@ protected:
     struct ChunkCacheEntry {
         long long chunk = ImageBufferInvalidChunk;
         unsigned lastUsed = 0;
+        unsigned long long generation = 0;
     };
     ChunkCacheEntry m_ChunkCache[ChunkPoolSize] = {};
     ChunkCacheKey m_ImageBufferKey;
     bool m_bImageBufferCanRender = false;
+    unsigned long long m_ullImageBufferGeneration = 1;
     unsigned m_uImageBufferFixedStamp = 0;
     unsigned m_uImageBufferTrackColorStamp = 0;
     unsigned long long m_ullImageBufferEventCount = 0;

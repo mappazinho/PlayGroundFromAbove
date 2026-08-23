@@ -283,6 +283,26 @@ HRESULT Renderer::SetLimitFPS(bool bLimitFPS) {
 
 // --- Image buffer (pre-rendered note chunks) --------------------------------
 
+void Renderer::ImageBufferInvalidate() {
+    ++m_ullImageBufferGeneration;
+    if (m_ullImageBufferGeneration == 0)
+        m_ullImageBufferGeneration = 1;
+    for (auto& entry : m_ChunkCache) {
+        entry.chunk = ImageBufferInvalidChunk;
+        entry.generation = 0;
+    }
+}
+
+void Renderer::ImageBufferSetEventCount(unsigned long long count) {
+    if (m_ullImageBufferEventCount == count)
+        return;
+    m_ullImageBufferEventCount = count;
+    // This setter is called from RenderNotesImageBuffer, after BeginFrame.
+    // Invalidate immediately so the first frame of a different MIDI cannot
+    // sample textures belonging to the previous event set.
+    ImageBufferInvalidate();
+}
+
 void Renderer::ImageBufferBeginFrame() {
     m_vChunkNotes.clear();
     m_vChunkBuilds.clear();
@@ -303,9 +323,6 @@ void Renderer::ImageBufferBeginFrame() {
     key.white_cx = m_RootConstants.white_cx;
     key.timespan = m_RootConstants.timespan;
     key.stripTimeSpan = m_RootConstants.stripTimeSpan;
-    key.fWarp = m_RootConstants.fWarp;
-    key.fWarpSeedX = m_RootConstants.fWarpSeedX;
-    key.fWarpSeedY = m_RootConstants.fWarpSeedY;
     key.notes_x = m_RootConstants.notes_x;
     key.notes_cx = m_RootConstants.notes_cx;
     key.fMT = m_RootConstants.fMT;
@@ -316,9 +333,9 @@ void Renderer::ImageBufferBeginFrame() {
     key.trackColorStamp = m_uImageBufferTrackColorStamp;
 
     if (!(key == m_ImageBufferKey)) {
-        // Content-affecting change invalidates every cached chunk.
-        for (auto& entry : m_ChunkCache)
-            entry.chunk = ImageBufferInvalidChunk;
+        // Content-affecting change invalidates every cached chunk and advances
+        // the generation so stale screen identities can never match again.
+        ImageBufferInvalidate();
         m_ImageBufferKey = key;
     }
     m_bImageBufferCanRender = true;
@@ -326,7 +343,8 @@ void Renderer::ImageBufferBeginFrame() {
 
 int Renderer::ImageBufferGetChunkSlot(long long chunk) const {
     for (unsigned i = 0; i < ChunkPoolSize; i++)
-        if (m_ChunkCache[i].chunk == chunk)
+        if (m_ChunkCache[i].generation == m_ullImageBufferGeneration &&
+            m_ChunkCache[i].chunk == chunk)
             return (int)i;
     return -1;
 }
@@ -334,7 +352,8 @@ int Renderer::ImageBufferGetChunkSlot(long long chunk) const {
 int Renderer::ImageBufferAllocateSlot() {
     int slot = -1;
     for (unsigned i = 0; i < ChunkPoolSize; i++)
-        if (m_ChunkCache[i].chunk == ImageBufferInvalidChunk) {
+        if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||
+            m_ChunkCache[i].chunk == ImageBufferInvalidChunk) {
             slot = (int)i;
             break;
         }
@@ -373,8 +392,10 @@ int Renderer::ImageBufferAllocateSlot() {
                 slot = (int)i;
             }
     }
-    if (slot >= 0)
+    if (slot >= 0) {
         m_ChunkCache[slot].chunk = ImageBufferInvalidChunk - 1; // in-use
+        m_ChunkCache[slot].generation = m_ullImageBufferGeneration;
+    }
     return slot;
 }
 
@@ -383,12 +404,14 @@ void Renderer::ImageBufferMarkBaked(int slot, long long chunk) {
         return;
     m_ChunkCache[slot].chunk = chunk;
     m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
+    m_ChunkCache[slot].generation = m_ullImageBufferGeneration;
 }
 
 unsigned Renderer::ImageBufferGetCachedCount() const {
     unsigned count = 0;
     for (unsigned i = 0; i < ChunkPoolSize; i++) {
-        if (m_ChunkCache[i].chunk != ImageBufferInvalidChunk &&
+        if (m_ChunkCache[i].generation == m_ullImageBufferGeneration &&
+            m_ChunkCache[i].chunk != ImageBufferInvalidChunk &&
             m_ChunkCache[i].chunk != ImageBufferInvalidChunk - 1) {
             count++;
         }
@@ -403,7 +426,10 @@ bool Renderer::ImageBufferChunkCached(long long chunk) const {
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount) {
     if (!notes)
         noteCount = 0;
-    noteCount = min(noteCount, (unsigned)MaxNotesPerPass);
+    // Never truncate a chunk and then cache the incomplete texture as valid.
+    // Oversized visible chunks use the normal multi-batch fallback path.
+    if (noteCount > MaxNotesPerPass)
+        return false;
     if (m_vChunkNotes.size() + noteCount > MaxNotesPerPass)
         return false; // per-frame budget hit; caller falls back to the note path
     m_vChunkBuilds.push_back({ chunk, (unsigned)m_vChunkNotes.size(), noteCount });

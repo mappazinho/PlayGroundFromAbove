@@ -1186,7 +1186,6 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
-    ImageBufferBeginFrame();
 
     auto c_t0 = std::chrono::steady_clock::now();
     m_pCommandAllocator[m_uFrameIndex]->Reset();
@@ -1252,6 +1251,10 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
         m_pCommandList->ResourceBarrier(1, &fixed_barrier);
     }
 
+    // Build the image-buffer key only after fixed constants and track-color
+    // stamps have been updated for this frame.
+    ImageBufferBeginFrame();
+
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pRenderTargets[m_uFrameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     m_pCommandList->ResourceBarrier(1, &barrier);
 
@@ -1307,6 +1310,26 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         if (FAILED(res))
             return res;
     }
+
+    // Chunk draws above reference slices in this frame's upload buffer. If a
+    // visible chunk overflowed the bake budget, the fallback path below needs
+    // to reuse that same buffer. Submit and retire the chunk work first so the
+    // fallback upload cannot mutate memory referenced by recorded D3D12 draws.
+    if (!m_vChunkBuilds.empty() && !m_vNotesIntermediate.empty()) {
+        res = m_pCommandList->Close();
+        if (FAILED(res))
+            return res;
+        ID3D12CommandList* command_lists[] = { m_pCommandList.Get() };
+        m_pCommandQueue->ExecuteCommandLists(1, command_lists);
+        res = WaitForGPU();
+        if (FAILED(res))
+            return res;
+        m_pCommandAllocator[m_uFrameIndex]->Reset();
+        m_pCommandList->Reset(m_pCommandAllocator[m_uFrameIndex].Get(), m_pRectPipelineState.Get());
+        SetPipeline(Pipeline::Note);
+        SetupCommandList();
+    }
+
     // Not else-if: fallback notes (image-buffer budget overflow) must still
     // draw through this path in the same frame.
     if (!m_vNotesIntermediate.empty()) {
@@ -1885,6 +1908,22 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         m_pCommandList->ResourceBarrier(1, &fixed_barrier);
     }
 
+    // A D3D12 upload heap is not implicitly renamed like D3D11 WRITE_DISCARD.
+    // Upload the complete per-frame chunk-note array once and point each
+    // recorded chunk draw at its own immutable slice. Rewriting offset 0 for
+    // every draw made earlier draws observe later chunks' note data.
+    if (!m_vChunkNotes.empty()) {
+        const SIZE_T chunkBytes = (SIZE_T)m_vChunkNotes.size() * sizeof(NoteData);
+        D3D12_RANGE noRead = { 0, 0 };
+        NoteData* mappedNotes = nullptr;
+        res = m_pNoteBuffers[m_uFrameIndex]->Map(0, &noRead, (void**)&mappedNotes);
+        if (FAILED(res))
+            return res;
+        memcpy(mappedNotes, m_vChunkNotes.data(), chunkBytes);
+        D3D12_RANGE written = { 0, chunkBytes };
+        m_pNoteBuffers[m_uFrameIndex]->Unmap(0, &written);
+    }
+
     for (const auto& req : m_vChunkBuilds) {
         if (ImageBufferGetChunkSlot(req.chunk) >= 0)
             continue; // already baked this frame
@@ -1920,24 +1959,15 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         m_pCommandList->ClearRenderTargetView(m_ChunkRTVCPU[slot], clear_color, 0, nullptr);
         m_pCommandList->ClearDepthStencilView(m_ChunkDSVCPU, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-        // Chunk notes go into [0, count) of the note buffer (free in image buffer mode)
         if (req.noteCount > 0) {
-            D3D12_RANGE note_range = {
-                .Begin = 0,
-                .End = (SIZE_T)req.noteCount * sizeof(NoteData),
-            };
-            NoteData* notes = nullptr;
-            res = m_pNoteBuffers[m_uFrameIndex]->Map(0, &note_range, (void**)&notes);
-            if (FAILED(res))
-                return res;
-            memcpy(notes, &m_vChunkNotes[req.noteOffset], (SIZE_T)req.noteCount * sizeof(NoteData));
-            m_pNoteBuffers[m_uFrameIndex]->Unmap(0, &note_range);
-
             SetPipeline(Pipeline::Note);
             m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(chunkRoot) / 4, &chunkRoot, 0);
             m_pCommandList->SetGraphicsRootShaderResourceView(1, m_pChunkFixedBuffer->GetGPUVirtualAddress());
             m_pCommandList->SetGraphicsRootShaderResourceView(2, m_pTrackColorBuffer->GetGPUVirtualAddress());
-            m_pCommandList->SetGraphicsRootShaderResourceView(3, m_pNoteBuffers[m_uFrameIndex]->GetGPUVirtualAddress());
+            const D3D12_GPU_VIRTUAL_ADDRESS noteBase =
+                m_pNoteBuffers[m_uFrameIndex]->GetGPUVirtualAddress() +
+                (UINT64)req.noteOffset * sizeof(NoteData);
+            m_pCommandList->SetGraphicsRootShaderResourceView(3, noteBase);
             m_pCommandList->DrawIndexedInstanced((UINT)req.noteCount * 6, 1, 0, 0, 0);
         }
 
