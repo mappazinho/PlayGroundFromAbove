@@ -82,7 +82,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
 
         const long long startTime = midi.GetEventTime(event);
         const long long lengthTime = midi.GetEventLength(event);
-        const long long endTime = ImageBufferOverlapSaturatingAdd(startTime, std::max(0LL, lengthTime));
+        const long long endTime = ImageBufferOverlapSaturatingAdd(startTime, (std::max)(0LL, lengthTime));
         const long long endTick = midi.GetEventAbsT(events[sister]);
         const size_t block = i / ImageBufferOverlapBlockEvents;
 
@@ -136,7 +136,7 @@ inline void ImageBufferOverlapCollect(
         const long long blockMaxEnd = tickMode ? state.maxEndTick[block] : state.maxEndTime[block];
         if (blockMaxEnd >= oldestUsefulEnd) {
             const size_t begin = block * ImageBufferOverlapBlockEvents;
-            const size_t end = std::min(hi, begin + ImageBufferOverlapBlockEvents);
+            const size_t end = (std::min)(hi, begin + ImageBufferOverlapBlockEvents);
             for (size_t i = end; i != begin; ) {
                 --i;
                 const MIDIChannelEvent event = events[i];
@@ -146,7 +146,7 @@ inline void ImageBufferOverlapCollect(
 
                 NoteData data = buildNote(event, chunkStart);
                 if (data.pos < (float)timeSpan &&
-                    data.pos + std::max(data.length, 0.0f) >= 0.0f)
+                    data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
                     out.push_back(data);
             }
         }
