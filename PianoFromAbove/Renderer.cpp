@@ -84,7 +84,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE MPD3D12EnsureDepth(Renderer* renderer, ID3D12
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
         heapDesc.NumDescriptors = Renderer::ChunkPoolSize;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-        if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(pool.heap.ReleaseAndGetAddressOf()))))
+        if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&pool.heap))))
             return none;
         pool.descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         D3D12_CPU_DESCRIPTOR_HANDLE start = pool.heap->GetCPUDescriptorHandleForHeapStart();
@@ -122,8 +122,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE MPD3D12EnsureDepth(Renderer* renderer, ID3D12
     heap.VisibleNodeMask = 1;
 
     HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
-        IID_PPV_ARGS(pool.depth[slot].ReleaseAndGetAddressOf()));
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&pool.depth[slot]));
     if (FAILED(hr))
         return none;
 
