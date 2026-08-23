@@ -1306,7 +1306,10 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         res = RenderImageBuffer();
         if (FAILED(res))
             return res;
-    } else if (!m_vNotesIntermediate.empty()) {
+    }
+    // Not else-if: fallback notes (image-buffer budget overflow) must still
+    // draw through this path in the same frame.
+    if (!m_vNotesIntermediate.empty()) {
         const size_t total = m_vNotesIntermediate.size();
         const size_t noteLimit = m_bUnlimitedNotes
             ? total
@@ -1979,6 +1982,7 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
             const int slot = ImageBufferGetChunkSlot(quad.chunk);
             if (slot < 0)
                 continue; // not baked this frame (shouldn't happen)
+            m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
             quadConstants.quadPos[0] = notesX;
             quadConstants.quadPos[1] = quad.yTop;
             quadConstants.quadSize[0] = notesCX;

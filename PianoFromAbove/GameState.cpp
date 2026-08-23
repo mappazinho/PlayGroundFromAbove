@@ -1671,12 +1671,27 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
             m_llMaxNPS = 1;
             vector<long long> noteTimes;
             noteTimes.reserve(m_vEvents.size());
+            // Longest note (start -> sister start), both time domains; used by
+            // the image buffer to catch notes that begin before a chunk but
+            // overlap into it.
+            m_llMaxNoteLen = 0;
+            m_llMaxNoteLenTicks = 0;
             for (size_t i = 0; i < m_vEvents.size(); i++)
             {
                 if (m_MIDI.GetEventChannelEventType(m_vEvents[i]) == MIDI::NoteOn &&
                     m_MIDI.GetEventParam2(m_vEvents[i]) > 0)
                 {
                     noteTimes.push_back(m_MIDI.GetEventTime(m_vEvents[i]));
+                    if (m_MIDI.EventHasSister(m_vEvents[i]))
+                    {
+                        long long len = m_MIDI.GetEventLength(m_vEvents[i]);
+                        if (len > m_llMaxNoteLen)
+                            m_llMaxNoteLen = len;
+                        len = m_MIDI.GetEventAbsT(m_vEvents[m_MIDI.GetEventSisterIdx(m_vEvents[i])]) -
+                              m_MIDI.GetEventAbsT(m_vEvents[i]);
+                        if (len > m_llMaxNoteLenTicks)
+                            m_llMaxNoteLenTicks = len;
+                    }
                 }
             }
             if (!noteTimes.empty())
@@ -3448,18 +3463,26 @@ void MainScreen::RenderNotesImageBuffer()
     unsigned lookaheadBakes = 0;
     const unsigned maxLookaheadBakesPerFrame = 8;
 
-    auto BakeChunk = [&](long long k) {
-        if (m_pRenderer->ImageBufferChunkCached(k))
-            return;
+    // Notes can begin before a chunk yet overlap into it. The scan window must
+    // reach back over the longest note in the song (plus the corruption
+    // margin), otherwise lookahead chunks bake with missing bars.
+    const long long maxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
+    const long long backScan = max(E, maxLen);
 
+    // Collects notes for visible chunks that could not be queued for baking
+    // (per-frame note budget hit); they are drawn through the normal path.
+    std::vector<NoteData> fallbackNotes;
+
+    // Scans every note overlapping [chunkStart, chunkStart+T) into chunkNotes
+    // (chunk-relative positions). The window reaches back over the longest
+    // note in the song plus the corruption margin, so baked content is a pure
+    // function of the chunk range — independent of playback state.
+    auto CollectChunk = [&](long long k) {
         const long long chunkStart = k * T;
         const long long chunkEnd = chunkStart + T;
         chunkNotes.clear();
 
-        // Forward scan over events with raw time in [chunkStart - E, chunkEnd + E):
-        // corrupted start times land in [raw - (E-1), raw + (E-1)], so any note
-        // that can corrupt into this chunk is inside this window.
-        auto itLo = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkStart - E,
+        auto itLo = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkStart - backScan,
             [&](MIDIChannelEvent lhs, long long rhs) {
                 return (bTickMode ? m_MIDI.GetEventAbsT(lhs) : m_MIDI.GetEventTime(lhs)) < rhs;
             });
@@ -3470,38 +3493,35 @@ void MainScreen::RenderNotesImageBuffer()
             if (m_MIDI.GetEventChannelEventType(*it) != MIDI::NoteOn ||
                 m_MIDI.GetEventParam2(*it) <= 0 || !m_MIDI.EventHasSister(*it))
                 continue;
-            if (tRaw < chunkStart - E)
-                continue; // safety; should not happen given the search bound
 
             NoteData data = BuildChunkNoteData(*it, chunkStart);
             if (data.pos < (float)T && data.pos + max(data.length, 0.0f) >= 0.0f)
                 chunkNotes.push_back(data);
         }
-
-        // Sustaining notes: still open at tStart but started before the forward
-        // scan window (dedup with raw < chunkStart - E).
-        if (k <= kLast) {
-            for (size_t key = 0; key < 128; key++) {
-                for (const int idx : m_vState[key]) {
-                    const MIDIChannelEvent pEvent = m_vEvents[idx];
-                    const long long tRaw = bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
-                    if (tRaw >= chunkStart - E)
-                        continue;
-
-                    NoteData data = BuildChunkNoteData(pEvent, chunkStart);
-                    if (data.pos < (float)T && data.pos + max(data.length, 0.0f) >= 0.0f)
-                        chunkNotes.push_back(data);
-                }
-            }
-        }
-
-        m_pRenderer->ImageBufferRenderChunk(k, chunkNotes.data(), (unsigned)chunkNotes.size());
     };
 
-    // 1. Ensure all visible chunks are baked
+    // Returns false when the chunk needs drawing but could not be queued.
+    auto BakeChunk = [&](long long k) -> bool {
+        if (m_pRenderer->ImageBufferChunkCached(k))
+            return true;
+
+        CollectChunk(k);
+        return m_pRenderer->ImageBufferRenderChunk(k, chunkNotes.data(), (unsigned)chunkNotes.size());
+    };
+
+    // 1. Ensure all visible chunks are baked; on budget failure queue their
+    //    notes through the regular note path so nothing disappears.
     for (long long k = kFirst; k <= kLast; k++) {
-        BakeChunk(k);
+        if (!BakeChunk(k)) {
+            CollectChunk(k);
+            for (NoteData data : chunkNotes) {
+                data.pos += static_cast<float>(k * T - tStart);
+                fallbackNotes.push_back(data);
+            }
+        }
     }
+    for (const NoteData& data : fallbackNotes)
+        m_pRenderer->PushNoteData(data);
 
     // 2. Pre-bake upcoming lookahead chunks
     for (long long k = kLast + 1; k <= kMax && lookaheadBakes < maxLookaheadBakesPerFrame; k++) {

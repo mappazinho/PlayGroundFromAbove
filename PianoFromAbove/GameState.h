@@ -306,6 +306,8 @@ void RenderText();
     deque<tuple<long long, long long>> m_dNPSNotes;
     deque<long long> m_dNPSHistory;
     long long m_llMaxNPS = 1;
+    long long m_llMaxNoteLen = 0;       // longest note, microseconds
+    long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;
     float m_fLastBGBlur = -1.0f;

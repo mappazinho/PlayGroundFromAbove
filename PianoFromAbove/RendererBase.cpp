@@ -295,11 +295,17 @@ void Renderer::ImageBufferBeginFrame() {
         return;
 
     ChunkCacheKey key = {};
-    key.width = (int)round(m_RootConstants.notes_cx);
-    key.height = (int)round(m_RootConstants.notes_cy);
+    key.width = m_iBufferWidth;
+    key.height = m_iBufferHeight;
     key.deflate = m_RootConstants.deflate;
+    key.notes_y = m_RootConstants.notes_y;
+    key.notes_cy = m_RootConstants.notes_cy;
     key.white_cx = m_RootConstants.white_cx;
     key.timespan = m_RootConstants.timespan;
+    key.stripTimeSpan = m_RootConstants.stripTimeSpan;
+    key.fWarp = m_RootConstants.fWarp;
+    key.fWarpSeedX = m_RootConstants.fWarpSeedX;
+    key.fWarpSeedY = m_RootConstants.fWarpSeedY;
     key.notes_x = m_RootConstants.notes_x;
     key.notes_cx = m_RootConstants.notes_cx;
     key.fMT = m_RootConstants.fMT;
@@ -333,7 +339,33 @@ int Renderer::ImageBufferAllocateSlot() {
             break;
         }
     if (slot < 0) {
-        // LRU eviction
+        // Evict the lowest-numbered chunk that is not queued for drawing this
+        // frame (oldest screens recycle first; visible chunks are protected).
+        long long bestChunk = 0;
+        int bestSlot = -1;
+        bool found = false;
+        for (unsigned i = 0; i < ChunkPoolSize; i++) {
+            const long long chunk = m_ChunkCache[i].chunk;
+            if (chunk == ImageBufferInvalidChunk || chunk == ImageBufferInvalidChunk - 1)
+                continue;
+            bool bVisible = false;
+            for (const auto& quad : m_vChunkQuads) {
+                if (quad.chunk == chunk) {
+                    bVisible = true;
+                    break;
+                }
+            }
+            if (!bVisible && (!found || chunk < bestChunk)) {
+                bestChunk = chunk;
+                bestSlot = (int)i;
+                found = true;
+            }
+        }
+        slot = bestSlot;
+    }
+    if (slot < 0) {
+        // Every slot is visible this frame (> ChunkPoolSize quads); fall back
+        // to LRU so allocation still succeeds.
         unsigned oldest = UINT_MAX;
         for (unsigned i = 0; i < ChunkPoolSize; i++)
             if (m_ChunkCache[i].lastUsed < oldest) {
@@ -368,15 +400,16 @@ bool Renderer::ImageBufferChunkCached(long long chunk) const {
     return ImageBufferGetChunkSlot(chunk) >= 0;
 }
 
-void Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount) {
+bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount) {
     if (!notes)
         noteCount = 0;
     noteCount = min(noteCount, (unsigned)MaxNotesPerPass);
     if (m_vChunkNotes.size() + noteCount > MaxNotesPerPass)
-        return;
+        return false; // per-frame budget hit; caller falls back to the note path
     m_vChunkBuilds.push_back({ chunk, (unsigned)m_vChunkNotes.size(), noteCount });
     if (notes && noteCount > 0)
         m_vChunkNotes.insert(m_vChunkNotes.end(), notes, notes + noteCount);
+    return true;
 }
 
 void Renderer::ImageBufferDrawChunk(long long chunk, float yTop, float yBottom) {

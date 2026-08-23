@@ -83,13 +83,15 @@ struct FixedSizeConstants {
     float bends[16];
 };
 
-// Image buffer content key: only fields that change what is baked INTO chunk
-// textures. Layout-only fields (notes_y, stripTimeSpan, fWarp) are excluded
-// because they only affect the draw pass, not the baked pixel content.
+// Image buffer cache key: everything that changes the baked chunk content.
+// fWarpTime is deliberately excluded (it advances every frame; warp disables
+// the image buffer entirely).
 struct ChunkCacheKey {
-    int width = 0;   // chunk texture width  = round(notes_cx)
-    int height = 0;  // chunk texture height = round(notes_cy)
-    float deflate = 0, white_cx = 0, timespan = 0;
+    int width = 0;
+    int height = 0;
+    float deflate = 0, notes_y = 0, notes_cy = 0, white_cx = 0, timespan = 0;
+    float stripTimeSpan = 0;
+    float fWarp = 0, fWarpSeedX = 0, fWarpSeedY = 0;
     float notes_x = 0, notes_cx = 0, fMT = 0, fMTTilt = 0;
     float corruption = 0;
     unsigned long long eventCount = 0;
@@ -97,7 +99,10 @@ struct ChunkCacheKey {
     unsigned trackColorStamp = 0;
     bool operator==(const ChunkCacheKey& o) const {
         return width == o.width && height == o.height &&
-            deflate == o.deflate && white_cx == o.white_cx && timespan == o.timespan &&
+            deflate == o.deflate && notes_y == o.notes_y && notes_cy == o.notes_cy &&
+            white_cx == o.white_cx && timespan == o.timespan &&
+            stripTimeSpan == o.stripTimeSpan && fWarp == o.fWarp &&
+            fWarpSeedX == o.fWarpSeedX && fWarpSeedY == o.fWarpSeedY &&
             notes_x == o.notes_x && notes_cx == o.notes_cx &&
             fMT == o.fMT && fMTTilt == o.fMTTilt &&
             corruption == o.corruption && eventCount == o.eventCount &&
@@ -240,7 +245,7 @@ public:
     bool ImageBufferCanRender() const { return m_bImageBufferCanRender; }
     bool ImageBufferChunkCached(long long chunk) const;
     unsigned ImageBufferGetCachedCount() const;
-    void ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount);
+    bool ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount);
     void ImageBufferDrawChunk(long long chunk, float yTop, float yBottom);
     void ImageBufferSetEventCount(unsigned long long count) { m_ullImageBufferEventCount = count; }
     void ImageBufferNotifyFixedChanged() { m_uImageBufferFixedStamp++; }
