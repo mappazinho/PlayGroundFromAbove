@@ -135,10 +135,9 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
             midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
             continue;
 
-        const size_t sisterIndex = (size_t)midi.GetEventSisterIdx(event);
-        if (sisterIndex >= events.size())
-            continue;
-        const MIDIChannelEvent sister = events[sisterIndex];
+        // GetEventSisterIdx returns a MIDI row id, not an index into the
+        // time-sorted m_vEvents vector. Use that row directly for tick/end data.
+        const MIDIChannelEvent sister = (MIDIChannelEvent)midi.GetEventSisterIdx(event);
 
         const long long startTime = midi.GetEventTime(event);
         const long long lengthTime = (std::max)(0LL, midi.GetEventLength(event));
