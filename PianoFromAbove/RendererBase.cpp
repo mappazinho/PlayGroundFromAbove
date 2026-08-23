@@ -66,9 +66,37 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         return false;
 
     if (state.slot < 0) {
-        const int slot = ImageBufferAllocateSlot();
+        // Reservation happens earlier than the legacy backend allocation, before
+        // this frame's visible quad list has been populated. Use LRU here rather
+        // than the legacy lowest-chunk eviction rule: screens visible last frame
+        // have the freshest lastUsed value, while the in-progress sentinel is
+        // never considered an eviction candidate.
+        int slot = -1;
+        for (unsigned i = 0; i < ChunkPoolSize; ++i) {
+            if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||
+                m_ChunkCache[i].chunk == ImageBufferInvalidChunk) {
+                slot = (int)i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            unsigned oldest = UINT_MAX;
+            for (unsigned i = 0; i < ChunkPoolSize; ++i) {
+                if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||
+                    m_ChunkCache[i].chunk == ImageBufferInvalidChunk ||
+                    m_ChunkCache[i].chunk == ImageBufferInvalidChunk - 1)
+                    continue;
+                if (m_ChunkCache[i].lastUsed < oldest) {
+                    oldest = m_ChunkCache[i].lastUsed;
+                    slot = (int)i;
+                }
+            }
+        }
         if (slot < 0)
             return false;
+
+        m_ChunkCache[slot].chunk = ImageBufferInvalidChunk - 1;
+        m_ChunkCache[slot].generation = m_ullImageBufferGeneration;
         state.slot = slot;
         state.chunk = chunk;
         state.cursor = 0;
