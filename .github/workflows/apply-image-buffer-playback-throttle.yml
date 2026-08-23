@@ -3,6 +3,8 @@ name: Apply image buffer playback throttle
 on:
   push:
     branches: [fix/image-buffer-playback-stutter]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
