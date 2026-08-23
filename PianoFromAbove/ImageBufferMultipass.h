@@ -40,28 +40,69 @@ inline ImageBufferMultipassState& ImageBufferMPGet(Renderer* renderer)
     return ImageBufferMPMap()[renderer];
 }
 
+// Let the backend sample an in-progress slot after this frame's pass has been
+// recorded. While requestQueued is true this helper deliberately returns -1 so
+// the build loop does not mistake the partial slot for a completed cache entry.
+inline int ImageBufferMPDrawableSlot(Renderer* renderer, int cachedSlot, long long chunk)
+{
+    if (cachedSlot >= 0)
+        return cachedSlot;
+
+    const auto& s = ImageBufferMPGet(renderer);
+    if (!s.requestQueued && s.slot >= 0 && s.chunk == chunk && s.cursor > 0)
+        return s.slot;
+    return -1;
+}
+
+// A normal-render fallback above this size is more expensive than simply
+// waiting for the image-buffer chunk to become drawable. Keeping this bounded
+// prevents a dense visible chunk from rendering millions of notes normally
+// while also spending a multipass GPU slice on the same frame.
+static constexpr size_t ImageBufferMPMaxNormalFallbackNotes = 100000;
+
 // GameState normally rebuilds a complete NoteData vector before every call to
 // ImageBufferRenderChunk. Once a multipass chunk has its CPU staging copy, the
-// first collection on the next frame can be skipped entirely. A second call in
-// the same frame means the chunk is visible and needs the normal-note fallback,
-// so provide the cached full vector instead of rescanning/reconverting events.
+// first collection on later frames can be skipped entirely. Visible in-progress
+// chunks are drawn from their partial texture, so they never need the full
+// normal-note fallback. If another visible chunk could not start because this
+// frame's one multipass request is already occupied, keep the ordinary fallback
+// only when that chunk is small enough to be cheap.
 template <typename Collector>
 inline void ImageBufferMPCollectDispatch(Renderer* renderer, std::vector<NoteData>& out,
                                          Collector& collector, long long chunk)
 {
     auto& s = ImageBufferMPGet(renderer);
+
     if (s.chunk == chunk && !s.notes.empty()) {
         if (s.collectChunk != chunk) {
             s.collectChunk = chunk;
             s.collectCalls = 0;
         }
+
+        // First call this frame is BakeChunk's collection. The renderer already
+        // owns the complete CPU staging vector, so avoid rebuilding it.
         if (s.collectCalls == 0) {
             s.collectCalls = 1;
             out.clear();
             return;
         }
+
+        // A second call is GameState asking for visible fallback after the bake
+        // returned incomplete. Do not copy/push millions of notes through the
+        // regular renderer; the backend will draw the accumulated partial slot.
         ++s.collectCalls;
-        out = s.notes;
+        out.clear();
+        return;
+    }
+
+    // A second collection of a different chunk in the same frame means its
+    // BakeChunk could not claim the one multipass request. Reuse the vector that
+    // is already in `out`, but suppress it when it would be an expensive normal
+    // fallback. It can begin its own multipass on a following frame.
+    if (s.collectChunk == chunk && s.collectCalls > 0) {
+        ++s.collectCalls;
+        if (out.size() > ImageBufferMPMaxNormalFallbackNotes)
+            out.clear();
         return;
     }
 
