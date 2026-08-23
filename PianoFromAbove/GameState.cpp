@@ -32,8 +32,18 @@
                 return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \
             }); \
     }; \
+    bool imageBufferAnyHidden = false; \
+    for (const auto& imageBufferTrack : m_vTrackSettings) { \
+        for (int imageBufferChannel = 0; imageBufferChannel < 16; ++imageBufferChannel) { \
+            if (imageBufferTrack.aChannels[imageBufferChannel].bHidden) { \
+                imageBufferAnyHidden = true; \
+                break; \
+            } \
+        } \
+        if (imageBufferAnyHidden) break; \
+    } \
     const int imageBufferPrepRows = (int)std::ceil(std::fabs(notesCY)); \
-    const bool imageBufferPreparedHandled = ImageBufferPreparedTryCollect( \
+    const bool imageBufferPreparedHandled = !imageBufferAnyHidden && ImageBufferPreparedTryCollect( \
         this, m_pRenderer, m_vEvents, m_MIDI, chunkNotes, (k), \
         kFirst, kLast, kMax, T, E, bTickMode, fCorrupt, \
         m_vTrackSettings.size(), imageBufferPrepRows); \
