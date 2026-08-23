@@ -2,6 +2,8 @@ name: Add hot preload state
 on:
   push:
     branches: [fix/image-buffer-dense-hot-preload]
+  pull_request:
+    branches: [main]
 permissions:
   contents: write
 jobs:
