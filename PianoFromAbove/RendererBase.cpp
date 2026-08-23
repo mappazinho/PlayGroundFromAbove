@@ -60,6 +60,7 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         state.slot = -1;
         state.cursor = 0;
         state.total = 0;
+        state.notes.clear();
     }
 
     if (noteCount > 0 && state.frameNotes >= kImageBufferNotesPerFrame)
@@ -100,12 +101,16 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         state.slot = slot;
         state.chunk = chunk;
         state.cursor = 0;
-        state.total = noteCount;
-    } else if (state.total != noteCount) {
+        state.notes.clear();
+        if (noteCount > 0)
+            state.notes.assign(notes, notes + noteCount);
+        state.total = state.notes.size();
+    } else if (noteCount > 0 && noteCount != state.total) {
         // The same chunk should be stable within a cache generation. If its
-        // source count changes anyway, rebuild it from scratch safely.
+        // source count changes anyway, rebuild the CPU staging copy from zero.
         state.cursor = 0;
-        state.total = noteCount;
+        state.notes.assign(notes, notes + noteCount);
+        state.total = state.notes.size();
     }
 
     if (state.cursor > state.total)
@@ -122,7 +127,9 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
 
     const unsigned noteOffset = (unsigned)m_vChunkNotes.size();
     if (passCount > 0)
-        m_vChunkNotes.insert(m_vChunkNotes.end(), notes + state.cursor, notes + state.cursor + passCount);
+        m_vChunkNotes.insert(m_vChunkNotes.end(),
+            state.notes.data() + state.cursor,
+            state.notes.data() + state.cursor + passCount);
 
     m_vChunkBuilds.push_back({ chunk, noteOffset, (unsigned)passCount });
     state.requestQueued = true;
