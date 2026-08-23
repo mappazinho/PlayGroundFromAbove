@@ -16,6 +16,8 @@ static void MPD3D11OMSetRenderTargets(Renderer*, ID3D11Device*, ID3D11DeviceCont
 static void MPD3D11ClearRenderTargetView(Renderer*, ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT*);
 static void MPD3D11ClearDepthStencilView(Renderer*, ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
 
+#define ImageBufferGetChunkSlot(chunk) \
+    ImageBufferMPDrawableSlot(this, Renderer::ImageBufferGetChunkSlot((chunk)), (chunk))
 #define ImageBufferAllocateSlot() ImageBufferMPBeginBackend(this)
 #define ImageBufferMarkBaked(slot, chunk) do { \
     if (ImageBufferMPRequestFinalize(this)) Renderer::ImageBufferMarkBaked((slot), (chunk)); \
@@ -33,6 +35,7 @@ static void MPD3D11ClearDepthStencilView(Renderer*, ID3D11DeviceContext*, ID3D11
 #undef OMSetRenderTargets
 #undef ImageBufferMarkBaked
 #undef ImageBufferAllocateSlot
+#undef ImageBufferGetChunkSlot
 
 struct MPD3D11DepthPool {
     ID3D11Device* deviceTag = nullptr;

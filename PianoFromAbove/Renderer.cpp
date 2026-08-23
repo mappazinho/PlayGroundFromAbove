@@ -26,6 +26,8 @@ static void MPD3D12ClearRenderTargetView(Renderer*, ID3D12GraphicsCommandList*,
 static void MPD3D12ClearDepthStencilView(Renderer*, ID3D12GraphicsCommandList*,
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
 
+#define ImageBufferGetChunkSlot(chunk) \
+    ImageBufferMPDrawableSlot(this, Renderer::ImageBufferGetChunkSlot((chunk)), (chunk))
 #define ImageBufferAllocateSlot() ImageBufferMPBeginBackend(this)
 #define ImageBufferMarkBaked(slot, chunk) do { \
     if (ImageBufferMPRequestFinalize(this)) Renderer::ImageBufferMarkBaked((slot), (chunk)); \
@@ -43,6 +45,7 @@ static void MPD3D12ClearDepthStencilView(Renderer*, ID3D12GraphicsCommandList*,
 #undef OMSetRenderTargets
 #undef ImageBufferMarkBaked
 #undef ImageBufferAllocateSlot
+#undef ImageBufferGetChunkSlot
 
 struct MPD3D12DepthPool {
     ID3D12Device* deviceTag = nullptr;
