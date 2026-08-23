@@ -260,68 +260,112 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferExactCollector, (k)); \
 }())
 
-// The playback gate can hold MainScreen at the pre-roll position where
-// RenderNotes() has no events and returns before RenderNotesImageBuffer(). The
-// old wake-up therefore waited for a cache miss that could never be collected.
-// Intercept frame start and explicitly initialize/schedule the full dense set.
-// A generic lambda keeps the MainScreen-only member accesses out of the Splash
-// and Intro instantiations of this wrapper.
+// Prewarm cannot depend on RenderNotesImageBuffer(): while Play is gated the
+// song can sit in its empty pre-roll, where RenderNotes() returns before image
+// buffers are touched. Prime the dense CPU set at frame start and, once it is
+// ready, submit one dense GPU bake per held frame. This makes both preparation
+// stages independent of the current visible-note window.
 #define ClearAndBeginScene(...) ([&](auto* imageBufferPrewarmSelf) -> HRESULT { \
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
+    bool imageBufferPrewarmActive = false; \
     if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
-        if (!imageBufferPrewarmSelf->m_bDiscarded && \
+        imageBufferPrewarmActive = !imageBufferPrewarmSelf->m_bDiscarded && \
             ImageBufferPreparedGetWaitBeforePlayback() && \
             Config::GetConfig().GetVizSettings().bImageBufferNotes && \
             !g_bVideoRendering && \
-            ImageBufferPrewarmPlayRequestedFor(imageBufferPrewarmSelf)) { \
-            bool imageBufferPrewarmAnyHidden = false; \
-            for (const auto& imageBufferPrewarmTrack : imageBufferPrewarmSelf->m_vTrackSettings) { \
-                for (int imageBufferPrewarmChannel = 0; imageBufferPrewarmChannel < 16; ++imageBufferPrewarmChannel) { \
-                    if (imageBufferPrewarmTrack.aChannels[imageBufferPrewarmChannel].bHidden) { \
-                        imageBufferPrewarmAnyHidden = true; \
-                        break; \
-                    } \
-                } \
-                if (imageBufferPrewarmAnyHidden) break; \
+            ImageBufferPrewarmPlayRequestedFor(imageBufferPrewarmSelf); \
+        if (imageBufferPrewarmActive) { \
+            if (imageBufferPrewarmSelf->m_bImageBufferNeedsInvalidate) { \
+                imageBufferPrewarmSelf->m_pRenderer->ImageBufferInvalidate(); \
+                imageBufferPrewarmSelf->m_bImageBufferNeedsInvalidate = false; \
             } \
-            if (imageBufferPrewarmAnyHidden) { \
+            imageBufferPrewarmSelf->m_pRenderer->ImageBufferSetEventCount( \
+                (unsigned long long)imageBufferPrewarmSelf->m_vEvents.size()); \
+        } \
+    } \
+    const HRESULT imageBufferPrewarmClearResult = \
+        imageBufferPrewarmSelf->m_pRenderer->ClearAndBeginScene(__VA_ARGS__); \
+    if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
+        if (imageBufferPrewarmActive && SUCCEEDED(imageBufferPrewarmClearResult)) { \
+            if (!imageBufferPrewarmSelf->m_pRenderer->ImageBufferCanRender()) { \
                 ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
+                UpdateImageBufferPrewarmGpuProgress( \
+                    imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, 1, 0, false); \
             } else { \
-                const long long imageBufferPrewarmT = imageBufferPrewarmSelf->m_llTimeSpan; \
-                if (imageBufferPrewarmT > 0 && !imageBufferPrewarmSelf->m_vEvents.empty()) { \
-                    const bool imageBufferPrewarmTickMode = imageBufferPrewarmSelf->m_bTickMode; \
-                    const float imageBufferPrewarmCorrupt = imageBufferPrewarmSelf->GetCorruptorAmount(); \
-                    const long long imageBufferPrewarmE = 1 + (long long)std::ceil( \
-                        (double)imageBufferPrewarmT * 0.10 * (double)imageBufferPrewarmCorrupt); \
-                    int imageBufferPrewarmRows = (int)std::ceil(std::fabs(imageBufferPrewarmSelf->m_fNotesCY)); \
-                    imageBufferPrewarmRows = (std::min)((std::max)(imageBufferPrewarmRows, 64), \
-                        ImageBufferPreparedMaxRows); \
-                    auto& imageBufferPrewarmOverlap = ImageBufferOverlapEnsureIndex( \
-                        imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI); \
-                    const auto imageBufferPrewarmSource = imageBufferPrewarmOverlap.preparedSource; \
-                    if (!imageBufferPrewarmSource || imageBufferPrewarmSource->notes.empty() || \
-                        imageBufferPrewarmCorrupt > 1.0f || \
-                        (imageBufferPrewarmTickMode ? imageBufferPrewarmSource->tickOverflow : imageBufferPrewarmSource->timeOverflow)) { \
-                        ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
-                    } else { \
-                        const uint64_t imageBufferPrewarmSignature = ImageBufferPreparedSignature( \
-                            imageBufferPrewarmSource.get(), imageBufferPrewarmT, imageBufferPrewarmTickMode, \
-                            imageBufferPrewarmCorrupt, imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows); \
-                        ImageBufferPreparedGet().Activate(imageBufferPrewarmSource.get(), imageBufferPrewarmSignature); \
-                        ImageBufferPreparedPrimeAllDense( \
-                            imageBufferPrewarmSelf, imageBufferPrewarmSource, imageBufferPrewarmT, imageBufferPrewarmE, \
-                            imageBufferPrewarmTickMode, imageBufferPrewarmCorrupt, \
-                            imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows, \
-                            imageBufferPrewarmSignature); \
-                        UpdateImageBufferPrewarmGpuProgress( \
-                            imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, \
-                            imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode); \
+                bool imageBufferPrewarmAnyHidden = false; \
+                for (const auto& imageBufferPrewarmTrack : imageBufferPrewarmSelf->m_vTrackSettings) { \
+                    for (int imageBufferPrewarmChannel = 0; imageBufferPrewarmChannel < 16; ++imageBufferPrewarmChannel) { \
+                        if (imageBufferPrewarmTrack.aChannels[imageBufferPrewarmChannel].bHidden) { \
+                            imageBufferPrewarmAnyHidden = true; \
+                            break; \
+                        } \
+                    } \
+                    if (imageBufferPrewarmAnyHidden) break; \
+                } \
+                if (imageBufferPrewarmAnyHidden) { \
+                    ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
+                } else { \
+                    const long long imageBufferPrewarmT = imageBufferPrewarmSelf->m_llTimeSpan; \
+                    if (imageBufferPrewarmT > 0 && !imageBufferPrewarmSelf->m_vEvents.empty()) { \
+                        const bool imageBufferPrewarmTickMode = imageBufferPrewarmSelf->m_bTickMode; \
+                        const float imageBufferPrewarmCorrupt = imageBufferPrewarmSelf->GetCorruptorAmount(); \
+                        const long long imageBufferPrewarmE = 1 + (long long)std::ceil( \
+                            (double)imageBufferPrewarmT * 0.10 * (double)imageBufferPrewarmCorrupt); \
+                        int imageBufferPrewarmRows = (int)std::ceil(std::fabs(imageBufferPrewarmSelf->m_fNotesCY)); \
+                        imageBufferPrewarmRows = (std::min)((std::max)(imageBufferPrewarmRows, 64), \
+                            ImageBufferPreparedMaxRows); \
+                        auto& imageBufferPrewarmOverlap = ImageBufferOverlapEnsureIndex( \
+                            imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI); \
+                        const auto imageBufferPrewarmSource = imageBufferPrewarmOverlap.preparedSource; \
+                        if (!imageBufferPrewarmSource || imageBufferPrewarmSource->notes.empty() || \
+                            imageBufferPrewarmCorrupt > 1.0f || \
+                            (imageBufferPrewarmTickMode ? imageBufferPrewarmSource->tickOverflow : imageBufferPrewarmSource->timeOverflow)) { \
+                            ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
+                        } else { \
+                            const uint64_t imageBufferPrewarmSignature = ImageBufferPreparedSignature( \
+                                imageBufferPrewarmSource.get(), imageBufferPrewarmT, imageBufferPrewarmTickMode, \
+                                imageBufferPrewarmCorrupt, imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows); \
+                            auto& imageBufferPrewarmManager = ImageBufferPreparedGet(); \
+                            imageBufferPrewarmManager.Activate(imageBufferPrewarmSource.get(), imageBufferPrewarmSignature); \
+                            ImageBufferPreparedPrimeAllDense( \
+                                imageBufferPrewarmSelf, imageBufferPrewarmSource, imageBufferPrewarmT, imageBufferPrewarmE, \
+                                imageBufferPrewarmTickMode, imageBufferPrewarmCorrupt, \
+                                imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows, \
+                                imageBufferPrewarmSignature); \
+                            UpdateImageBufferPrewarmGpuProgress( \
+                                imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, \
+                                imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode); \
+                            long long imageBufferPrewarmBakeChunk = Renderer::ImageBufferInvalidChunk; \
+                            { \
+                                std::lock_guard<std::mutex> imageBufferPrewarmLock(s_ImageBufferPrewarmGpuMutex); \
+                                if (s_ImageBufferPrewarmGpu.owner == imageBufferPrewarmSelf && \
+                                    s_ImageBufferPrewarmGpu.cacheRequired) { \
+                                    s_ImageBufferPrewarmGpu.cached = CountImageBufferPrewarmCached( \
+                                        imageBufferPrewarmSelf->m_pRenderer, s_ImageBufferPrewarmGpu.chunks); \
+                                    for (long long imageBufferPrewarmChunk : s_ImageBufferPrewarmGpu.chunks) { \
+                                        if (!imageBufferPrewarmSelf->m_pRenderer->ImageBufferChunkCached(imageBufferPrewarmChunk)) { \
+                                            imageBufferPrewarmBakeChunk = imageBufferPrewarmChunk; \
+                                            break; \
+                                        } \
+                                    } \
+                                } \
+                            } \
+                            if (imageBufferPrewarmBakeChunk != Renderer::ImageBufferInvalidChunk) { \
+                                const ImageBufferPreparedKey imageBufferPrewarmBakeKey{ \
+                                    imageBufferPrewarmSource.get(), imageBufferPrewarmBakeChunk, imageBufferPrewarmSignature }; \
+                                if (auto imageBufferPrewarmReady = imageBufferPrewarmManager.Ready(imageBufferPrewarmBakeKey)) { \
+                                    imageBufferPrewarmSelf->m_pRenderer->ImageBufferRenderChunk( \
+                                        imageBufferPrewarmBakeChunk, imageBufferPrewarmReady->data(), \
+                                        (unsigned)imageBufferPrewarmReady->size()); \
+                                } \
+                            } \
+                        } \
                     } \
                 } \
             } \
         } \
     } \
-    return imageBufferPrewarmSelf->m_pRenderer->ClearAndBeginScene(__VA_ARGS__); \
+    return imageBufferPrewarmClearResult; \
 }(this))
 #define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer)
 #include "GameStateLegacy.inc"
