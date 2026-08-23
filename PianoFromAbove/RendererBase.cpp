@@ -40,6 +40,10 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
 
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount)
 {
+    // Remember the active renderer so a later Play request can explicitly wake
+    // full-song preparation even if the current lookahead is already cached.
+    ImageBufferPrewarmRendererSeen(this);
+
     // A dense chunk owned by the CPU preparation queue deliberately supplies no
     // notes until its compact representation is ready. Do not let an empty
     // request become a permanently cached blank texture.
