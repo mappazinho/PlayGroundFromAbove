@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "MIDI.h"
@@ -20,9 +21,12 @@
 
 class Renderer;
 
+// Dense chunks are prepared before they reach the renderer. The vertical
+// raster is deliberately bounded so one prepared chunk always fits the existing
+// 200k-note GPU pass after adjacent equal-style cells are merged back to runs.
 static constexpr size_t ImageBufferPreparedDenseThreshold = 100000;
 static constexpr int ImageBufferPreparedPreloadRadius = 10;
-static constexpr int ImageBufferPreparedMaxRows = 1536; // 128 * 1536 = 196608 compact rectangles max
+static constexpr int ImageBufferPreparedMaxRows = 1536;
 static constexpr size_t ImageBufferPreparedEntryLimit = 128;
 
 struct ImageBufferPreparedParams {
@@ -94,15 +98,24 @@ inline void ImageBufferPreparedCorruptNote(
     note += (int)llroundf((rPitch * 2.0f - 1.0f) * 60.0f * fCorrupt);
     note = (std::min)((std::max)(note, 0), 127);
 
-    start += (long long)((double)(rTime * 2.0f - 1.0f) * (double)timeSpan * 0.10 * (double)fCorrupt);
-    length = (long long)((double)length * (1.0 + (double)(rLen * 2.0f - 1.0f) * 0.5 * (double)fCorrupt));
+    start += (long long)((double)(rTime * 2.0f - 1.0f) *
+        (double)timeSpan * 0.10 * (double)fCorrupt);
+    length = (long long)((double)length *
+        (1.0 + (double)(rLen * 2.0f - 1.0f) * 0.5 * (double)fCorrupt));
 
     if (trackCount > 0) {
-        track += (int)llroundf((rCol * 2.0f - 1.0f) * (float)trackCount * 0.5f * fCorrupt);
+        track += (int)llroundf((rCol * 2.0f - 1.0f) *
+            (float)trackCount * 0.5f * fCorrupt);
         track = (std::min)((std::max)(track, 0), (int)trackCount - 1);
     }
     channel += (int)llroundf((rCol * 2.0f - 1.0f) * 16.0f * fCorrupt);
     channel = (std::min)((std::max)(channel, 0), 15);
+}
+
+inline long long ImageBufferPreparedStartValue(
+    const ImageBufferPreparedRawNote& note, bool tickMode)
+{
+    return tickMode ? (long long)note.startTick : (long long)note.start100us * 100LL;
 }
 
 inline size_t ImageBufferPreparedEstimateStarts(
@@ -120,14 +133,14 @@ inline size_t ImageBufferPreparedEstimateStarts(
     const long long hiValue = ImageBufferOverlapSaturatingAdd(
         ImageBufferOverlapSaturatingAdd(chunkStart, timeSpan), margin);
 
-    auto startValue = [&](const ImageBufferPreparedRawNote& n) -> long long {
-        return tickMode ? (long long)n.startTick : (long long)n.start100us * 100LL;
-    };
-
     auto lo = std::lower_bound(source.notes.begin(), source.notes.end(), loValue,
-        [&](const ImageBufferPreparedRawNote& n, long long value) { return startValue(n) < value; });
+        [&](const ImageBufferPreparedRawNote& n, long long value) {
+            return ImageBufferPreparedStartValue(n, tickMode) < value;
+        });
     auto hi = std::lower_bound(source.notes.begin(), source.notes.end(), hiValue,
-        [&](const ImageBufferPreparedRawNote& n, long long value) { return startValue(n) < value; });
+        [&](const ImageBufferPreparedRawNote& n, long long value) {
+            return ImageBufferPreparedStartValue(n, tickMode) < value;
+        });
     return (size_t)(hi - lo);
 }
 
@@ -143,25 +156,27 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
     const long long chunkStart = params.chunk * params.timeSpan;
     const long long chunkEnd = ImageBufferOverlapSaturatingAdd(chunkStart, params.timeSpan);
     const long long hiValue = ImageBufferOverlapSaturatingAdd(chunkEnd, params.corruptionMargin);
-    const long long oldestUsefulEnd = ImageBufferOverlapSaturatingAdd(chunkStart, -params.corruptionMargin);
-
-    auto startValue = [&](const ImageBufferPreparedRawNote& n) -> long long {
-        return params.tickMode ? (long long)n.startTick : (long long)n.start100us * 100LL;
-    };
+    const long long oldestUsefulEnd = ImageBufferOverlapSaturatingAdd(
+        chunkStart, -params.corruptionMargin);
 
     auto itHi = std::lower_bound(source.notes.begin(), source.notes.end(), hiValue,
-        [&](const ImageBufferPreparedRawNote& n, long long value) { return startValue(n) < value; });
+        [&](const ImageBufferPreparedRawNote& n, long long value) {
+            return ImageBufferPreparedStartValue(n, params.tickMode) < value;
+        });
     const size_t hi = (size_t)(itHi - source.notes.begin());
     if (hi == 0)
         return result;
 
+    // Newest note wins each same-key vertical cell, matching the renderer's
+    // equal-depth ordering. A disjoint-set points to the next unclaimed row so
+    // millions of repeated overlapping notes do not repeatedly touch every row.
     const uint32_t emptyStyle = 0xffffffffu;
     std::vector<uint32_t> cells((size_t)128 * rows, emptyStyle);
     std::vector<int> next((size_t)128 * (rows + 1));
     for (int key = 0; key < 128; ++key) {
         const size_t base = (size_t)key * (rows + 1);
-        for (int r = 0; r <= rows; ++r)
-            next[base + r] = r;
+        for (int row = 0; row <= rows; ++row)
+            next[base + row] = row;
     }
 
     auto findNext = [&](int key, int row) {
@@ -183,8 +198,9 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
         const uint64_t blockMax = params.tickMode
             ? source.maxEndTick150[block]
             : source.maxEndTime150_100us[block] * 100ULL;
+        const uint64_t oldest = oldestUsefulEnd < 0 ? 0ULL : (uint64_t)oldestUsefulEnd;
 
-        if (blockMax >= (oldestUsefulEnd < 0 ? 0ULL : (uint64_t)oldestUsefulEnd)) {
+        if (blockMax >= oldest) {
             const size_t begin = block * ImageBufferPreparedRawBlockNotes;
             const size_t end = (std::min)(hi, begin + ImageBufferPreparedRawBlockNotes);
             for (size_t i = end; i != begin; ) {
@@ -207,28 +223,28 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
                     params.timeSpan, params.trackCount);
 
                 const long long relativeStart = start - chunkStart;
-                const long long nonNegativeLength = (std::max)(length, 0LL);
-                const long long relativeEnd = ImageBufferOverlapSaturatingAdd(relativeStart, nonNegativeLength);
+                const long long relativeEnd = ImageBufferOverlapSaturatingAdd(
+                    relativeStart, (std::max)(length, 0LL));
                 if (relativeStart >= params.timeSpan || relativeEnd < 0)
                     continue;
 
                 const double clippedStart = (std::max)(0.0, (double)relativeStart);
                 const double clippedEnd = (std::min)((double)params.timeSpan, (double)relativeEnd);
-                int r0 = (int)std::floor(clippedStart * rows / (double)params.timeSpan);
-                int r1 = (int)std::ceil(clippedEnd * rows / (double)params.timeSpan);
-                r0 = (std::min)((std::max)(r0, 0), rows - 1);
-                r1 = (std::min)((std::max)(r1, r0 + 1), rows);
+                int row0 = (int)std::floor(clippedStart * rows / (double)params.timeSpan);
+                int row1 = (int)std::ceil(clippedEnd * rows / (double)params.timeSpan);
+                row0 = (std::min)((std::max)(row0, 0), rows - 1);
+                row1 = (std::min)((std::max)(row1, row0 + 1), rows);
 
-                const uint32_t style = ((uint32_t)(uint16_t)track << 8) | (uint32_t)(uint8_t)channel;
-                int r = findNext(note, r0);
-                while (r < r1) {
-                    const size_t cell = (size_t)note * rows + r;
-                    cells[cell] = style;
+                const uint32_t style = ((uint32_t)(uint16_t)track << 8) |
+                    (uint32_t)(uint8_t)channel;
+                int row = findNext(note, row0);
+                while (row < row1) {
+                    cells[(size_t)note * rows + row] = style;
                     ++result.cellsWritten;
                     --remainingCells;
                     const size_t base = (size_t)note * (rows + 1);
-                    next[base + r] = findNext(note, r + 1);
-                    r = next[base + r];
+                    next[base + row] = findNext(note, row + 1);
+                    row = next[base + row];
                 }
 
                 if (remainingCells == 0)
@@ -244,18 +260,19 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
     result.notes.reserve((std::min)((size_t)128 * rows, result.cellsWritten));
     for (int key = 0; key < 128; ++key) {
         const size_t base = (size_t)key * rows;
-        int r = 0;
-        while (r < rows) {
-            const uint32_t style = cells[base + r];
+        int row = 0;
+        while (row < rows) {
+            const uint32_t style = cells[base + row];
             if (style == emptyStyle) {
-                ++r;
+                ++row;
                 continue;
             }
-            const int begin = r;
-            while (r < rows && cells[base + r] == style)
-                ++r;
+
+            const int begin = row;
+            while (row < rows && cells[base + row] == style)
+                ++row;
             const double pos = (double)begin * (double)params.timeSpan / (double)rows;
-            const double end = (double)r * (double)params.timeSpan / (double)rows;
+            const double end = (double)row * (double)params.timeSpan / (double)rows;
             result.notes.push_back(NoteData{
                 .key = (uint8_t)key,
                 .channel = (uint8_t)(style & 0xff),
@@ -279,17 +296,17 @@ struct ImageBufferPreparedKey {
 };
 
 struct ImageBufferPreparedKeyHash {
-    size_t operator()(const ImageBufferPreparedKey& k) const {
-        uint64_t h = ImageBufferPreparedMix((uint64_t)(uintptr_t)k.source);
-        h ^= ImageBufferPreparedMix((uint64_t)k.chunk);
-        h ^= ImageBufferPreparedMix(k.signature);
+    size_t operator()(const ImageBufferPreparedKey& key) const {
+        uint64_t h = ImageBufferPreparedMix((uint64_t)(uintptr_t)key.source);
+        h ^= ImageBufferPreparedMix((uint64_t)key.chunk);
+        h ^= ImageBufferPreparedMix(key.signature);
         return (size_t)h;
     }
 };
 
 class ImageBufferPreparedManager {
 public:
-    enum class State { Queued, Preparing, Ready, Failed };
+    enum class State { Missing, Queued, Preparing, Ready, Failed };
 
     struct Entry {
         State state = State::Queued;
@@ -298,6 +315,7 @@ public:
         ImageBufferPreparedParams params;
         size_t estimate = 0;
         size_t rawVisited = 0;
+        int priority = 1000;
         uint64_t lastUse = 0;
     };
 
@@ -342,9 +360,9 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_activeSource == source && m_activeSignature == signature)
             return;
+
         m_activeSource = source;
         m_activeSignature = signature;
-
         for (auto it = m_entries.begin(); it != m_entries.end(); ) {
             if (it->first.source != source || it->first.signature != signature)
                 it = m_entries.erase(it);
@@ -364,10 +382,11 @@ public:
         m_pendingRender.clear();
     }
 
-    bool Has(const ImageBufferPreparedKey& key)
+    State StateOf(const ImageBufferPreparedKey& key)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_entries.find(key) != m_entries.end();
+        const auto it = m_entries.find(key);
+        return it == m_entries.end() ? State::Missing : it->second.state;
     }
 
     std::shared_ptr<const std::vector<NoteData>> Ready(const ImageBufferPreparedKey& key)
@@ -389,11 +408,15 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_entries.find(key);
         if (it != m_entries.end()) {
-            if (it->second.state != State::Failed) {
-                it->second.lastUse = ++m_useSerial;
-                return;
+            it->second.lastUse = ++m_useSerial;
+            if (it->second.state == State::Queued && priority < it->second.priority) {
+                // Priority queues cannot mutate an existing node. Push a newer
+                // copy and let WorkerMain discard the stale lower-priority copy.
+                it->second.priority = priority;
+                m_jobs.push(Job{ key, source, params, priority, ++m_jobSerial });
+                m_cv.notify_one();
             }
-            m_entries.erase(it);
+            return;
         }
 
         Entry entry;
@@ -401,6 +424,7 @@ public:
         entry.source = source;
         entry.params = params;
         entry.estimate = estimate;
+        entry.priority = priority;
         entry.lastUse = ++m_useSerial;
         m_entries.emplace(key, std::move(entry));
         m_jobs.push(Job{ key, source, params, priority, ++m_jobSerial });
@@ -413,10 +437,10 @@ public:
     {
         const uint64_t key = ImageBufferPreparedMix((uint64_t)(uintptr_t)source) ^ signature;
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto& stamp = m_prime[key];
-        if (stamp.first == first && stamp.second == last)
+        const auto it = m_prime.find(key);
+        if (it != m_prime.end() && it->second.first == first && it->second.second == last)
             return false;
-        stamp = { first, last };
+        m_prime[key] = { first, last };
         return true;
     }
 
@@ -442,7 +466,7 @@ private:
     static uint64_t PendingKey(Renderer* renderer, long long chunk)
     {
         return ImageBufferPreparedMix((uint64_t)(uintptr_t)renderer) ^
-               ImageBufferPreparedMix((uint64_t)chunk + 0x517cc1b727220a95ull);
+            ImageBufferPreparedMix((uint64_t)chunk + 0x517cc1b727220a95ull);
     }
 
     void EvictReadyLocked()
@@ -461,14 +485,6 @@ private:
         }
     }
 
-    size_t ReadySizeLocked(const ImageBufferPreparedKey& key) const
-    {
-        auto it = m_entries.find(key);
-        if (it == m_entries.end() || !it->second.ready)
-            return 0;
-        return it->second.ready->size();
-    }
-
     void WorkerMain()
     {
         for (;;) {
@@ -478,10 +494,12 @@ private:
                 m_cv.wait(lock, [&]() { return m_stop || !m_jobs.empty(); });
                 if (m_stop)
                     return;
+
                 job = m_jobs.top();
                 m_jobs.pop();
                 auto it = m_entries.find(job.key);
-                if (it == m_entries.end() || it->second.state != State::Queued)
+                if (it == m_entries.end() || it->second.state != State::Queued ||
+                    it->second.priority != job.priority)
                     continue;
                 it->second.state = State::Preparing;
             }
@@ -502,22 +520,30 @@ private:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto it = m_entries.find(job.key);
                 if (it == m_entries.end())
-                    continue;
+                    continue; // stale song/signature; discard the result
+
                 if (!ok) {
+                    it->second.ready.reset();
                     it->second.state = State::Failed;
                 } else {
-                    it->second.ready = std::make_shared<const std::vector<NoteData>>(std::move(built.notes));
+                    it->second.ready = std::make_shared<const std::vector<NoteData>>(
+                        std::move(built.notes));
                     it->second.rawVisited = built.rawVisited;
                     it->second.state = State::Ready;
                     it->second.lastUse = ++m_useSerial;
-                    compact = ReadySizeLocked(job.key);
+                    compact = it->second.ready->size();
                 }
                 EvictReadyLocked();
             }
 
             char log[192];
-            sprintf_s(log, "imgprep:done chunk=%lld visited=%zu compact=%zu ms=%.1f",
-                job.params.chunk, built.rawVisited, compact, ms);
+            if (ok) {
+                sprintf_s(log, "imgprep:done chunk=%lld visited=%zu compact=%zu ms=%.1f",
+                    job.params.chunk, built.rawVisited, compact, ms);
+            } else {
+                sprintf_s(log, "imgprep:fail chunk=%lld ms=%.1f fallback=exact",
+                    job.params.chunk, ms);
+            }
             HeartbeatLog(log);
         }
     }
@@ -542,6 +568,26 @@ inline ImageBufferPreparedManager& ImageBufferPreparedGet()
     return manager;
 }
 
+inline ImageBufferPreparedParams ImageBufferPreparedMakeParams(
+    long long chunk,
+    long long timeSpan,
+    long long margin,
+    bool tickMode,
+    float corruption,
+    size_t trackCount,
+    int rows)
+{
+    ImageBufferPreparedParams params;
+    params.chunk = chunk;
+    params.timeSpan = timeSpan;
+    params.corruptionMargin = margin;
+    params.corruption = corruption;
+    params.trackCount = trackCount;
+    params.rows = rows;
+    params.tickMode = tickMode;
+    return params;
+}
+
 inline void ImageBufferPreparedPrime(
     const std::shared_ptr<const ImageBufferPreparedSource>& source,
     long long first,
@@ -556,36 +602,34 @@ inline void ImageBufferPreparedPrime(
 {
     if (!source || first > last)
         return;
+
     auto& manager = ImageBufferPreparedGet();
     if (!manager.BeginPrime(source.get(), signature, first, last))
         return;
 
     std::vector<std::pair<long long, size_t>> dense;
     dense.reserve((size_t)(last - first + 1));
-    for (long long k = first; k <= last; ++k) {
-        const size_t estimate = ImageBufferPreparedEstimateStarts(*source, k, timeSpan, margin, tickMode);
+    for (long long chunk = first; chunk <= last; ++chunk) {
+        const size_t estimate = ImageBufferPreparedEstimateStarts(
+            *source, chunk, timeSpan, margin, tickMode);
         if (estimate >= ImageBufferPreparedDenseThreshold)
-            dense.push_back({ k, estimate });
+            dense.push_back({ chunk, estimate });
     }
 
     std::unordered_set<long long> scheduled;
     for (const auto& center : dense) {
         const long long lo = (std::max)(first, center.first - ImageBufferPreparedPreloadRadius);
         const long long hi = (std::min)(last, center.first + ImageBufferPreparedPreloadRadius);
-        for (long long k = lo; k <= hi; ++k) {
-            if (!scheduled.insert(k).second)
+        for (long long chunk = lo; chunk <= hi; ++chunk) {
+            if (!scheduled.insert(chunk).second)
                 continue;
-            ImageBufferPreparedParams params;
-            params.chunk = k;
-            params.timeSpan = timeSpan;
-            params.corruptionMargin = margin;
-            params.corruption = corruption;
-            params.trackCount = trackCount;
-            params.rows = rows;
-            params.tickMode = tickMode;
-            const ImageBufferPreparedKey key{ source.get(), k, signature };
-            const size_t estimate = ImageBufferPreparedEstimateStarts(*source, k, timeSpan, margin, tickMode);
-            const int priority = 100 + (int)(std::max)(0LL, k - first);
+
+            const size_t estimate = ImageBufferPreparedEstimateStarts(
+                *source, chunk, timeSpan, margin, tickMode);
+            const ImageBufferPreparedKey key{ source.get(), chunk, signature };
+            const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
+                chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
+            const int priority = 100 + (int)(std::max)(0LL, chunk - first);
             manager.Schedule(key, source, params, priority, estimate);
         }
     }
@@ -598,10 +642,9 @@ inline void ImageBufferPreparedPrime(
     }
 }
 
-// Returns true when the prepared path owns this collection request. `out` is
-// either the ready compact geometry or empty while a worker is still building.
-// Returns false for ordinary sparse chunks so the caller can use the exact
-// synchronous collector unchanged.
+// Returns true when the prepared path owns this collection request. While a
+// dense chunk is queued/preparing it intentionally returns an empty vector; the
+// renderer's pending gate keeps that from becoming a cached blank texture.
 template <typename MidiT>
 inline bool ImageBufferPreparedTryCollect(
     const void* owner,
@@ -610,8 +653,8 @@ inline bool ImageBufferPreparedTryCollect(
     MidiT& midi,
     std::vector<NoteData>& out,
     long long chunk,
-    long long first,
-    long long last,
+    long long firstVisible,
+    long long lastVisible,
     long long preloadLast,
     long long timeSpan,
     long long margin,
@@ -634,33 +677,46 @@ inline bool ImageBufferPreparedTryCollect(
 
     auto& manager = ImageBufferPreparedGet();
     manager.Activate(source.get(), signature);
-    ImageBufferPreparedPrime(source, first, preloadLast,
+    ImageBufferPreparedPrime(source, firstVisible, preloadLast,
         timeSpan, margin, tickMode, corruption, trackCount, rows, signature);
 
     const ImageBufferPreparedKey key{ source.get(), chunk, signature };
-    const size_t estimate = ImageBufferPreparedEstimateStarts(*source, chunk, timeSpan, margin, tickMode);
-    const bool prepared = manager.Has(key) || estimate >= ImageBufferPreparedDenseThreshold;
-    if (!prepared) {
+    const size_t estimate = ImageBufferPreparedEstimateStarts(
+        *source, chunk, timeSpan, margin, tickMode);
+    ImageBufferPreparedManager::State state = manager.StateOf(key);
+    const bool ownsChunk = state != ImageBufferPreparedManager::State::Missing ||
+        estimate >= ImageBufferPreparedDenseThreshold;
+
+    if (!ownsChunk || state == ImageBufferPreparedManager::State::Failed) {
         manager.ClearPending(renderer, chunk);
         return false;
     }
 
+    if (state == ImageBufferPreparedManager::State::Ready) {
+        if (auto ready = manager.Ready(key)) {
+            out.assign(ready->begin(), ready->end());
+            manager.ClearPending(renderer, chunk);
+            return true;
+        }
+    }
+
+    // Re-scheduling a queued entry with a better priority promotes it. This is
+    // important when a chunk was speculative preload work and then becomes
+    // visible before a worker has picked it up.
+    const bool visible = chunk >= firstVisible && chunk <= lastVisible;
+    const int priority = visible ? 0 : 50 + (int)(std::max)(0LL, chunk - firstVisible);
+    const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
+        chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
+    manager.Schedule(key, source, params, priority, estimate);
+
+    // A worker can finish between StateOf and Schedule. Prefer the completed
+    // result immediately rather than deliberately blanking one extra frame.
     if (auto ready = manager.Ready(key)) {
         out.assign(ready->begin(), ready->end());
         manager.ClearPending(renderer, chunk);
         return true;
     }
 
-    ImageBufferPreparedParams params;
-    params.chunk = chunk;
-    params.timeSpan = timeSpan;
-    params.corruptionMargin = margin;
-    params.corruption = corruption;
-    params.trackCount = trackCount;
-    params.rows = rows;
-    params.tickMode = tickMode;
-    const int priority = (chunk >= first && chunk <= last) ? 0 : 50 + (int)(std::max)(0LL, chunk - first);
-    manager.Schedule(key, source, params, priority, estimate);
     out.clear();
     manager.MarkPending(renderer, chunk);
     return true;
