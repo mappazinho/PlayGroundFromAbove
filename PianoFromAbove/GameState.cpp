@@ -297,6 +297,11 @@ BOOL ImageBufferPrewarmPlaybackHold()
 
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
+        // CPU preparation may have completed between Logic and the previous
+        // render. Hold one more frame until RenderNotesImageBuffer publishes
+        // whether a texture-cache stage is required for this song.
+        if (!s_ImageBufferPrewarmGpu.initialized)
+            return TRUE;
         if (s_ImageBufferPrewarmGpu.cacheRequired &&
             s_ImageBufferPrewarmGpu.cached < s_ImageBufferPrewarmGpu.total)
             return TRUE;
