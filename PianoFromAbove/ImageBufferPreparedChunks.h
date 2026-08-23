@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -21,9 +22,6 @@
 
 class Renderer;
 
-// Dense chunks are prepared before they reach the renderer. The vertical
-// raster is deliberately bounded so one prepared chunk always fits the existing
-// 200k-note GPU pass after adjacent equal-style cells are merged back to runs.
 static constexpr size_t ImageBufferPreparedDenseThreshold = 100000;
 static constexpr int ImageBufferPreparedPreloadRadius = 10;
 static constexpr int ImageBufferPreparedMaxRows = 1536;
@@ -44,6 +42,34 @@ struct ImageBufferPreparedResult {
     size_t rawVisited = 0;
     size_t cellsWritten = 0;
 };
+
+struct ImageBufferPreparedProgress {
+    size_t done = 0;
+    size_t total = 0;
+    size_t failed = 0;
+    bool initialized = false;
+    bool unsupported = false;
+
+    bool Complete() const {
+        return initialized && (unsupported || done >= total);
+    }
+};
+
+inline std::atomic<bool>& ImageBufferPreparedWaitOptionStorage()
+{
+    static std::atomic<bool> enabled{ false };
+    return enabled;
+}
+
+inline bool ImageBufferPreparedGetWaitBeforePlayback()
+{
+    return ImageBufferPreparedWaitOptionStorage().load(std::memory_order_relaxed);
+}
+
+inline void ImageBufferPreparedSetWaitBeforePlayback(bool enabled)
+{
+    ImageBufferPreparedWaitOptionStorage().store(enabled, std::memory_order_relaxed);
+}
 
 inline uint64_t ImageBufferPreparedMix(uint64_t x)
 {
@@ -144,6 +170,17 @@ inline size_t ImageBufferPreparedEstimateStarts(
     return (size_t)(hi - lo);
 }
 
+inline long long ImageBufferPreparedFloorDiv(long long value, long long divisor)
+{
+    if (divisor <= 0)
+        return 0;
+    long long q = value / divisor;
+    const long long r = value % divisor;
+    if (r < 0)
+        --q;
+    return q;
+}
+
 inline ImageBufferPreparedResult ImageBufferPreparedBuild(
     const ImageBufferPreparedSource& source,
     const ImageBufferPreparedParams& params)
@@ -167,11 +204,12 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
     if (hi == 0)
         return result;
 
-    // Newest note wins each same-key vertical cell, matching the renderer's
-    // equal-depth ordering. A disjoint-set points to the next unclaimed row so
-    // millions of repeated overlapping notes do not repeatedly touch every row.
+    // Keep source-note ownership alongside style. Without the owner id, adjacent
+    // repeated notes of the same color merge into one flat bar during compaction.
     const uint32_t emptyStyle = 0xffffffffu;
+    const uint32_t emptyOwner = 0xffffffffu;
     std::vector<uint32_t> cells((size_t)128 * rows, emptyStyle);
+    std::vector<uint32_t> owners((size_t)128 * rows, emptyOwner);
     std::vector<int> next((size_t)128 * (rows + 1));
     for (int key = 0; key < 128; ++key) {
         const size_t base = (size_t)key * (rows + 1);
@@ -237,9 +275,12 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
 
                 const uint32_t style = ((uint32_t)(uint16_t)track << 8) |
                     (uint32_t)(uint8_t)channel;
+                const uint32_t ownerId = (uint32_t)i;
                 int row = findNext(note, row0);
                 while (row < row1) {
-                    cells[(size_t)note * rows + row] = style;
+                    const size_t cell = (size_t)note * rows + row;
+                    cells[cell] = style;
+                    owners[cell] = ownerId;
                     ++result.cellsWritten;
                     --remainingCells;
                     const size_t base = (size_t)note * (rows + 1);
@@ -268,9 +309,13 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
                 continue;
             }
 
+            const uint32_t ownerId = owners[base + row];
             const int begin = row;
-            while (row < rows && cells[base + row] == style)
+            while (row < rows &&
+                   cells[base + row] == style &&
+                   owners[base + row] == ownerId)
                 ++row;
+
             const double pos = (double)begin * (double)params.timeSpan / (double)rows;
             const double end = (double)row * (double)params.timeSpan / (double)rows;
             result.notes.push_back(NoteData{
@@ -380,6 +425,13 @@ public:
         m_jobs.swap(kept);
         m_prime.clear();
         m_pendingRender.clear();
+        m_fullOwner = nullptr;
+        m_fullSource = nullptr;
+        m_fullSignature = 0;
+        m_fullInitialized = false;
+        m_fullUnsupported = false;
+        m_fullKeys.clear();
+        m_pinned.clear();
     }
 
     State StateOf(const ImageBufferPreparedKey& key)
@@ -403,15 +455,17 @@ public:
                   const std::shared_ptr<const ImageBufferPreparedSource>& source,
                   const ImageBufferPreparedParams& params,
                   int priority,
-                  size_t estimate)
+                  size_t estimate,
+                  bool pinForFullPrime = false)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (pinForFullPrime && m_pinned.insert(key).second)
+            m_fullKeys.push_back(key);
+
         auto it = m_entries.find(key);
         if (it != m_entries.end()) {
             it->second.lastUse = ++m_useSerial;
             if (it->second.state == State::Queued && priority < it->second.priority) {
-                // Priority queues cannot mutate an existing node. Push a newer
-                // copy and let WorkerMain discard the stale lower-priority copy.
                 it->second.priority = priority;
                 m_jobs.push(Job{ key, source, params, priority, ++m_jobSerial });
                 m_cv.notify_one();
@@ -442,6 +496,121 @@ public:
             return false;
         m_prime[key] = { first, last };
         return true;
+    }
+
+    bool BeginFullPrime(const void* owner,
+                        const ImageBufferPreparedSource* source,
+                        uint64_t signature)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_fullInitialized &&
+            m_fullOwner == owner &&
+            m_fullSource == source &&
+            m_fullSignature == signature)
+            return false;
+
+        m_fullOwner = owner;
+        m_fullSource = source;
+        m_fullSignature = signature;
+        m_fullInitialized = true;
+        m_fullUnsupported = false;
+        m_fullKeys.clear();
+        m_pinned.clear();
+        return true;
+    }
+
+    void MarkFullPrimeUnsupported(const void* owner)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_fullOwner = owner;
+        m_fullSource = nullptr;
+        m_fullSignature = 0;
+        m_fullInitialized = true;
+        m_fullUnsupported = true;
+        m_fullKeys.clear();
+        m_pinned.clear();
+    }
+
+    ImageBufferPreparedProgress FullProgress() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ImageBufferPreparedProgress progress;
+        progress.initialized = m_fullInitialized;
+        progress.unsupported = m_fullUnsupported;
+        if (!m_fullInitialized || m_fullUnsupported)
+            return progress;
+
+        progress.total = m_fullKeys.size();
+        for (const auto& key : m_fullKeys) {
+            const auto it = m_entries.find(key);
+            if (it == m_entries.end())
+                continue;
+            if (it->second.state == State::Ready) {
+                ++progress.done;
+            } else if (it->second.state == State::Failed) {
+                ++progress.done;
+                ++progress.failed;
+            }
+        }
+        return progress;
+    }
+
+    void ArmPlaybackGate(const void* owner)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_playbackGateArmed = true;
+        m_playbackGateOwner = owner;
+    }
+
+    void CancelPlaybackGate()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_playbackGateArmed = false;
+        m_playbackGateOwner = nullptr;
+    }
+
+    bool ShouldHoldPlayback(const void* owner)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_playbackGateArmed)
+            return false;
+        if (!ImageBufferPreparedGetWaitBeforePlayback()) {
+            m_playbackGateArmed = false;
+            m_playbackGateOwner = nullptr;
+            return false;
+        }
+
+        if (!m_playbackGateOwner)
+            m_playbackGateOwner = owner;
+        if (m_playbackGateOwner != owner)
+            return false;
+
+        if (!m_fullInitialized || m_fullOwner != owner)
+            return true;
+
+        if (m_fullUnsupported) {
+            m_playbackGateArmed = false;
+            m_playbackGateOwner = nullptr;
+            return false;
+        }
+
+        for (const auto& key : m_fullKeys) {
+            const auto it = m_entries.find(key);
+            if (it == m_entries.end() ||
+                (it->second.state != State::Ready && it->second.state != State::Failed))
+                return true;
+        }
+
+        m_playbackGateArmed = false;
+        m_playbackGateOwner = nullptr;
+        return false;
+    }
+
+    bool PlaybackGateArmedFor(const void* owner) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_playbackGateArmed &&
+            (!m_playbackGateOwner || m_playbackGateOwner == owner);
     }
 
     void MarkPending(Renderer* renderer, long long chunk)
@@ -475,6 +644,8 @@ private:
             auto victim = m_entries.end();
             for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
                 if (it->second.state != State::Ready && it->second.state != State::Failed)
+                    continue;
+                if (m_pinned.find(it->first) != m_pinned.end())
                     continue;
                 if (victim == m_entries.end() || it->second.lastUse < victim->second.lastUse)
                     victim = it;
@@ -512,6 +683,17 @@ private:
             } catch (...) {
                 ok = false;
             }
+
+            std::shared_ptr<const std::vector<NoteData>> published;
+            if (ok) {
+                try {
+                    published = std::make_shared<const std::vector<NoteData>>(
+                        std::move(built.notes));
+                } catch (...) {
+                    ok = false;
+                }
+            }
+
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - begin).count();
 
@@ -520,18 +702,17 @@ private:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto it = m_entries.find(job.key);
                 if (it == m_entries.end())
-                    continue; // stale song/signature; discard the result
+                    continue;
 
                 if (!ok) {
                     it->second.ready.reset();
                     it->second.state = State::Failed;
                 } else {
-                    it->second.ready = std::make_shared<const std::vector<NoteData>>(
-                        std::move(built.notes));
+                    it->second.ready = std::move(published);
                     it->second.rawVisited = built.rawVisited;
                     it->second.state = State::Ready;
                     it->second.lastUse = ++m_useSerial;
-                    compact = it->second.ready->size();
+                    compact = it->second.ready ? it->second.ready->size() : 0;
                 }
                 EvictReadyLocked();
             }
@@ -548,7 +729,7 @@ private:
         }
     }
 
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     bool m_stop = false;
     const ImageBufferPreparedSource* m_activeSource = nullptr;
@@ -560,6 +741,17 @@ private:
     std::unordered_map<ImageBufferPreparedKey, Entry, ImageBufferPreparedKeyHash> m_entries;
     std::unordered_map<uint64_t, std::pair<long long, long long>> m_prime;
     std::unordered_set<uint64_t> m_pendingRender;
+
+    const void* m_fullOwner = nullptr;
+    const ImageBufferPreparedSource* m_fullSource = nullptr;
+    uint64_t m_fullSignature = 0;
+    bool m_fullInitialized = false;
+    bool m_fullUnsupported = false;
+    std::vector<ImageBufferPreparedKey> m_fullKeys;
+    std::unordered_set<ImageBufferPreparedKey, ImageBufferPreparedKeyHash> m_pinned;
+
+    bool m_playbackGateArmed = false;
+    const void* m_playbackGateOwner = nullptr;
 };
 
 inline ImageBufferPreparedManager& ImageBufferPreparedGet()
@@ -642,9 +834,53 @@ inline void ImageBufferPreparedPrime(
     }
 }
 
-// Returns true when the prepared path owns this collection request. While a
-// dense chunk is queued/preparing it intentionally returns an empty vector; the
-// renderer's pending gate keeps that from becoming a cached blank texture.
+inline void ImageBufferPreparedPrimeAllDense(
+    const void* owner,
+    const std::shared_ptr<const ImageBufferPreparedSource>& source,
+    long long timeSpan,
+    long long margin,
+    bool tickMode,
+    float corruption,
+    size_t trackCount,
+    int rows,
+    uint64_t signature)
+{
+    if (!ImageBufferPreparedGetWaitBeforePlayback() || !source || source->notes.empty())
+        return;
+
+    auto& manager = ImageBufferPreparedGet();
+    if (!manager.BeginFullPrime(owner, source.get(), signature))
+        return;
+
+    const long long firstStart = ImageBufferPreparedStartValue(source->notes.front(), tickMode);
+    const long long lastStart = ImageBufferPreparedStartValue(source->notes.back(), tickMode);
+    const long long first = ImageBufferPreparedFloorDiv(
+        ImageBufferOverlapSaturatingAdd(firstStart, -margin), timeSpan) - 1;
+    const long long last = ImageBufferPreparedFloorDiv(
+        ImageBufferOverlapSaturatingAdd(lastStart, margin), timeSpan) + 1;
+
+    size_t denseCount = 0;
+    for (long long chunk = first; chunk <= last; ++chunk) {
+        const size_t estimate = ImageBufferPreparedEstimateStarts(
+            *source, chunk, timeSpan, margin, tickMode);
+        if (estimate < ImageBufferPreparedDenseThreshold)
+            continue;
+
+        ++denseCount;
+        const ImageBufferPreparedKey key{ source.get(), chunk, signature };
+        const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
+            chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
+        const long long distance = chunk >= first ? chunk - first : 0;
+        const int priority = 10 + (int)(std::min)(distance, 1000000LL);
+        manager.Schedule(key, source, params, priority, estimate, true);
+    }
+
+    char log[160];
+    sprintf_s(log, "imgprep:full-prime dense=%zu horizon=%lld..%lld",
+        denseCount, first, last);
+    HeartbeatLog(log);
+}
+
 template <typename MidiT>
 inline bool ImageBufferPreparedTryCollect(
     const void* owner,
@@ -668,6 +904,8 @@ inline bool ImageBufferPreparedTryCollect(
     if (!source || source->notes.empty() || corruption > 1.0f ||
         (tickMode ? source->tickOverflow : source->timeOverflow)) {
         ImageBufferPreparedGet().ClearPending(renderer, chunk);
+        if (ImageBufferPreparedGetWaitBeforePlayback())
+            ImageBufferPreparedGet().MarkFullPrimeUnsupported(owner);
         return false;
     }
 
@@ -677,6 +915,12 @@ inline bool ImageBufferPreparedTryCollect(
 
     auto& manager = ImageBufferPreparedGet();
     manager.Activate(source.get(), signature);
+
+    if (ImageBufferPreparedGetWaitBeforePlayback()) {
+        ImageBufferPreparedPrimeAllDense(owner, source, timeSpan, margin,
+            tickMode, corruption, trackCount, rows, signature);
+    }
+
     ImageBufferPreparedPrime(source, firstVisible, preloadLast,
         timeSpan, margin, tickMode, corruption, trackCount, rows, signature);
 
@@ -700,17 +944,12 @@ inline bool ImageBufferPreparedTryCollect(
         }
     }
 
-    // Re-scheduling a queued entry with a better priority promotes it. This is
-    // important when a chunk was speculative preload work and then becomes
-    // visible before a worker has picked it up.
     const bool visible = chunk >= firstVisible && chunk <= lastVisible;
     const int priority = visible ? 0 : 50 + (int)(std::max)(0LL, chunk - firstVisible);
     const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
         chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
     manager.Schedule(key, source, params, priority, estimate);
 
-    // A worker can finish between StateOf and Schedule. Prefer the completed
-    // result immediately rather than deliberately blanking one extra frame.
     if (auto ready = manager.Ready(key)) {
         out.assign(ready->begin(), ready->end());
         manager.ClearPending(renderer, chunk);
@@ -725,4 +964,35 @@ inline bool ImageBufferPreparedTryCollect(
 inline bool ImageBufferPreparedRenderPending(Renderer* renderer, long long chunk)
 {
     return ImageBufferPreparedGet().IsPending(renderer, chunk);
+}
+
+inline ImageBufferPreparedProgress ImageBufferPreparedGetFullProgress()
+{
+    return ImageBufferPreparedGet().FullProgress();
+}
+
+inline void ImageBufferPreparedMarkPrewarmUnavailable(const void* owner)
+{
+    if (ImageBufferPreparedGetWaitBeforePlayback())
+        ImageBufferPreparedGet().MarkFullPrimeUnsupported(owner);
+}
+
+inline void ImageBufferPreparedArmPlaybackGate(const void* owner)
+{
+    ImageBufferPreparedGet().ArmPlaybackGate(owner);
+}
+
+inline void ImageBufferPreparedCancelPlaybackGate()
+{
+    ImageBufferPreparedGet().CancelPlaybackGate();
+}
+
+inline bool ImageBufferPreparedShouldHoldPlayback(const void* owner)
+{
+    return ImageBufferPreparedGet().ShouldHoldPlayback(owner);
+}
+
+inline bool ImageBufferPreparedPlaybackGateArmed(const void* owner)
+{
+    return ImageBufferPreparedGet().PlaybackGateArmedFor(owner);
 }
