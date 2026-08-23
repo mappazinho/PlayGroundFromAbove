@@ -3,14 +3,6 @@
 #include <dxgidebug.h>
 #include <mmsystem.h>
 #endif
-#include "RectPixelShader.h"
-#include "RectVertexShader.h"
-#include "NotePixelShader.h"
-#include "NoteVertexShader.h"
-#include "BackgroundPixelShader.h"
-#include "BackgroundVertexShader.h"
-#include "ChunkQuadPixelShader.h"
-#include "ChunkQuadVertexShader.h"
 #include "Globals.h"
 #include "Renderer.h"
 #include <d3dcompiler.h>
