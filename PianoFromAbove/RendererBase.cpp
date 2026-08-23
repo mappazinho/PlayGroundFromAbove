@@ -3,11 +3,40 @@
 #include "ImageBufferMultipass.h"
 #include "ImageBufferPreparedChunks.h"
 
+// Keep the RenderMode UI in the legacy renderer body, but add the dense-prewarm
+// switch immediately below its existing Image Buffer Notes checkbox without
+// duplicating the large RenderImGuiFrame implementation.
+namespace ImGui {
+static bool PGFAImageBufferCheckbox(const char* label, bool* value)
+{
+    const bool changed = Checkbox(label, value);
+    if (label && strcmp(label, "Image Buffer Notes") == 0) {
+        ImGui::Indent();
+        ImGui::BeginDisabled(!*value);
+        bool waitForDense = ImageBufferPreparedGetWaitBeforePlayback();
+        if (Checkbox("Wait for dense buffers before playback", &waitForDense)) {
+            ImageBufferPreparedSetWaitBeforePlayback(waitForDense);
+            if (!waitForDense)
+                ImageBufferPreparedCancelPlaybackGate();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Prepares every dense image-buffer chunk before a requested playback start.");
+        ImGui::EndDisabled();
+        ImGui::Unindent();
+    }
+    return changed;
+}
+}
+
 // Compile the existing shared renderer unchanged under a legacy name for the
-// one method this file replaces.
+// one method this file replaces. The Checkbox alias only augments the specific
+// RenderMode Image Buffer Notes entry; all other checkboxes pass straight
+// through the helper unchanged.
+#define Checkbox PGFAImageBufferCheckbox
 #define ImageBufferRenderChunk ImageBufferRenderChunkLegacy
 #include "RendererBaseLegacy.inc"
 #undef ImageBufferRenderChunk
+#undef Checkbox
 
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount)
 {
