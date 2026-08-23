@@ -1,0 +1,43 @@
+name: Add hot preload state
+on:
+  push:
+    branches: [fix/image-buffer-dense-hot-preload]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/image-buffer-dense-hot-preload
+      - shell: python
+        run: |
+          from pathlib import Path
+          p=Path('PianoFromAbove/GameState.h'); s=p.read_text(encoding='utf-8')
+          a='    NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;\n    void GenNoteXTable();'
+          b='''    NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
+    struct ImageBufferHotChunk {
+        long long chunk = 0;
+        long long scoreNPS = 0;
+        vector<MIDIChannelEvent> events;
+    };
+    void BuildImageBufferHotPreload(const vector<long long>& noteTimes, long long timeSpan);
+    void GenNoteXTable();'''
+          assert s.count(a)==1, s.count(a); s=s.replace(a,b,1)
+          a='    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached\n    std::wstring m_sCurBackground;'
+          b='''    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached
+    vector<ImageBufferHotChunk> m_vImageBufferHotChunks;
+    long long m_llImageBufferHotTimeSpan = 0;
+    size_t m_iImageBufferHotCursor = 0;
+    std::wstring m_sCurBackground;'''
+          assert s.count(a)==1, s.count(a); p.write_text(s.replace(a,b,1),encoding='utf-8')
+          Path('.github/workflows/add-hot-header.yml').unlink()
+      - shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A && git commit -m "Add image buffer hot-preload state" && git push origin HEAD:fix/image-buffer-dense-hot-preload
