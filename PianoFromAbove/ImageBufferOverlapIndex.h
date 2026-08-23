@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 static constexpr size_t ImageBufferOverlapBlockEvents = 4096;
