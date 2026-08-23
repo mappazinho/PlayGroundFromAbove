@@ -5,6 +5,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "MIDI.h"
 #include "ImageBufferOverlapIndex.h"
 
 class Renderer;
@@ -153,10 +155,6 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
     if (hi == 0)
         return result;
 
-    // One ownership cell per key and vertical sample. Newest notes are visited
-    // first; once a cell is claimed, older same-key notes can never change it.
-    // The disjoint-set skips already-filled cells, so huge stacks of repeated
-    // notes do not turn into rows * notes work.
     const uint32_t emptyStyle = 0xffffffffu;
     std::vector<uint32_t> cells((size_t)128 * rows, emptyStyle);
     std::vector<int> next((size_t)128 * (rows + 1));
@@ -172,7 +170,7 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
         while (next[base + root] != root)
             root = next[base + root];
         while (next[base + row] != row) {
-            int old = row;
+            const int old = row;
             row = next[base + row];
             next[base + old] = root;
         }
@@ -321,8 +319,8 @@ public:
 
     ImageBufferPreparedManager()
     {
-        unsigned hc = std::thread::hardware_concurrency();
-        unsigned workers = hc > 4 ? 4u : (std::max)(2u, hc == 0 ? 2u : hc);
+        const unsigned hc = std::thread::hardware_concurrency();
+        const unsigned workers = hc > 4 ? 4u : (std::max)(2u, hc == 0 ? 2u : hc);
         for (unsigned i = 0; i < workers; ++i)
             m_workers.emplace_back([this]() { WorkerMain(); });
     }
@@ -337,6 +335,33 @@ public:
         for (std::thread& worker : m_workers)
             if (worker.joinable())
                 worker.join();
+    }
+
+    void Activate(const ImageBufferPreparedSource* source, uint64_t signature)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_activeSource == source && m_activeSignature == signature)
+            return;
+        m_activeSource = source;
+        m_activeSignature = signature;
+
+        for (auto it = m_entries.begin(); it != m_entries.end(); ) {
+            if (it->first.source != source || it->first.signature != signature)
+                it = m_entries.erase(it);
+            else
+                ++it;
+        }
+
+        std::priority_queue<Job, std::vector<Job>, JobLater> kept;
+        while (!m_jobs.empty()) {
+            Job job = m_jobs.top();
+            m_jobs.pop();
+            if (job.key.source == source && job.key.signature == signature)
+                kept.push(std::move(job));
+        }
+        m_jobs.swap(kept);
+        m_prime.clear();
+        m_pendingRender.clear();
     }
 
     bool Has(const ImageBufferPreparedKey& key)
@@ -364,8 +389,11 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_entries.find(key);
         if (it != m_entries.end()) {
-            it->second.lastUse = ++m_useSerial;
-            return;
+            if (it->second.state != State::Failed) {
+                it->second.lastUse = ++m_useSerial;
+                return;
+            }
+            m_entries.erase(it);
         }
 
         Entry entry;
@@ -433,6 +461,14 @@ private:
         }
     }
 
+    size_t ReadySizeLocked(const ImageBufferPreparedKey& key) const
+    {
+        auto it = m_entries.find(key);
+        if (it == m_entries.end() || !it->second.ready)
+            return 0;
+        return it->second.ready->size();
+    }
+
     void WorkerMain()
     {
         for (;;) {
@@ -461,6 +497,7 @@ private:
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - begin).count();
 
+            size_t compact = 0;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto it = m_entries.find(job.key);
@@ -473,30 +510,23 @@ private:
                     it->second.rawVisited = built.rawVisited;
                     it->second.state = State::Ready;
                     it->second.lastUse = ++m_useSerial;
+                    compact = ReadySizeLocked(job.key);
                 }
                 EvictReadyLocked();
             }
 
             char log[192];
             sprintf_s(log, "imgprep:done chunk=%lld visited=%zu compact=%zu ms=%.1f",
-                job.params.chunk, built.rawVisited,
-                ok ? (size_t)(ReadySize(job.key)) : 0, ms);
+                job.params.chunk, built.rawVisited, compact, ms);
             HeartbeatLog(log);
         }
-    }
-
-    size_t ReadySize(const ImageBufferPreparedKey& key)
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_entries.find(key);
-        if (it == m_entries.end() || !it->second.ready)
-            return 0;
-        return it->second.ready->size();
     }
 
     std::mutex m_mutex;
     std::condition_variable m_cv;
     bool m_stop = false;
+    const ImageBufferPreparedSource* m_activeSource = nullptr;
+    uint64_t m_activeSignature = 0;
     uint64_t m_jobSerial = 0;
     uint64_t m_useSerial = 0;
     std::vector<std::thread> m_workers;
@@ -513,7 +543,6 @@ inline ImageBufferPreparedManager& ImageBufferPreparedGet()
 }
 
 inline void ImageBufferPreparedPrime(
-    Renderer* renderer,
     const std::shared_ptr<const ImageBufferPreparedSource>& source,
     long long first,
     long long last,
@@ -603,11 +632,12 @@ inline bool ImageBufferPreparedTryCollect(
     const uint64_t signature = ImageBufferPreparedSignature(
         source.get(), timeSpan, tickMode, corruption, trackCount, rows);
 
-    ImageBufferPreparedPrime(renderer, source, first, preloadLast,
+    auto& manager = ImageBufferPreparedGet();
+    manager.Activate(source.get(), signature);
+    ImageBufferPreparedPrime(source, first, preloadLast,
         timeSpan, margin, tickMode, corruption, trackCount, rows, signature);
 
     const ImageBufferPreparedKey key{ source.get(), chunk, signature };
-    auto& manager = ImageBufferPreparedGet();
     const size_t estimate = ImageBufferPreparedEstimateStarts(*source, chunk, timeSpan, margin, tickMode);
     const bool prepared = manager.Has(key) || estimate >= ImageBufferPreparedDenseThreshold;
     if (!prepared) {
