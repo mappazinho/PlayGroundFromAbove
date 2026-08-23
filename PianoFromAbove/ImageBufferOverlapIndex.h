@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -36,9 +37,14 @@ struct ImageBufferOverlapIndexState {
     const void* owner = nullptr;
     const MIDIChannelEvent* eventData = nullptr;
     size_t eventCount = 0;
+    uint64_t firstEvent = 0;
+    uint64_t lastEvent = 0;
+    long long firstTime = 0;
+    long long lastTime = 0;
     std::vector<long long> maxEndTime;
     std::vector<long long> maxEndTick;
     std::shared_ptr<const ImageBufferPreparedSource> preparedSource;
+    bool preparedAttempted = false;
 };
 
 inline ImageBufferOverlapIndexState& ImageBufferOverlapIndexGet()
@@ -85,22 +91,43 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     const MIDIChannelEvent* const data = events.empty() ? nullptr : events.data();
     const size_t blockCount =
         (events.size() + ImageBufferOverlapBlockEvents - 1) / ImageBufferOverlapBlockEvents;
+    const uint64_t firstEvent = events.empty() ? 0 : (uint64_t)events.front();
+    const uint64_t lastEvent = events.empty() ? 0 : (uint64_t)events.back();
+    const long long firstTime = events.empty() ? 0 : midi.GetEventTime(events.front());
+    const long long lastTime = events.empty() ? 0 : midi.GetEventTime(events.back());
 
+    // Include cheap content probes as well as owner/storage identity. An old and
+    // new MainScreen can otherwise reuse the same allocator addresses and event
+    // count, which would make a stale prepared source look current.
     if (state.owner == owner && state.eventData == data &&
-        state.eventCount == events.size() && state.maxEndTime.size() == blockCount &&
-        state.preparedSource)
+        state.eventCount == events.size() && state.firstEvent == firstEvent &&
+        state.lastEvent == lastEvent && state.firstTime == firstTime &&
+        state.lastTime == lastTime && state.maxEndTime.size() == blockCount &&
+        state.preparedAttempted)
         return state;
 
     state.owner = owner;
     state.eventData = data;
     state.eventCount = events.size();
+    state.firstEvent = firstEvent;
+    state.lastEvent = lastEvent;
+    state.firstTime = firstTime;
+    state.lastTime = lastTime;
     state.maxEndTime.assign(blockCount, (std::numeric_limits<long long>::min)());
     state.maxEndTick.assign(blockCount, (std::numeric_limits<long long>::min)());
+    state.preparedSource.reset();
+    state.preparedAttempted = false;
 
-    auto source = std::make_shared<ImageBufferPreparedSource>();
-    // NoteOn/NoteOff streams are commonly close to 50/50. Reserve without
-    // constructing so huge MIDIs avoid repeated vector reallocations.
-    source->notes.reserve(events.size() / 2);
+    std::shared_ptr<ImageBufferPreparedSource> source;
+    try {
+        source = std::make_shared<ImageBufferPreparedSource>();
+        // NoteOn/NoteOff streams are commonly close to 50/50. Reserving once
+        // avoids repeated 100+ MB reallocations on black MIDIs. If this reserve
+        // cannot be satisfied, image buffering still has the exact overlap path.
+        source->notes.reserve(events.size() / 2);
+    } catch (const std::bad_alloc&) {
+        source.reset();
+    }
 
     for (size_t i = 0; i < events.size(); ++i) {
         const MIDIChannelEvent event = events[i];
@@ -127,55 +154,64 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
         if (worstTick > state.maxEndTick[eventBlock])
             state.maxEndTick[eventBlock] = worstTick;
 
-        ImageBufferPreparedRawNote raw;
-        raw.seed = ImageBufferOverlapSeed(event, sister);
-        raw.track = (uint16_t)midi.GetEventTrack(event);
-        raw.key = (uint8_t)midi.GetEventParam1(event);
-        raw.channel = (uint8_t)midi.GetEventChannel(event);
+        if (!source)
+            continue;
 
-        if (startTime < 0 || lengthTime < 0) {
-            source->timeOverflow = true;
-        } else {
-            const uint64_t start100 = (uint64_t)startTime / 100ULL;
-            const uint64_t length100 = ((uint64_t)lengthTime + 99ULL) / 100ULL;
-            if (start100 > (std::numeric_limits<uint32_t>::max)() ||
-                length100 > (std::numeric_limits<uint32_t>::max)()) {
+        try {
+            ImageBufferPreparedRawNote raw;
+            raw.seed = ImageBufferOverlapSeed(event, sister);
+            raw.track = (uint16_t)midi.GetEventTrack(event);
+            raw.key = (uint8_t)midi.GetEventParam1(event);
+            raw.channel = (uint8_t)midi.GetEventChannel(event);
+
+            if (startTime < 0) {
                 source->timeOverflow = true;
             } else {
-                raw.start100us = (uint32_t)start100;
-                raw.length100us = (uint32_t)length100;
+                const uint64_t start100 = (uint64_t)startTime / 100ULL;
+                const uint64_t length100 = ((uint64_t)lengthTime + 99ULL) / 100ULL;
+                if (start100 > (std::numeric_limits<uint32_t>::max)() ||
+                    length100 > (std::numeric_limits<uint32_t>::max)()) {
+                    source->timeOverflow = true;
+                } else {
+                    raw.start100us = (uint32_t)start100;
+                    raw.length100us = (uint32_t)length100;
+                }
             }
+
+            if (startTickLL < 0 ||
+                (uint64_t)startTickLL > (std::numeric_limits<uint32_t>::max)() ||
+                (uint64_t)lengthTickLL > (std::numeric_limits<uint32_t>::max)()) {
+                source->tickOverflow = true;
+            } else {
+                raw.startTick = (uint32_t)startTickLL;
+                raw.lengthTick = (uint32_t)lengthTickLL;
+            }
+
+            const size_t rawIndex = source->notes.size();
+            source->notes.push_back(raw);
+            const size_t rawBlock = rawIndex / ImageBufferPreparedRawBlockNotes;
+            if (rawBlock >= source->maxEndTime150_100us.size()) {
+                source->maxEndTime150_100us.push_back(0);
+                source->maxEndTick150.push_back(0);
+            }
+
+            const uint64_t worst100 = (uint64_t)raw.start100us +
+                (uint64_t)raw.length100us + ((uint64_t)raw.length100us + 1ULL) / 2ULL;
+            const uint64_t worstRawTick = (uint64_t)raw.startTick +
+                (uint64_t)raw.lengthTick + ((uint64_t)raw.lengthTick + 1ULL) / 2ULL;
+            if (worst100 > source->maxEndTime150_100us[rawBlock])
+                source->maxEndTime150_100us[rawBlock] = worst100;
+            if (worstRawTick > source->maxEndTick150[rawBlock])
+                source->maxEndTick150[rawBlock] = worstRawTick;
+        } catch (const std::bad_alloc&) {
+            // Preparation is an optimization. Keep the exact block index and
+            // abandon the compact source instead of failing song playback.
+            source.reset();
         }
-
-        if (startTickLL < 0 || lengthTickLL < 0 ||
-            (uint64_t)startTickLL > (std::numeric_limits<uint32_t>::max)() ||
-            (uint64_t)lengthTickLL > (std::numeric_limits<uint32_t>::max)()) {
-            source->tickOverflow = true;
-        } else {
-            raw.startTick = (uint32_t)startTickLL;
-            raw.lengthTick = (uint32_t)lengthTickLL;
-        }
-
-        const size_t rawIndex = source->notes.size();
-        const size_t rawBlock = rawIndex / ImageBufferPreparedRawBlockNotes;
-        if (rawBlock >= source->maxEndTime150_100us.size()) {
-            source->maxEndTime150_100us.push_back(0);
-            source->maxEndTick150.push_back(0);
-        }
-
-        const uint64_t worst100 = (uint64_t)raw.start100us +
-            (uint64_t)raw.length100us + ((uint64_t)raw.length100us + 1ULL) / 2ULL;
-        const uint64_t worstRawTick = (uint64_t)raw.startTick +
-            (uint64_t)raw.lengthTick + ((uint64_t)raw.lengthTick + 1ULL) / 2ULL;
-        if (worst100 > source->maxEndTime150_100us[rawBlock])
-            source->maxEndTime150_100us[rawBlock] = worst100;
-        if (worstRawTick > source->maxEndTick150[rawBlock])
-            source->maxEndTick150[rawBlock] = worstRawTick;
-
-        source->notes.push_back(raw);
     }
 
     state.preparedSource = std::move(source);
+    state.preparedAttempted = true;
     return state;
 }
 
