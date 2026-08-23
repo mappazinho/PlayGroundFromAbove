@@ -42,6 +42,12 @@ VOID SetPlayPauseStop( BOOL bPlay, BOOL bPause, BOOL bStop );
 BOOL PlayFile( const wstring &sFile, bool bCustomSettings = false );
 VOID CheckActivity( BOOL bIsActive, POINT *ptNew = NULL, BOOL bToggleEnable = false );
 
+// RenderMode dense-image prewarm gate. PlaybackSettings calls these on play /
+// pause transitions; the implementation lives with MainScreen because it owns
+// the MIDI/image-buffer lifetime.
+VOID ImageBufferPrewarmPlaybackRequested( BOOL bPlaying );
+BOOL ImageBufferPrewarmPlaybackHold();
+
 // Test hook (crash repro driver): -repro "<midiA>" "<audio>" "<midiB>" [delaySecs]
 // on the command line opens song A with custom audio, then plain-opens song B
 // while A plays. Inert unless the switch is used.
