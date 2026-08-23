@@ -1633,6 +1633,10 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
         m_MIDI.ConnectNotes(); // Order's important here
         // the memory peak and throws bad_alloc; PostProcess's push_back doubling
         m_MIDI.PostProcess(m_vEvents, &m_vProgramChange, &m_vMetaEvents, &m_vTempo, &m_vSignature, &m_vMarkers);
+        // Renderer instances survive game-state/MIDI changes. Never let a new
+        // file inherit screen textures from the previous file merely because
+        // its chunk numbers or event count happen to match.
+        m_pRenderer->ImageBufferInvalidate();
         if (!m_vEvents.empty())
         {
             size_t aProbe[] = { 0, 1, 10, 100, 1000, 10000, 100000, 1000000, (size_t)m_vEvents.size() / 16,

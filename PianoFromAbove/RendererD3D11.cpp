@@ -702,7 +702,6 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
-    ImageBufferBeginFrame();
 
     // Upload fixed size constants if they changed
     if (memcmp(&m_FixedConstants, &m_OldFixedConstants, sizeof(FixedSizeConstants))) {
@@ -724,6 +723,9 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
         };
         m_pContext->UpdateSubresource(m_pTrackColorBuffer.Get(), 0, &box, (const uint8_t*)m_TrackColors + beginBytes, (UINT)bytes, 0);
     }
+
+    // Fixed/color stamps now describe the data that will actually be baked.
+    ImageBufferBeginFrame();
 
     SetPipeline(Pipeline::Rect);
     SetupCommandList();
