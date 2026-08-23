@@ -140,7 +140,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
         const MIDIChannelEvent sister = (MIDIChannelEvent)midi.GetEventSisterIdx(event);
 
         const long long startTime = midi.GetEventTime(event);
-        const long long lengthTime = (std::max)(0LL, midi.GetEventLength(event));
+        const long long lengthTime = (std::max)(0LL, (long long)midi.GetEventLength(event));
         const long long startTickLL = midi.GetEventAbsT(event);
         const long long endTickLL = midi.GetEventAbsT(sister);
         const long long lengthTickLL = (std::max)(0LL, endTickLL - startTickLL);
