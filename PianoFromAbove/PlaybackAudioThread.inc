@@ -605,10 +605,10 @@ void MainScreen::PlaybackAudioThreadMain()
         const float corruptor = m_fPlaybackAudioCorruption.load(std::memory_order_acquire);
         const auto muteSnapshot = std::atomic_load_explicit(&m_pPlaybackAudioMuteMask, std::memory_order_acquire);
 
-        // The scheduler itself runs independently at ~1 kHz. Keep the host
-        // cursor strictly due-now even for native SVMS: dense equal-time events
-        // are still submitted as one exact-QPC batch, but pause/mute/provider
-        // changes can never leave already-queued future MIDI behind.
+        // The scheduler is intentionally uncapped while live playback is
+        // running. It busy-polls the independent QPC clock as fast as this CPU
+        // can execute the loop; dense equal-time events still use one exact-QPC
+        // batch at a time. Paused/inactive states sleep separately below.
         const bool exactBatch = output.HasExactQpcBatch();
         const long long lookAheadWallUs = 0LL;
         const long long deadlineSongUs = songUs + (long long)(lookAheadWallUs * localSpeed + 0.5);
@@ -698,12 +698,13 @@ void MainScreen::PlaybackAudioThreadMain()
             }
         }
 
-        if (processed >= maxEventsThisPass) {
-            SwitchToThread();
+        // Never yield or sleep on the active playback path. A full batch
+        // immediately continues into the next batch, while an idle iteration
+        // immediately polls QPC again. This deliberately consumes one scheduler
+        // thread/core when playing in exchange for the lowest possible ingress
+        // latency and an effectively unlimited audio/MIDI FPS.
+        if (processed >= maxEventsThisPass)
             continue;
-        }
-
-        Sleep(1);
     }
 
     output.Panic();
