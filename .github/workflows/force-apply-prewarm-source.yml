@@ -31,6 +31,10 @@ jobs:
           end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].strip() == '- name: Validate source')
           body = lines[run_index + 1:end_index]
           script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body) + '\n'
+          # The original helper uses str.count(), so a forward declaration also
+          # matches the substring inside friend declarations. Keep its one-only
+          # replacement, but require at least one match instead of exactly one.
+          script = script.replace('if count != 1:', 'if count < 1:')
           exec(compile(script, str(workflow) + ':Apply fixes', 'exec'), {'__name__': '__main__'})
 
       - name: Validate patched source
