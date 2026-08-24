@@ -12,7 +12,7 @@ permissions:
 jobs:
   apply-source:
     if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'fix/prewarm-pins-parallel-sort-source')
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
         with:
