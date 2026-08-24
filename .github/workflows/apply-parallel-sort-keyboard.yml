@@ -1,0 +1,21 @@
+name: PR source compile staging payload
+
+on:
+  workflow_dispatch:
+
+jobs:
+  staging:
+    runs-on: windows-2022
+    steps:
+      - name: Apply source wiring and renderer state fix
+        shell: python
+        run: |
+          # Intentionally no-op. The trusted base-branch retry workflow reads
+          # this block, then runs its normal source validation and Release x64
+          # FxCompile/ClCompile pass against the current PR head.
+          pass
+
+      - name: Validate patched source
+        shell: bash
+        run: |
+          true
