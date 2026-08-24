@@ -10,10 +10,81 @@ jobs:
       - name: Apply source wiring and renderer state fix
         shell: python
         run: |
-          # Intentionally no-op. The trusted base-branch retry workflow reads
-          # this block, then runs its normal source validation and Release x64
-          # FxCompile/ClCompile pass against the current PR head.
-          pass
+          from pathlib import Path
+          import os
+          import subprocess
+
+          def replace_or_verify(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if old in text:
+                  p.write_text(text.replace(old, new, 1), encoding='utf-8')
+                  return
+              if new not in text:
+                  raise RuntimeError(f'{label}: neither old nor new text found')
+
+          replace_or_verify(
+              'PianoFromAbove/GameState.h',
+              '''    std::atomic<bool> m_bPlaybackAudioMute{ false };\n    std::atomic<bool> m_bPlaybackAudioWantKDMAPI{ false };''',
+              '''    std::atomic<bool> m_bPlaybackAudioMute{ false };\n    std::atomic<bool> m_bPlaybackAudioPianoOverride{ false };\n    std::atomic<bool> m_bPlaybackAudioWantKDMAPI{ false };''',
+              'piano override snapshot state')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''    void Panic()\n    {''',
+              '''    // Pause/mute must silence currently sounding notes without resetting\n    // channel/program state. The scheduler never queues future host events, so\n    // All Notes Off + sustain off is sufficient and avoids expensive synth resets.\n    void Silence()\n    {\n        if (m_mode == Mode::SvmsNative) {\n            if (!m_svms.send_short) return;\n            for (unsigned channel = 0; channel < 16; ++channel) {\n                m_svms.send_short(m_svmsSession,\n                    (uint32_t)(0xB0u | channel | (0x7Bu << 8)));\n                m_svms.send_short(m_svmsSession,\n                    (uint32_t)(0xB0u | channel | (0x40u << 8)));\n            }\n            return;\n        }\n        if (m_mode == Mode::KDMAPI) {\n            if (!m_sendDirectData) return;\n            for (unsigned channel = 0; channel < 16; ++channel) {\n                m_sendDirectData((DWORD)(0xB0u | channel | (0x7Bu << 8)));\n                m_sendDirectData((DWORD)(0xB0u | channel | (0x40u << 8)));\n            }\n            return;\n        }\n        if (m_mode == Mode::WinMM)\n            m_winmm.AllNotesOff();\n    }\n\n    void Panic()\n    {''',
+              'non-destructive pause silence')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''    const bool muted = playback.GetMute();\n    const bool wantKDMAPI = viz.bKDMAPI;''',
+              '''    const bool muted = playback.GetMute();\n    const bool pianoOverride = config.m_bPianoOverride;\n    const bool wantKDMAPI = viz.bKDMAPI;''',
+              'snapshot piano override')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''    m_bPlaybackAudioMute.store(muted, std::memory_order_release);\n    m_bPlaybackAudioWantKDMAPI.store(wantKDMAPI, std::memory_order_release);''',
+              '''    m_bPlaybackAudioMute.store(muted, std::memory_order_release);\n    m_bPlaybackAudioPianoOverride.store(pianoOverride, std::memory_order_release);\n    m_bPlaybackAudioWantKDMAPI.store(wantKDMAPI, std::memory_order_release);''',
+              'publish piano override')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''            if (type == MIDI::ProgramChange && m_MIDI.GetEventChannel(event) != MIDI::Drums && Config::GetConfig().m_bPianoOverride)\n                p1 = 0;''',
+              '''            if (type == MIDI::ProgramChange && m_MIDI.GetEventChannel(event) != MIDI::Drums &&\n                m_bPlaybackAudioPianoOverride.load(std::memory_order_acquire))\n                p1 = 0;''',
+              'worker config isolation')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''        // Native SVMS accepts exact QPC timestamps, so queue a tiny future\n        // window. Generic WinMM/KDMAPI stays due-now because those APIs do not\n        // provide a timestamped contract. Either way the iteration cadence is\n        // independent of renderer FPS.\n        const bool exactBatch = output.HasExactQpcBatch();\n        const long long lookAheadWallUs = exactBatch ? 8000LL : 0LL;''',
+              '''        // The scheduler itself runs independently at ~1 kHz. Keep the host\n        // cursor strictly due-now even for native SVMS: dense equal-time events\n        // are still submitted as one exact-QPC batch, but pause/mute/provider\n        // changes can never leave already-queued future MIDI behind.\n        const bool exactBatch = output.HasExactQpcBatch();\n        const long long lookAheadWallUs = 0LL;''',
+              'remove future MIDI queue')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''        // Pause/mute transitions flush once. In particular, do not call reset\n        // on every 1 ms scheduler iteration while paused: some KDMAPI synths do\n        // expensive pool maintenance on ResetKDMAPIStream.\n        if ((localPaused && !lastPanicPaused) || (globalMute && !lastPanicMute))\n            output.Panic();''',
+              '''        // Pause/mute transitions silence once without resetting the synth.\n        // No future host MIDI is queued, so this cannot leave scheduled notes\n        // behind and it preserves program/controller state across resume.\n        if ((localPaused && !lastPanicPaused) || (globalMute && !lastPanicMute))\n            output.Silence();''',
+              'pause mute edge behavior')
+
+          replace_or_verify(
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              '''    // For live synth playback the audio QPC clock is authoritative. Resetting\n    // the legacy frame timer here prevents its old FPS-based elapsed step from\n    // double-advancing the song after we snap visuals to the audio clock.\n    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) &&\n        !m_bPlaybackAudioPaused.load(std::memory_order_acquire) && !g_bVideoRendering) {''',
+              '''    // For live synth playback the audio QPC clock is authoritative, including\n    // the exact pause position. Resetting the legacy frame timer here prevents\n    // its old FPS-based elapsed step from double-advancing after the snap.\n    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering) {''',
+              'pause clock visual snap')
+
+          # Compile and link the complete Release x64 target before the trusted
+          # wrapper performs its normal FxCompile/ClCompile validation.
+          vswhere = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe'
+          found = subprocess.check_output([
+              str(vswhere), '-latest', '-products', '*',
+              '-requires', 'Microsoft.Component.MSBuild',
+              '-find', r'MSBuild\**\Bin\MSBuild.exe'
+          ], text=True).strip().splitlines()
+          if not found:
+              raise RuntimeError('MSBuild.exe not found via vswhere')
+          subprocess.check_call([
+              found[0], r'PianoFromAbove\PianoFromAbove.vcxproj', '/m', '/t:Build',
+              '/p:Configuration=Release', '/p:Platform=x64'
+          ])
 
       - name: Validate patched source
         shell: bash
