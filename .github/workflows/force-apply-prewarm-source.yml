@@ -23,18 +23,14 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          import textwrap
 
           workflow = Path('.github/workflows/apply-prewarm-pins-parallel-sort.yml')
           lines = workflow.read_text(encoding='utf-8').splitlines()
           apply_index = next(i for i, line in enumerate(lines) if line.strip() == '- name: Apply fixes')
           run_index = next(i for i in range(apply_index + 1, len(lines)) if lines[i].strip() == 'run: |')
-          body = []
-          for line in lines[run_index + 1:]:
-              if line and not line.startswith('          '):
-                  break
-              body.append(line[10:] if line.startswith('          ') else '')
-          script = '\n'.join(body) + '\n'
+          end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].strip() == '- name: Validate source')
+          body = lines[run_index + 1:end_index]
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body) + '\n'
           exec(compile(script, str(workflow) + ':Apply fixes', 'exec'), {'__name__': '__main__'})
 
       - name: Validate patched source
@@ -60,6 +56,7 @@ jobs:
         run: |
           set -euxo pipefail
           rm -f .github/workflows/force-apply-prewarm-source.yml
+          rm -f .github/source-patch-kick.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
