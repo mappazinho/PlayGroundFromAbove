@@ -232,7 +232,9 @@ void VizSettings::LoadDefaultValues() {
     this->sSplashMIDI = L"";
     this->bVisualizePitchBends = false;
     this->bDualPianoRoll = false;
+    this->bHorizontalPianoRoll = false;
     this->bDualRollKeyboard = true;
+    this->bDisableBlurs = false;
     this->bBloom = false;
     this->fBloomIntensity = 1.0f;
     this->fBloomBrightness = 1.0f;
@@ -496,8 +498,14 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bVisualizePitchBends = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)
         bDualPianoRoll = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("HorizontalPianoRoll", &iAttrVal) == TIXML_SUCCESS)
+        bHorizontalPianoRoll = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("DualRollKeyboard", &iAttrVal) == TIXML_SUCCESS)
         bDualRollKeyboard = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("DisableBlurs", &iAttrVal) == TIXML_SUCCESS)
+        bDisableBlurs = (iAttrVal != 0);
+    if (bDualPianoRoll && bHorizontalPianoRoll)
+        bHorizontalPianoRoll = false;
     if (txViz->QueryIntAttribute("Bloom", &iAttrVal) == TIXML_SUCCESS)
         bBloom = (iAttrVal != 0);
     txViz->QueryFloatAttribute("BloomIntensity", &fBloomIntensity);
@@ -747,7 +755,9 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("SplashMIDI", Util::WstringToString(sSplashMIDI));
     txViz->SetAttribute("VisualizePitchBends", bVisualizePitchBends);
     txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);
+    txViz->SetAttribute("HorizontalPianoRoll", bHorizontalPianoRoll);
     txViz->SetAttribute("DualRollKeyboard", bDualRollKeyboard);
+    txViz->SetAttribute("DisableBlurs", bDisableBlurs);
     txViz->SetAttribute("Bloom", bBloom);
     txViz->SetDoubleAttribute("BloomIntensity", fBloomIntensity);
     txViz->SetDoubleAttribute("BloomBrightness", fBloomBrightness);

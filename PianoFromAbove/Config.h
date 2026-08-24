@@ -215,7 +215,9 @@ struct VizSettings : public ISettings {
     std::wstring sSplashMIDI;
     bool bVisualizePitchBends;
     bool bDualPianoRoll;
+    bool bHorizontalPianoRoll;
     bool bDualRollKeyboard;
+    bool bDisableBlurs;
     bool bBloom;
     float fBloomIntensity;
     float fBloomBrightness;

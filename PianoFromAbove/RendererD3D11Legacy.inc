@@ -817,7 +817,7 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         ApplyBlur();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
-    if (bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
+    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
         // Extract bright parts into the half-res buffer
         m_pContext->CSSetShader(m_pBloomExtractCS.Get(), nullptr, 0);
         m_pContext->CSSetConstantBuffers(0, 1, m_pBloomExtractConstants.GetAddressOf());
@@ -1424,9 +1424,21 @@ void D3D11Renderer::ApplyBlur() {
 }
 
 void D3D11Renderer::DrawPianoRollStripBackground() {
-    if (g_bDisableBlur || !Config::GetConfig().GetVizSettings().bDualPianoRoll || !m_pBlurOutput)
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    if (g_bDisableBlur || (!stripViz.bDualPianoRoll && !stripViz.bHorizontalPianoRoll) || !m_pBlurOutput)
         return;
 
+    if (stripViz.bHorizontalPianoRoll) {
+        const D3D11_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
+        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };
+        SetPipeline(Pipeline::Background);
+        m_pContext->UpdateSubresource(m_pBackgroundConstants.Get(), 0, nullptr, &fullConstants, 0, 0);
+        ID3D11ShaderResourceView* blurSRV = m_pBlurOutputSRV.Get();
+        m_pContext->PSSetShaderResources(0, 1, &blurSRV);
+        m_pContext->RSSetScissorRects(1, &fullScissor);
+        m_pContext->Draw(3, 0);
+        return;
+    }
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
     const float stripTop = menuBarHeight + toolbarHeight;
@@ -1476,7 +1488,9 @@ void D3D11Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D11Renderer::DrawPianoRollStrip() {
-    if (!Config::GetConfig().GetVizSettings().bDualPianoRoll)
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    const bool horizontal = stripViz.bHorizontalPianoRoll;
+    if (!stripViz.bDualPianoRoll && !horizontal)
         return;
 
     const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
@@ -1496,11 +1510,11 @@ void D3D11Renderer::DrawPianoRollStrip() {
 
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
-    const float stripTop = menuBarHeight + toolbarHeight;
+    const float stripTop = horizontal ? 0.0f : menuBarHeight + toolbarHeight;
 
     m_pContext->ClearDepthStencilView(m_pDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-    const float stripH = max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripW = (float)m_iBufferWidth;
     const int nKeys = 128;
     static const int sSharpsBelow[12] = { 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5 };
@@ -1600,6 +1614,18 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
     const int H = (int)round(m_RootConstants.notes_cy);
     if (W <= 0 || H <= 0)
         return S_OK;
+
+    for (const auto& req : m_vChunkBuilds) {
+        const size_t offset = (size_t)req.noteOffset;
+        const size_t count = (size_t)req.noteCount;
+        if (offset > m_vChunkNotes.size() || count > m_vChunkNotes.size() - offset || count > MaxNotesPerPass) {
+            char buf[192];
+            sprintf_s(buf, "imgbuf:reject-range chunk=%lld off=%zu count=%zu total=%zu cap=%u", req.chunk, offset, count, m_vChunkNotes.size(), (unsigned)MaxNotesPerPass);
+            HeartbeatLog(buf);
+            ImageBufferInvalidate();
+            return S_OK;
+        }
+    }
 
     // Chunk-relative root constants: [0,W]x[0,H] maps to NDC, no warp.
     D3D11RootConstants chunkRoot = {};

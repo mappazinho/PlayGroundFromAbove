@@ -1399,7 +1399,7 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         ApplyBlur();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
-    if (bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
+    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
         ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
         m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
 
@@ -1635,9 +1635,22 @@ HRESULT D3D12Renderer::PresentBackend() {
 }
 
 void D3D12Renderer::DrawPianoRollStripBackground() {
-    if (g_bDisableBlur || !Config::GetConfig().GetVizSettings().bDualPianoRoll || !m_pBlurOutput)
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    if (g_bDisableBlur || (!stripViz.bDualPianoRoll && !stripViz.bHorizontalPianoRoll) || !m_pBlurOutput)
         return;
 
+    if (stripViz.bHorizontalPianoRoll) {
+        const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
+        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };
+        SetPipeline(Pipeline::Background);
+        ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
+        m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+        m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(fullConstants) / 4, &fullConstants, 0);
+        m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BlurOutputSRVGPU);
+        m_pCommandList->RSSetScissorRects(1, &fullScissor);
+        m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);
+        return;
+    }
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
     const float stripTop = menuBarHeight + toolbarHeight;
@@ -1689,7 +1702,9 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D12Renderer::DrawPianoRollStrip() {
-    if (!Config::GetConfig().GetVizSettings().bDualPianoRoll)
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    const bool horizontal = stripViz.bHorizontalPianoRoll;
+    if (!stripViz.bDualPianoRoll && !horizontal)
         return;
 
     const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
@@ -1709,13 +1724,13 @@ void D3D12Renderer::DrawPianoRollStrip() {
 
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
-    const float stripTop = menuBarHeight + toolbarHeight;
+    const float stripTop = horizontal ? 0.0f : menuBarHeight + toolbarHeight;
 
     // Reposition the depth so the strip pass starts clean; nothing after it
     CD3DX12_CPU_DESCRIPTOR_HANDLE stripDsv(m_pDSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
     m_pCommandList->ClearDepthStencilView(stripDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    const float stripH = max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripW = (float)m_iBufferWidth;
     const int nKeys = 128;
     static const int sSharpsBelow[12] = { 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5 };
@@ -1865,6 +1880,18 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
     const int H = (int)round(m_RootConstants.notes_cy);
     if (W <= 0 || H <= 0)
         return S_OK;
+
+    for (const auto& req : m_vChunkBuilds) {
+        const size_t offset = (size_t)req.noteOffset;
+        const size_t count = (size_t)req.noteCount;
+        if (offset > m_vChunkNotes.size() || count > m_vChunkNotes.size() - offset || count > MaxNotesPerPass) {
+            char buf[192];
+            sprintf_s(buf, "imgbuf:reject-range chunk=%lld off=%zu count=%zu total=%zu cap=%u", req.chunk, offset, count, m_vChunkNotes.size(), (unsigned)MaxNotesPerPass);
+            HeartbeatLog(buf);
+            ImageBufferInvalidate();
+            return S_OK;
+        }
+    }
 
     // The chunk textures, depth and fixed buffer are shared across frames, but
     // PresentBackend only fences the previous use of the current swapchain
