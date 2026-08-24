@@ -37,6 +37,33 @@ jobs:
           script = script.replace('if count != 1:', 'if count < 1:')
           exec(compile(script, str(workflow) + ':Apply fixes', 'exec'), {'__name__': '__main__'})
 
+          # The frametime drawer is a free helper, while GetStatsBounceScale is
+          # a protected MainScreen member. Pass the scale out of the EndText
+          # member-call site instead of trying to call the member from the free
+          # helper or duplicating its bounce formula.
+          p = Path('PianoFromAbove/GameState.cpp')
+          raw = p.read_bytes()
+          bom = raw.startswith(b'\xef\xbb\xbf')
+          if bom:
+              raw = raw[3:]
+          text = raw.decode('utf-8').replace('\r\n', '\n')
+          text = text.replace(
+              'static void DrawFrameTimeGraphLate(Renderer* renderer);',
+              'static void DrawFrameTimeGraphLate(Renderer* renderer, float bounceScale);', 1)
+          text = text.replace(
+              'DrawFrameTimeGraphLate(m_pRenderer)',
+              'DrawFrameTimeGraphLate(m_pRenderer, GetStatsBounceScale())', 1)
+          text = text.replace(
+              'static void DrawFrameTimeGraphLate(Renderer* renderer)\n{',
+              'static void DrawFrameTimeGraphLate(Renderer* renderer, float bounceScale)\n{', 1)
+          text = text.replace(
+              '0.20f, GetStatsBounceScale(), 750.0f);',
+              '0.20f, bounceScale, 750.0f);', 1)
+          data = text.replace('\n', '\r\n').encode('utf-8')
+          if bom:
+              data = b'\xef\xbb\xbf' + data
+          p.write_bytes(data)
+
       - name: Validate patched source
         shell: bash
         run: |
@@ -47,6 +74,8 @@ jobs:
           grep -F "imgprep:full-prime dense=%zu jobs=%zu" PianoFromAbove/ImageBufferPreparedChunks.h
           grep -F "ImageBufferChunkPinned(this" PianoFromAbove/RendererBase.cpp
           grep -F "Match Sys Stats exactly" PianoFromAbove/GameState.cpp
+          grep -F "DrawFrameTimeGraphLate(m_pRenderer, GetStatsBounceScale())" PianoFromAbove/GameState.cpp
+          grep -F "0.20f, bounceScale, 750.0f" PianoFromAbove/GameState.cpp
           grep -F "ParallelMIDIPos midiPos" PianoFromAbove/MIDI.cpp
           grep -F "parallel sort lanes" PianoFromAbove/RendererBaseLegacy.inc
           grep -F "PhysicalCoreCount" PianoFromAbove/ParallelMIDIPos.h
