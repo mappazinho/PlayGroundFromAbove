@@ -503,9 +503,114 @@ void Renderer::ImGuiStartFrame()
     RenderImGuiFrame();
 }
 
+static ImVec4 PGFAGuiColorFromHSV(float h, float s, float v, float a = 1.0f)
+{
+    while (h < 0.0f) h += 1.0f;
+    while (h >= 1.0f) h -= 1.0f;
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(h, max(0.0f, min(s, 1.0f)), max(0.0f, min(v, 1.0f)), r, g, b);
+    return ImVec4(r, g, b, a);
+}
+
+static void PGFAGenerateGuiPalette(VizSettings& viz, const ImVec4& base)
+{
+    ImGuiStyle generated;
+    ImGui::StyleColorsDark(&generated);
+    float h = 0.0f, s = 0.0f, v = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(base.x, base.y, base.z, h, s, v);
+    s = max(s, 0.35f);
+
+    auto c = [&](float value, float satScale = 1.0f, float alpha = 1.0f, float hueShift = 0.0f) {
+        return PGFAGuiColorFromHSV(h + hueShift, min(1.0f, s * satScale), value, alpha);
+    };
+    ImVec4* col = generated.Colors;
+    col[ImGuiCol_Text] = c(0.95f, 0.10f);
+    col[ImGuiCol_TextDisabled] = c(0.55f, 0.18f);
+    col[ImGuiCol_WindowBg] = c(0.075f, 0.35f, 0.96f);
+    col[ImGuiCol_ChildBg] = c(0.060f, 0.30f, 0.92f);
+    col[ImGuiCol_PopupBg] = c(0.090f, 0.38f, 0.98f);
+    col[ImGuiCol_Border] = c(0.42f, 0.65f, 0.55f);
+    col[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+    col[ImGuiCol_FrameBg] = c(0.15f, 0.65f, 0.95f);
+    col[ImGuiCol_FrameBgHovered] = c(0.30f, 0.90f, 0.95f);
+    col[ImGuiCol_FrameBgActive] = c(0.40f, 1.00f, 1.00f);
+    col[ImGuiCol_TitleBg] = c(0.095f, 0.48f, 1.00f);
+    col[ImGuiCol_TitleBgActive] = c(0.22f, 0.90f, 1.00f);
+    col[ImGuiCol_TitleBgCollapsed] = c(0.075f, 0.35f, 0.80f);
+    col[ImGuiCol_MenuBarBg] = c(0.10f, 0.45f, 1.00f);
+    col[ImGuiCol_ScrollbarBg] = c(0.055f, 0.25f, 0.80f);
+    col[ImGuiCol_ScrollbarGrab] = c(0.25f, 0.65f, 0.90f);
+    col[ImGuiCol_ScrollbarGrabHovered] = c(0.38f, 0.90f, 1.00f);
+    col[ImGuiCol_ScrollbarGrabActive] = c(0.50f, 1.00f, 1.00f);
+    col[ImGuiCol_CheckMark] = c(0.98f, 0.90f);
+    col[ImGuiCol_SliderGrab] = c(0.72f, 0.95f);
+    col[ImGuiCol_SliderGrabActive] = c(1.00f, 0.95f);
+    col[ImGuiCol_Button] = c(0.23f, 0.85f, 0.85f);
+    col[ImGuiCol_ButtonHovered] = c(0.40f, 1.00f, 0.95f);
+    col[ImGuiCol_ButtonActive] = c(0.52f, 1.00f, 1.00f);
+    col[ImGuiCol_Header] = c(0.22f, 0.85f, 0.80f);
+    col[ImGuiCol_HeaderHovered] = c(0.38f, 1.00f, 0.90f);
+    col[ImGuiCol_HeaderActive] = c(0.48f, 1.00f, 1.00f);
+    col[ImGuiCol_Separator] = c(0.35f, 0.60f, 0.60f);
+    col[ImGuiCol_SeparatorHovered] = c(0.62f, 1.00f, 0.90f);
+    col[ImGuiCol_SeparatorActive] = c(0.82f, 1.00f, 1.00f);
+    col[ImGuiCol_ResizeGrip] = c(0.34f, 0.85f, 0.45f);
+    col[ImGuiCol_ResizeGripHovered] = c(0.58f, 1.00f, 0.85f);
+    col[ImGuiCol_ResizeGripActive] = c(0.82f, 1.00f, 0.95f);
+    col[ImGuiCol_Tab] = c(0.13f, 0.55f, 0.95f);
+    col[ImGuiCol_TabHovered] = c(0.40f, 1.00f, 0.95f);
+    col[ImGuiCol_TabActive] = c(0.30f, 0.95f, 1.00f);
+    col[ImGuiCol_TabUnfocused] = c(0.09f, 0.35f, 0.90f);
+    col[ImGuiCol_TabUnfocusedActive] = c(0.19f, 0.68f, 1.00f);
+    col[ImGuiCol_PlotLines] = c(0.78f, 0.55f);
+    col[ImGuiCol_PlotLinesHovered] = c(1.00f, 1.00f);
+    col[ImGuiCol_PlotHistogram] = c(0.88f, 0.90f, 1.0f, 0.08f);
+    col[ImGuiCol_PlotHistogramHovered] = c(1.00f, 1.00f, 1.0f, 0.08f);
+    col[ImGuiCol_TableHeaderBg] = c(0.16f, 0.55f);
+    col[ImGuiCol_TableBorderStrong] = c(0.36f, 0.55f);
+    col[ImGuiCol_TableBorderLight] = c(0.22f, 0.45f);
+    col[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
+    col[ImGuiCol_TableRowBgAlt] = c(0.14f, 0.25f, 0.40f);
+    col[ImGuiCol_TextSelectedBg] = c(0.48f, 1.00f, 0.45f);
+    col[ImGuiCol_DragDropTarget] = c(1.00f, 1.00f, 0.95f);
+    col[ImGuiCol_NavHighlight] = c(0.86f, 1.00f, 1.00f);
+    col[ImGuiCol_NavWindowingHighlight] = c(1.00f, 0.25f, 0.70f);
+    col[ImGuiCol_NavWindowingDimBg] = c(0.05f, 0.20f, 0.35f);
+    col[ImGuiCol_ModalWindowDimBg] = c(0.03f, 0.20f, 0.72f);
+
+    viz.vGUIColors.resize(ImGuiCol_COUNT);
+    for (int i = 0; i < ImGuiCol_COUNT; ++i)
+        viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(col[i]);
+    viz.bCustomGUIColors = true;
+}
+
+static void PGFAApplyGuiPalette(VizSettings& viz)
+{
+    static bool captured = false;
+    static ImVec4 defaults[ImGuiCol_COUNT];
+    ImGuiStyle& style = ImGui::GetStyle();
+    if (!captured) {
+        for (int i = 0; i < ImGuiCol_COUNT; ++i)
+  defaults[i] = style.Colors[i];
+        captured = true;
+    }
+
+    if (viz.vGUIColors.size() != ImGuiCol_COUNT) {
+        viz.vGUIColors.resize(ImGuiCol_COUNT);
+        for (int i = 0; i < ImGuiCol_COUNT; ++i)
+  viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(defaults[i]);
+    }
+
+    for (int i = 0; i < ImGuiCol_COUNT; ++i)
+        style.Colors[i] = viz.bCustomGUIColors
+  ? ImGui::ColorConvertU32ToFloat4(viz.vGUIColors[i])
+  : defaults[i];
+}
+
 void Renderer::RenderImGuiFrame() {
     auto& io = ImGui::GetIO();
     auto& viz = Config::GetConfig().GetVizSettings();
+    PGFAApplyGuiPalette(viz);
     if (io.KeyCtrl && io.KeyAlt &&
         (ImGui::IsKeyPressed(ImGuiKey_LeftCtrl, false) || ImGui::IsKeyPressed(ImGuiKey_RightCtrl, false) ||
          ImGui::IsKeyPressed(ImGuiKey_LeftAlt, false) || ImGui::IsKeyPressed(ImGuiKey_RightAlt, false)))
@@ -1231,9 +1336,49 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     if (ImGui::Button("Reset##font"))
                         viz.sUIFont = L"";
                     ImGui::SliderFloat("UI Scale", &viz.fUIScale, 0.1f, 10.0f, "%.2f");
-                    ImGui::EndTabItem();
-                }
-                ImGui::EndTabBar();
+          ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Customize")) {
+          PGFAApplyGuiPalette(viz);
+          ImGui::Checkbox("Use custom GUI colors", &viz.bCustomGUIColors);
+          ImGui::SameLine();
+          if (ImGui::Button("Reset to default")) {
+              viz.bCustomGUIColors = false;
+              viz.vGUIColors.clear();
+              PGFAApplyGuiPalette(viz);
+          }
+
+          ImVec4 base = ImGui::ColorConvertU32ToFloat4(viz.uGUIPaletteBase);
+          if (ImGui::ColorEdit3("Palette base color", &base.x)) {
+              base.w = 1.0f;
+              viz.uGUIPaletteBase = ImGui::ColorConvertFloat4ToU32(base);
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Generate palette"))
+              PGFAGenerateGuiPalette(viz, base);
+          ImGui::TextDisabled("Generates a dark UI palette around one hue; individual colors remain editable below.");
+          ImGui::Separator();
+
+          if (viz.vGUIColors.size() != ImGuiCol_COUNT)
+              PGFAApplyGuiPalette(viz);
+          if (ImGui::BeginChild("##GuiColorParameters", ImVec2(0, 0), true)) {
+              for (int i = 0; i < ImGuiCol_COUNT; ++i) {
+                  ImGui::PushID(i);
+                  ImVec4 color = ImGui::ColorConvertU32ToFloat4(viz.vGUIColors[i]);
+                  ImGui::SetNextItemWidth(180.0f);
+                  if (ImGui::ColorEdit4("##color", &color.x, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf)) {
+                      viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(color);
+                      viz.bCustomGUIColors = true;
+                  }
+                  ImGui::SameLine();
+                  ImGui::TextUnformatted(ImGui::GetStyleColorName(i));
+                  ImGui::PopID();
+              }
+          }
+          ImGui::EndChild();
+          ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
             }
             ImGui::End();
         }

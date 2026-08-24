@@ -528,7 +528,6 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
 
     const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
     const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
-    const double audioSchedulerHz = statsScreen ? statsScreen->GetAudioSchedulerFPSForOverlay() : 0.0;
 
     if (frameMs > 0.05f && frameMs < 5000.0f) {
         s_history.push_back(frameMs);
@@ -609,11 +608,8 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
 
     const float currentMs = n > 0 ? s_history.back() : 0.0f;
     const float currentFps = currentMs > 0.001f ? 1000.0f / currentMs : 0.0f;
-    char label[128];
-    if (audioSchedulerHz > 0.0)
-        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f FPS", currentMs, currentFps, audioSchedulerHz);
-    else
-        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
+    char label[96];
+    snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
     dl->AddText(ImVec2(panelLeft + 6.0f * scale, panelTop + 3.0f * scale),
         0xFF9A9A9A, label);
 

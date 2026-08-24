@@ -387,6 +387,16 @@ void MainScreen::StopPlaybackAudioThread()
     m_bPlaybackAudioRunning.store(false, std::memory_order_release);
     m_bPlaybackAudioLiveEnabled.store(false, std::memory_order_release);
     m_dPlaybackAudioSchedulerHz.store(0.0, std::memory_order_relaxed);
+
+    // A Stop is a real output-session boundary. Clear the UI-side transition
+    // cache as well as the worker so the next Play cannot inherit a stale
+    // provider/live state from the previous run.
+    m_bPlaybackAudioControlInitialized = false;
+    m_bPlaybackAudioLastPaused = true;
+    m_bPlaybackAudioLastLive = false;
+    m_bPlaybackAudioLastKDMAPI = false;
+    m_iPlaybackAudioLastDevice = -2;
+    m_dPlaybackAudioLastSpeed = 1.0;
 }
 
 void MainScreen::PlaybackAudioSeek(long long songUs)
@@ -730,8 +740,25 @@ GameState::GameError IntroScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LP
 GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     const long long before = m_llStartTime;
+    const bool wasPaused = Config::GetConfig().GetPlaybackSettings().GetPaused();
     GameError result = MsgProcLegacy(hWnd, msg, wParam, lParam);
-    if (!IsFreePlay() && m_llStartTime != before) {
+    const bool nowPaused = Config::GetConfig().GetPlaybackSettings().GetPaused();
+
+    const bool isStop = msg == WM_COMMAND && LOWORD(wParam) == ID_PLAY_STOP;
+    if (isStop) {
+        // Tear the output provider down completely at Stop. The following Play
+        // starts a fresh scheduler/provider and reseeks from the reset position.
+        StopPlaybackAudioThread();
+        m_llPlaybackAudioControlSongUs.store(m_llStartTime, std::memory_order_relaxed);
+        m_llPlaybackAudioClockUs.store(m_llStartTime, std::memory_order_relaxed);
+        return result;
+    }
+
+    if (!IsFreePlay() && wasPaused && !nowPaused) {
+        StartPlaybackAudioThread();
+        PlaybackAudioSeek(m_llStartTime);
+        SyncPlaybackAudioThread(true);
+    } else if (!IsFreePlay() && m_llStartTime != before) {
         StartPlaybackAudioThread();
         PlaybackAudioSeek(m_llStartTime);
     }

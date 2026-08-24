@@ -258,6 +258,9 @@ struct VizSettings : public ISettings {
     bool bDisableUI;
     float fUIScale;
     std::wstring sUIFont;
+    bool bCustomGUIColors;
+    unsigned int uGUIPaletteBase;
+    std::vector<unsigned int> vGUIColors;
     bool bBounceStats;
     int iBounceNPSThreshold;
     bool bImageBufferNotes;

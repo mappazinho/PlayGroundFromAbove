@@ -260,6 +260,10 @@ void VizSettings::LoadDefaultValues() {
     this->bDisableUI = false;
     this->fUIScale = 1.0f;
     this->sUIFont = L"";
+    this->bCustomGUIColors = false;
+    // ImGui packed ABGR: RGB(64, 140, 255).
+    this->uGUIPaletteBase = 0xFFFF8C40u;
+    this->vGUIColors.clear();
     this->bBounceStats = false;
     this->iBounceNPSThreshold = 90;
     this->bImageBufferNotes = false;
@@ -566,6 +570,19 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         fUIScale = 1.0f;
     txViz->QueryStringAttribute("UIFont", &sTempStr);
     sUIFont = Util::StringToWstring(sTempStr);
+    if (txViz->QueryIntAttribute("CustomGUIColors", &iAttrVal) == TIXML_SUCCESS)
+        bCustomGUIColors = (iAttrVal != 0);
+    if (const char* base = txViz->Attribute("GUIPaletteBase"))
+        uGUIPaletteBase = (unsigned int)strtoul(base, nullptr, 16);
+    vGUIColors.clear();
+    if (TiXmlElement* txColors = txViz->FirstChildElement("GUIColors")) {
+        for (TiXmlElement* txColor = txColors->FirstChildElement("Color"); txColor;
+             txColor = txColor->NextSiblingElement("Color")) {
+            const char* value = txColor->Attribute("Value");
+            if (value)
+                vGUIColors.push_back((unsigned int)strtoul(value, nullptr, 16));
+        }
+    }
     if (txViz->QueryIntAttribute("BounceStats", &iAttrVal) == TIXML_SUCCESS)
         bBounceStats = (iAttrVal != 0);
     txViz->QueryIntAttribute("BounceNPSThreshold", &iBounceNPSThreshold);
@@ -782,6 +799,21 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("DisableUI", bDisableUI);
     txViz->SetDoubleAttribute("UIScale", fUIScale);
     txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));
+    txViz->SetAttribute("CustomGUIColors", bCustomGUIColors);
+    char guiBase[16] = {};
+    sprintf_s(guiBase, "%08X", uGUIPaletteBase);
+    txViz->SetAttribute("GUIPaletteBase", guiBase);
+    if (!vGUIColors.empty()) {
+        TiXmlElement* txColors = new TiXmlElement("GUIColors");
+        txViz->LinkEndChild(txColors);
+        for (unsigned int color : vGUIColors) {
+            TiXmlElement* txColor = new TiXmlElement("Color");
+            char value[16] = {};
+            sprintf_s(value, "%08X", color);
+            txColor->SetAttribute("Value", value);
+            txColors->LinkEndChild(txColor);
+        }
+    }
     txViz->SetAttribute("BounceStats", bBounceStats);
     txViz->SetAttribute("BounceNPSThreshold", iBounceNPSThreshold);
     txViz->SetAttribute("ImageBufferNotes", bImageBufferNotes);
