@@ -1,0 +1,143 @@
+name: Apply parallel sort tail and image-buffer keyboard fix
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-source:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply source wiring and renderer state fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def read_text(path):
+              p = Path(path)
+              raw = p.read_bytes()
+              bom = raw.startswith(b'\xef\xbb\xbf')
+              if bom:
+                  raw = raw[3:]
+              return p, raw.decode('utf-8').replace('\r\n', '\n'), bom
+
+          def write_text(p, text, bom):
+              raw = text.replace('\n', '\r\n').encode('utf-8')
+              if bom:
+                  raw = b'\xef\xbb\xbf' + raw
+              p.write_bytes(raw)
+
+          def replace_once(path, old, new, label):
+              p, text, bom = read_text(path)
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected one match, got {count}')
+              write_text(p, text.replace(old, new, 1), bom)
+
+          replace_once('PianoFromAbove/MIDI.h',
+              '''    void PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,\n        vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);\n''',
+              '''    void PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,\n        vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);\n    void PostProcessParallel(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,\n        vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);\n''',
+              'parallel PostProcess declaration')
+
+          replace_once('PianoFromAbove/MIDI.cpp',
+              '''#include "ParallelMIDIPos.h"\n#include <fstream>''',
+              '''#include "ParallelMIDIPos.h"\n#include "ParallelPostProcess.h"\n#include <fstream>''',
+              'parallel PostProcess include')
+
+          replace_once('PianoFromAbove/MIDI.cpp',
+              '''void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges, vector<MIDIMetaEvent*>* vMetaEvents, eventvec_t* vTempo, eventvec_t* vSignature, eventvec_t* vMarkers)\n{\n    ParallelMIDIPos midiPos( *this );''',
+              '''void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges, vector<MIDIMetaEvent*>* vMetaEvents, eventvec_t* vTempo, eventvec_t* vSignature, eventvec_t* vMarkers)\n{\n    LogLoadStage("PostProcess parallel start", this);\n    PostProcessParallel(vChannelEvents, vProgramChanges, vMetaEvents, vTempo, vSignature, vMarkers);\n    LogLoadStage("PostProcess parallel end", this);\n    return;\n\n    // Legacy single-consumer implementation retained below as a correctness\n    // reference/fallback while the active path above performs every heavy pass\n    // across the physical-core worker pool.\n    ParallelMIDIPos midiPos( *this );''',
+              'parallel PostProcess entry')
+
+          # Image-buffer chunk drawing narrows the scissor to the piano-roll area.
+          # RenderKeys() is submitted after RenderNotes(), so failing to restore
+          # full-screen clipping makes the keyboard rectangles disappear.
+          p, text, bom = read_text('PianoFromAbove/RendererD3D11Legacy.inc')
+          marker = 'HRESULT D3D11Renderer::RenderImageBuffer() {'
+          start = text.find(marker)
+          if start < 0:
+              raise RuntimeError('D3D11 RenderImageBuffer not found')
+          end = text.find('\n}\n\nvoid D3D11Renderer::ImGuiBackendNewFrame()', start)
+          if end < 0:
+              raise RuntimeError('D3D11 RenderImageBuffer end not found')
+          body = text[start:end]
+          old = '''        m_pContext->PSSetShaderResources(0, 1, nullptr);\n    }\n\n    return S_OK;'''
+          new = '''        m_pContext->PSSetShaderResources(0, 1, nullptr);\n    }\n\n    // Chunk quads clip to notes_scissor. Keyboard and border rectangles are\n    // post-split draws rendered after this pass, so restore the full viewport.\n    m_pContext->RSSetScissorRects(1, &m_FullScissor);\n    return S_OK;'''
+          if body.count(old) != 1:
+              raise RuntimeError(f'D3D11 scissor restore point count={body.count(old)}')
+          body = body.replace(old, new, 1)
+          write_text(p, text[:start] + body + text[end:], bom)
+
+          p, text, bom = read_text('PianoFromAbove/RendererD3D12Legacy.inc')
+          marker = 'HRESULT D3D12Renderer::RenderImageBuffer() {'
+          start = text.find(marker)
+          if start < 0:
+              raise RuntimeError('D3D12 RenderImageBuffer not found')
+          end = text.find('\n}\n\nstd::wstring D3D12Renderer::GetAdapterName()', start)
+          if end < 0:
+              raise RuntimeError('D3D12 RenderImageBuffer end not found')
+          body = text[start:end]
+          old = '''    }\n\n    return S_OK;'''
+          new = '''    }\n\n    // Chunk quads leave the command list clipped to notes_scissor. Restore a\n    // full-screen scissor before EndScene draws the post-split piano keyboard.\n    const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };\n    m_pCommandList->RSSetScissorRects(1, &fullScissor);\n    return S_OK;'''
+          # Use the last return in RenderImageBuffer, not earlier failure exits.
+          pos = body.rfind(old)
+          if pos < 0:
+              raise RuntimeError('D3D12 final scissor restore point not found')
+          body = body[:pos] + new + body[pos + len(old):]
+          write_text(p, text[:start] + body + text[end:], bom)
+
+          # The old label described only the first sort pass; the bars now stay
+          # active through merge, timing, output-order and sister-index passes.
+          replace_once('PianoFromAbove/RendererBaseLegacy.inc',
+              '''                ImGui::TextDisabled("%u parallel sort lanes", sortWorkers);''',
+              '''                ImGui::TextDisabled("%u parallel event lanes", sortWorkers);''',
+              'parallel event lane label')
+
+          for temp in [
+              Path('.github/workflows/apply-parallel-sort-keyboard.yml'),
+              Path('.patch-trigger-sort-keyboard')
+          ]:
+              if temp.exists():
+                  temp.unlink()
+
+      - name: Validate patched source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          test -f PianoFromAbove/ParallelPostProcess.h
+          grep -F 'PostProcessParallel(vChannelEvents' PianoFromAbove/MIDI.cpp
+          grep -F 'parallel event lanes' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'RSSetScissorRects(1, &m_FullScissor)' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'Chunk quads leave the command list clipped' PianoFromAbove/RendererD3D12Legacy.inc
+          grep -F 'parallel merge path' PianoFromAbove/ParallelPostProcess.h
+          grep -F 'sister-index pass' PianoFromAbove/ParallelPostProcess.h
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit actual source changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Parallelize event finalization and restore image-buffer keyboard'
+          git push origin HEAD:${{ github.head_ref }}
