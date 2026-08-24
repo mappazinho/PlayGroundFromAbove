@@ -1,0 +1,62 @@
+name: Apply final renderer stability source
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-source:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply renderer/config source changes
+        shell: python
+        run: |
+          from pathlib import Path
+          workflow = Path('.github/workflows/apply-final-render-stability.yml')
+          lines = workflow.read_text(encoding='utf-8').splitlines()
+          step = next(i for i, line in enumerate(lines) if line.strip() == '- name: Apply renderer/config source changes')
+          run = next(i for i in range(step + 1, len(lines)) if lines[i].strip() == 'run: |')
+          end = next(i for i in range(run + 1, len(lines)) if lines[i].strip() == '- name: Validate source diff')
+          body = lines[run + 1:end]
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body) + '\n'
+          exec(compile(script, str(workflow) + ':renderer-source', 'exec'), {'__name__': '__main__'})
+
+      - name: Validate source diff
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'bHorizontalPianoRoll' PianoFromAbove/Config.h
+          grep -F 'Disable all blurs' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'imgbuf:reject-range' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'imgbuf:reject-range' PianoFromAbove/RendererD3D12Legacy.inc
+          grep -F 'kImageBufferNotesPerFrame = 65536' PianoFromAbove/RendererBase.cpp
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit renderer/config changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PianoFromAbove/Config.h PianoFromAbove/Config.cpp PianoFromAbove/RendererBase.cpp PianoFromAbove/RendererBaseLegacy.inc PianoFromAbove/RendererD3D11Legacy.inc PianoFromAbove/RendererD3D12Legacy.inc PianoFromAbove/GameStateLegacy.inc
+          git commit -m 'Add Horizontal RenderMode and harden image-buffer rendering'
+          git push origin HEAD:${{ github.head_ref }}
