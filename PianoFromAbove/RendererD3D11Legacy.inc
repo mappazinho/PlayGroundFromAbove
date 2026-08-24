@@ -1720,6 +1720,9 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
         m_pContext->PSSetShaderResources(0, 1, nullptr);
     }
 
+    // Chunk quads clip to notes_scissor. Keyboard and border rectangles are
+    // post-split draws rendered after this pass, so restore the full viewport.
+    m_pContext->RSSetScissorRects(1, &m_FullScissor);
     return S_OK;
 }
 
