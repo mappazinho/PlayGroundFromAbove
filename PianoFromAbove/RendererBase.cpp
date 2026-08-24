@@ -170,10 +170,31 @@ bool Renderer::PushNoteDataFiltered(NoteData data)
 
 // Keep the RenderMode UI in the legacy renderer body, but add the dense-prewarm
 // switch immediately below its existing Image Buffer Notes checkbox without
-// duplicating the large RenderImGuiFrame implementation.
+// duplicating the large RenderImGuiFrame implementation. The Viz tab is tracked
+// as well so controls that belong exclusively to RenderMode can be suppressed
+// there without forking the legacy UI implementation.
 namespace ImGui {
+static bool s_PGFAInVizPreferences = false;
+
+static bool PGFABeginTabItem(const char* label, bool* p_open = nullptr, ImGuiTabItemFlags flags = 0)
+{
+    const bool open = BeginTabItem(label, p_open, flags);
+    if (open && label && strcmp(label, "Viz") == 0)
+        s_PGFAInVizPreferences = true;
+    return open;
+}
+
+static void PGFAEndTabItem()
+{
+    EndTabItem();
+    s_PGFAInVizPreferences = false;
+}
+
 static bool PGFAImageBufferCheckbox(const char* label, bool* value)
 {
+    if (s_PGFAInVizPreferences && label && strcmp(label, "Bounce stats to the beat") == 0)
+        return false;
+
     const bool wasEnabled = value && *value;
     const bool changed = Checkbox(label, value);
     if (label && strcmp(label, "Image Buffer Notes") == 0) {
@@ -200,17 +221,30 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
     }
     return changed;
 }
+
+static bool PGFASliderInt(const char* label, int* v, int v_min, int v_max,
+                          const char* format = "%d", ImGuiSliderFlags flags = 0)
+{
+    if (s_PGFAInVizPreferences && label && strcmp(label, "Low Activity Threshold") == 0)
+        return false;
+    return SliderInt(label, v, v_min, v_max, format, flags);
+}
 }
 
 // Compile the existing shared renderer unchanged under a legacy name for the
-// one method this file replaces. The Checkbox alias only augments the specific
-// RenderMode Image Buffer Notes entry; all other checkboxes pass straight
-// through the helper unchanged.
+// one method this file replaces. These aliases add the Image Buffer wait switch
+// and hide RenderMode-only bounce controls from the Viz preferences tab.
+#define BeginTabItem PGFABeginTabItem
+#define EndTabItem PGFAEndTabItem
 #define Checkbox PGFAImageBufferCheckbox
+#define SliderInt PGFASliderInt
 #define ImageBufferRenderChunk ImageBufferRenderChunkLegacy
 #include "RendererBaseLegacy.inc"
 #undef ImageBufferRenderChunk
+#undef SliderInt
 #undef Checkbox
+#undef EndTabItem
+#undef BeginTabItem
 
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount)
 {
