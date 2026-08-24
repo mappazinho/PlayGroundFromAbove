@@ -3,6 +3,9 @@ name: Final fix source diagnostics
 on:
   push:
     branches: [ feature/final-stability-svms-horizontal ]
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -13,6 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 0
       - name: Dump relevant source contexts
         shell: bash
