@@ -487,10 +487,21 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
     } \
 }(this))
 #define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer); DrawFrameTimeGraphLate(m_pRenderer)
+// Compile the original game-state implementation under private legacy method
+// names. PlaybackAudioThread.inc supplies the public wrappers so visual logic can
+// remain frame-driven without letting the frame loop own live synth ingress.
+#define Logic LogicLegacy
+#define MsgProc MsgProcLegacy
+#define Discard DiscardLegacy
 #include "GameStateLegacy.inc"
+#undef Discard
+#undef MsgProc
+#undef Logic
 #undef EndText
 #undef ClearAndBeginScene
 #undef CollectChunk
+
+#include "PlaybackAudioThread.inc"
 
 // Frametime is sampled at the same late-render point as the system-stat panel,
 // so it measures real presented-frame cadence without perturbing MainScreen's
@@ -517,6 +528,7 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
 
     const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
     const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
+    const double audioSchedulerHz = statsScreen ? statsScreen->GetAudioSchedulerFPSForOverlay() : 0.0;
 
     if (frameMs > 0.05f && frameMs < 5000.0f) {
         s_history.push_back(frameMs);
@@ -532,7 +544,7 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     const float scale = (std::max)(viz.fUIScale, 0.5f);
     const float bh = (float)renderer->GetBufferHeight();
     const float graphH = 64.0f * scale;
-    const float panelW = 220.0f * scale;
+    const float panelW = 250.0f * scale;
     const float textH = (6.0f + 16.0f * 4.0f) * scale;
 
     const float contentTop = ImGui::GetFrameHeight() + 35.0f;
@@ -597,8 +609,11 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
 
     const float currentMs = n > 0 ? s_history.back() : 0.0f;
     const float currentFps = currentMs > 0.001f ? 1000.0f / currentMs : 0.0f;
-    char label[96];
-    snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
+    char label[128];
+    if (audioSchedulerHz > 0.0)
+        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f Hz", currentMs, currentFps, audioSchedulerHz);
+    else
+        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
     dl->AddText(ImVec2(panelLeft + 6.0f * scale, panelTop + 3.0f * scale),
         0xFF9A9A9A, label);
 
