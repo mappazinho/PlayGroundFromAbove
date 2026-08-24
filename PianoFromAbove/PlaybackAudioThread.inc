@@ -140,7 +140,6 @@ public:
         } else if (m_mode == Mode::WinMM) {
             m_winmm.Close();
         }
-        m_winmm.Close();
         m_mode = Mode::None;
         m_sendDirectData = nullptr;
         m_resetKDMAPI = nullptr;
@@ -193,14 +192,8 @@ public:
         if (!events || count == 0)
             return true;
         if (HasExactQpcBatch()) {
-            while (count) {
-                const uint32_t n = (uint32_t)(std::min)(count, (size_t)UINT32_MAX);
-                if (m_svms.send_short_batch(m_svmsSession, events, n) != PGFA_SVMS_OK)
-                    return false;
-                events += n;
-                count -= n;
-            }
-            return true;
+            const uint32_t n = (uint32_t)(std::min)(count, (size_t)UINT32_MAX);
+            return n == count && m_svms.send_short_batch(m_svmsSession, events, n) == PGFA_SVMS_OK;
         }
         for (size_t i = 0; i < count; ++i)
             if (!Send(events[i].packed_message, events[i].timestamp_qpc))
@@ -473,6 +466,8 @@ void MainScreen::PlaybackAudioThreadMain()
     double localSpeed = m_dPlaybackAudioSpeed.load(std::memory_order_acquire);
     bool localPaused = true;
     bool localLive = false;
+    bool lastPanicPaused = true;
+    bool lastPanicMute = false;
     unsigned long long controlSerial = ~0ULL;
     unsigned long long seekSerial = ~0ULL;
     size_t eventPos = 0;
@@ -480,8 +475,8 @@ void MainScreen::PlaybackAudioThreadMain()
 
     uint64_t hzStart = PGFAQpcNow();
     uint64_t hzTicks = 0;
-    std::vector<PGFASvmsShortEvent> nativeBatch;
-    nativeBatch.reserve(4096);
+    std::vector<PGFASvmsShortEvent> eventBatch;
+    eventBatch.reserve(4096);
 
     auto seekEventPos = [&](long long songUs) {
         auto it = std::lower_bound(m_vEvents.begin(), m_vEvents.end(), songUs,
@@ -506,6 +501,7 @@ void MainScreen::PlaybackAudioThreadMain()
         const unsigned long long newSeek = m_uPlaybackAudioSeekSerial.load(std::memory_order_acquire);
         const bool live = m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire);
         const bool paused = m_bPlaybackAudioPaused.load(std::memory_order_acquire);
+        const bool globalMute = m_bPlaybackAudioMute.load(std::memory_order_acquire);
         const double speed = (std::max)(0.0001, m_dPlaybackAudioSpeed.load(std::memory_order_acquire));
 
         if (newControl != controlSerial) {
@@ -545,6 +541,8 @@ void MainScreen::PlaybackAudioThreadMain()
                 providerWasLive = false;
             }
             localLive = false;
+            lastPanicPaused = paused;
+            lastPanicMute = globalMute;
             Sleep(1);
             continue;
         }
@@ -561,14 +559,19 @@ void MainScreen::PlaybackAudioThreadMain()
         }
         providerWasLive = output.IsOpen();
 
+        // Pause/mute transitions flush once. In particular, do not call reset
+        // on every 1 ms scheduler iteration while paused: some KDMAPI synths do
+        // expensive pool maintenance on ResetKDMAPIStream.
+        if ((localPaused && !lastPanicPaused) || (globalMute && !lastPanicMute))
+            output.Panic();
+        lastPanicPaused = localPaused;
+        lastPanicMute = globalMute;
+
         if (localPaused || !output.IsOpen()) {
-            if (localPaused)
-                output.Panic();
             Sleep(1);
             continue;
         }
 
-        const bool globalMute = m_bPlaybackAudioMute.load(std::memory_order_acquire);
         const double velocityScale = m_dPlaybackAudioVelocityScale.load(std::memory_order_acquire);
         const float corruptor = m_fPlaybackAudioCorruption.load(std::memory_order_acquire);
         const auto muteSnapshot = std::atomic_load_explicit(&m_pPlaybackAudioMuteMask, std::memory_order_acquire);
@@ -577,14 +580,15 @@ void MainScreen::PlaybackAudioThreadMain()
         // window. Generic WinMM/KDMAPI stays due-now because those APIs do not
         // provide a timestamped contract. Either way the iteration cadence is
         // independent of renderer FPS.
-        const long long lookAheadWallUs = output.HasExactQpcBatch() ? 8000LL : 0LL;
+        const bool exactBatch = output.HasExactQpcBatch();
+        const long long lookAheadWallUs = exactBatch ? 8000LL : 0LL;
         const long long deadlineSongUs = songUs + (long long)(lookAheadWallUs * localSpeed + 0.5);
         const size_t startPos = eventPos;
-        nativeBatch.clear();
+        eventBatch.clear();
         size_t processed = 0;
-        static constexpr size_t kMaxEventsPerSchedulerPass = 131072;
+        const size_t maxEventsThisPass = exactBatch ? 4096u : 131072u;
 
-        while (eventPos < m_vEvents.size() && processed < kMaxEventsPerSchedulerPass) {
+        while (eventPos < m_vEvents.size() && processed < maxEventsThisPass) {
             const MIDIChannelEvent event = m_vEvents[eventPos];
             const long long eventTime = m_MIDI.GetEventTime(event);
             if (eventTime > deadlineSongUs)
@@ -642,34 +646,29 @@ void MainScreen::PlaybackAudioThreadMain()
                 const uint32_t packed = (uint32_t)m_MIDI.GetEventCode(event) |
                     ((uint32_t)p1 << 8) | ((uint32_t)p2 << 16);
                 uint64_t eventQpc = 0;
-                if (output.HasExactQpcBatch()) {
+                if (exactBatch) {
                     const double eventWallUs = (double)(eventTime - anchorSongUs) / localSpeed;
                     const double qpcDelta = eventWallUs * (double)qpcFreq / 1000000.0;
                     const double qpcAbsolute = (double)anchorQpc + qpcDelta;
                     eventQpc = qpcAbsolute > 0.0 ? (uint64_t)(qpcAbsolute + 0.5) : nowQpc;
                 }
-                nativeBatch.push_back({ eventQpc, packed, 0u });
-                if (nativeBatch.size() == 4096) {
-                    if (!output.SendBatch(nativeBatch.data(), nativeBatch.size())) {
-                        eventPos = startPos;
-                        output.Close();
-                        break;
-                    }
-                    nativeBatch.clear();
-                }
+                eventBatch.push_back({ eventQpc, packed, 0u });
             }
             ++eventPos;
             ++processed;
         }
 
-        if (!nativeBatch.empty() && output.IsOpen()) {
-            if (!output.SendBatch(nativeBatch.data(), nativeBatch.size())) {
+        if (!eventBatch.empty() && output.IsOpen()) {
+            if (!output.SendBatch(eventBatch.data(), eventBatch.size())) {
+                // Exact SVMS submits this pass atomically as one batch. Generic
+                // output can only fail on an actual device error; rewinding is
+                // still preferable to silently dropping the remainder.
                 eventPos = startPos;
                 output.Close();
             }
         }
 
-        if (processed >= kMaxEventsPerSchedulerPass) {
+        if (processed >= maxEventsThisPass) {
             SwitchToThread();
             continue;
         }
