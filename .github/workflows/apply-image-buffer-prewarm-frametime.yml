@@ -1,0 +1,600 @@
+name: Apply image buffer prewarm and frametime fixes
+
+on:
+  push:
+    branches:
+      - fix/image-buffer-prewarm-frametime
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/image-buffer-prewarm-frametime
+          fetch-depth: 0
+
+      - name: Apply source changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def read_text(path):
+              raw = Path(path).read_bytes()
+              newline = '\r\n' if b'\r\n' in raw else '\n'
+              text = raw.decode('utf-8-sig').replace('\r\n', '\n')
+              return text, newline, raw.startswith(b'\xef\xbb\xbf')
+
+          def write_text(path, text, newline, bom=False):
+              if newline == '\r\n':
+                  text = text.replace('\n', '\r\n')
+              data = text.encode('utf-8')
+              if bom:
+                  data = b'\xef\xbb\xbf' + data
+              Path(path).write_bytes(data)
+
+          def replace_once(path, old, new, label):
+              text, newline, bom = read_text(path)
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected exactly one match, got {count}')
+              write_text(path, text.replace(old, new, 1), newline, bom)
+
+          def replace_between(path, start, end, replacement, label):
+              text, newline, bom = read_text(path)
+              i = text.find(start)
+              if i < 0:
+                  raise RuntimeError(f'{label}: start marker not found')
+              j = text.find(end, i)
+              if j < 0:
+                  raise RuntimeError(f'{label}: end marker not found')
+              write_text(path, text[:i] + replacement + text[j:], newline, bom)
+
+          # MainScreen: compact hot-chunk index and frametime history.
+          replace_once(
+              'PianoFromAbove/GameState.h',
+              '''    void RenderNotesImageBuffer();
+    NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
+    void GenNoteXTable();''',
+              '''    void RenderNotesImageBuffer();
+    NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
+    struct ImageBufferHotChunk {
+        long long chunk = 0;
+        long long score = 0;
+        vector<MIDIChannelEvent> events; // newest -> oldest, matching normal note rendering
+    };
+    void BuildImageBufferHotPreload(const vector<long long>& noteTimes, long long timeSpan);
+    bool CollectImageBufferHotChunk(vector<NoteData>& out, long long chunk, long long timeSpan) const;
+    void GenNoteXTable();''',
+              'hot preload declarations')
+
+          replace_once(
+              'PianoFromAbove/GameState.h',
+              '''    long long m_llFPSTime;
+    double m_dFPS;
+
+    long long m_llFrameMaxLate = 0;''',
+              '''    long long m_llFPSTime;
+    double m_dFPS;
+    deque<float> m_dFrameTimeHistory;
+
+    long long m_llFrameMaxLate = 0;''',
+              'frametime history member')
+
+          replace_once(
+              'PianoFromAbove/GameState.h',
+              '''    long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)
+    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached
+    std::wstring m_sCurBackground;''',
+              '''    long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)
+    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached
+    vector<ImageBufferHotChunk> m_vImageBufferHotChunks;
+    long long m_llImageBufferHotTimeSpan = 0;
+    std::wstring m_sCurBackground;''',
+              'hot preload members')
+
+          # Build the bounded search index while the MIDI loader is already doing
+          # the note-time/NPS pass. Huge songs therefore never need to discover
+          # their hottest chunks on the playback/render thread.
+          replace_once(
+              'PianoFromAbove/GameStateLegacy.inc',
+              '''                    long long curWindowNPS = (long long)(right - left + 1);
+                    if (curWindowNPS > m_llMaxNPS)
+                        m_llMaxNPS = curWindowNPS;
+                }
+            }
+        }
+    }
+    catch (const std::exception& e)''',
+              '''                    long long curWindowNPS = (long long)(right - left + 1);
+                    if (curWindowNPS > m_llMaxNPS)
+                        m_llMaxNPS = curWindowNPS;
+                }
+            }
+
+            const auto& preloadViz = Config::GetConfig().GetVizSettings();
+            if (preloadViz.bImageBufferNotes && !preloadViz.bTickBased &&
+                !ImageBufferFullPreparedSupported(m_vEvents, m_MIDI))
+            {
+                const long long preloadT = (long long)(3.0 *
+                    Config::GetConfig().GetPlaybackSettings().GetNSpeed() * 1000000.0);
+                BuildImageBufferHotPreload(noteTimes, preloadT);
+            }
+        }
+    }
+    catch (const std::exception& e)''',
+              'loader hot preload call')
+
+          marker = '''NoteData MainScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
+{'''
+          implementation = r'''void MainScreen::BuildImageBufferHotPreload(const vector<long long>& noteTimes, long long timeSpan)
+{
+    m_vImageBufferHotChunks.clear();
+    m_llImageBufferHotTimeSpan = timeSpan;
+    if (timeSpan <= 0 || noteTimes.empty())
+        return;
+
+    unordered_map<long long, long long> chunkScores;
+    chunkScores.reserve((size_t)(m_MIDI.GetInfo().llTotalMicroSecs / (max)(timeSpan, 1LL)) + 4);
+    for (long long noteTime : noteTimes) {
+        const long long chunk = (long long)floor((double)noteTime / (double)timeSpan);
+        ++chunkScores[chunk];
+    }
+
+    // Prime a little below the prepared path's 100k-start threshold so notes
+    // sitting in the corruption margin around a chunk boundary are not missed.
+    const long long hotThreshold = (long long)ImageBufferPreparedDenseThreshold / 2;
+    vector<pair<long long, long long>> candidates;
+    candidates.reserve(chunkScores.size());
+    for (const auto& item : chunkScores) {
+        if (item.second >= hotThreshold)
+            candidates.push_back(item);
+    }
+    sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+
+    // Keep this bounded. Event handles are 32-bit, so 12M handles are about
+    // 48 MiB even for a gigantic MIDI; the 48-chunk cap also leaves spare slots
+    // in the 64-texture cache for the currently visible sparse neighborhood.
+    const size_t maxHotChunks = (min)((size_t)48, (size_t)Renderer::ChunkPoolSize - 8);
+    const size_t maxPreparedEvents = 12000000;
+    const size_t maxCacheableChunkEvents = 6000000;
+    const long long maxShift = 1 + (long long)ceil((double)timeSpan * 0.10);
+    const long long backScan = m_llMaxNoteLen + maxShift;
+    size_t totalPreparedEvents = 0;
+
+    for (const auto& candidate : candidates) {
+        if (m_vImageBufferHotChunks.size() >= maxHotChunks)
+            break;
+
+        const long long k = candidate.first;
+        const long long chunkStart = k * timeSpan;
+        const long long chunkEnd = chunkStart + timeSpan;
+        auto itLo = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkStart - backScan,
+            [&](MIDIChannelEvent lhs, long long rhs) {
+                return m_MIDI.GetEventTime(lhs) < rhs;
+            });
+        auto itHi = lower_bound(m_vEvents.begin(), m_vEvents.end(), chunkEnd + maxShift,
+            [&](MIDIChannelEvent lhs, long long rhs) {
+                return m_MIDI.GetEventTime(lhs) < rhs;
+            });
+
+        ImageBufferHotChunk hot;
+        hot.chunk = k;
+        hot.score = candidate.second;
+        hot.events.reserve((min)((size_t)distance(itLo, itHi), (size_t)1000000));
+        for (auto it = itHi; it != itLo; ) {
+            --it;
+            const MIDIChannelEvent event = *it;
+            if (m_MIDI.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                m_MIDI.GetEventParam2(event) <= 0 || !m_MIDI.EventHasSister(event))
+                continue;
+            hot.events.push_back(event);
+            if (hot.events.size() > maxCacheableChunkEvents)
+                break;
+        }
+
+        if (hot.events.empty() || hot.events.size() > maxCacheableChunkEvents)
+            continue;
+        if (!m_vImageBufferHotChunks.empty() &&
+            totalPreparedEvents + hot.events.size() > maxPreparedEvents)
+            continue;
+
+        totalPreparedEvents += hot.events.size();
+        m_vImageBufferHotChunks.push_back(std::move(hot));
+    }
+
+    char log[192];
+    sprintf_s(log, "imghot:index chunks=%zu events=%zu threshold=%lld span=%.3fs",
+        m_vImageBufferHotChunks.size(), totalPreparedEvents, hotThreshold,
+        (double)timeSpan / 1e6);
+    HeartbeatLog(log);
+}
+
+bool MainScreen::CollectImageBufferHotChunk(
+    vector<NoteData>& out, long long chunk, long long timeSpan) const
+{
+    if (timeSpan <= 0 || m_llImageBufferHotTimeSpan != timeSpan)
+        return false;
+
+    for (const auto& hot : m_vImageBufferHotChunks) {
+        if (hot.chunk != chunk)
+            continue;
+
+        out.clear();
+        const long long chunkStart = chunk * timeSpan;
+        out.reserve(hot.events.size());
+        for (MIDIChannelEvent event : hot.events) {
+            NoteData data = BuildChunkNoteData(event, chunkStart);
+            if (data.pos < (float)timeSpan &&
+                data.pos + (max)(data.length, 0.0f) >= 0.0f)
+                out.push_back(data);
+        }
+        return true;
+    }
+    return false;
+}
+
+''' + marker
+          replace_once(
+              'PianoFromAbove/GameStateLegacy.inc',
+              marker,
+              implementation,
+              'hot preload implementation')
+
+          # Track every actual frame interval for the sys-stats graph.
+          replace_once(
+              'PianoFromAbove/GameStateLegacy.inc',
+              '''    long long llRealElapsed = m_RealTimer.GetMicroSecs();
+    m_Timer.Start();
+    m_RealTimer.Start();
+
+    {''',
+              '''    long long llRealElapsed = m_RealTimer.GetMicroSecs();
+    m_Timer.Start();
+    m_RealTimer.Start();
+
+    if (llRealElapsed >= 0 && llRealElapsed < 5000000) {
+        m_dFrameTimeHistory.push_back((float)llRealElapsed / 1000.0f);
+        if (m_dFrameTimeHistory.size() > 600)
+            m_dFrameTimeHistory.pop_front();
+    }
+
+    {''',
+              'frametime sampling')
+
+          replace_once(
+              'PianoFromAbove/GameStateLegacy.inc',
+              '''    m_dNPSNotes.clear();
+    m_dNPSHistory.clear();
+    m_vImageData.clear();''',
+              '''    m_dNPSNotes.clear();
+    m_dNPSHistory.clear();
+    m_dFrameTimeHistory.clear();
+    vector<ImageBufferHotChunk>().swap(m_vImageBufferHotChunks);
+    m_llImageBufferHotTimeSpan = 0;
+    m_vImageData.clear();''',
+              'discard hot/frame history')
+
+          # Expand sys stats to contain a second graph for real frame time with
+          # an instantaneous FPS readout and 60/30-FPS reference lines.
+          replace_once(
+              'PianoFromAbove/GameStateLegacy.inc',
+              '''    const float textH = (6 + 16 * 4) * scale;
+    const float overlayH = textH + graphH + 10.0f * scale;
+    const float panelTop = toolbarBottom;''',
+              '''    const float textH = (6 + 16 * 4) * scale;
+    const float graphGap = 20.0f * scale;
+    const float overlayH = textH + graphH * 2.0f + graphGap + 10.0f * scale;
+    const float panelTop = toolbarBottom;''',
+              'sysstats panel height')
+
+          graph_start = '''    // NPS history graph: rolling 1s note-count samples, newest on the right.
+'''
+          graph_end = '''    if (dl)
+    {
+        const int vtx_end = dl->VtxBuffer.Size;'''
+          graph_replacement = r'''    // NPS history graph: rolling 1s note-count samples, newest on the right.
+    const float graphTop = panelTop + (6 + 16 * 4) * scale + 4.0f * scale;
+    const ImVec2 g0(panelLeft + 6.0f * scale, graphTop);
+    const ImVec2 g1(panelRight - 6.0f * scale, graphTop + graphH);
+    if (!dl)
+        dl = r->GetDrawList();
+    dl->AddRectFilled(g0, g1, 0x30000000);
+    for (int gi = 0; gi <= 4; gi++)
+    {
+        float y = g0.y + (g1.y - g0.y) * gi / 4.0f;
+        dl->AddLine(ImVec2(g0.x, y), ImVec2(g1.x, y), 0x20FFFFFF);
+    }
+    dl->AddText(ImVec2(g0.x, graphTop - 14.0f * scale), 0xFF9A9A9A, "NPS");
+    const size_t n = m_dNPSHistory.size();
+    if (n > 0)
+    {
+        long long maxNps = 1;
+        for (size_t i = 0; i < n; i++)
+            maxNps = max(maxNps, m_dNPSHistory[i]);
+        const float target = max(100.0f, (float)(ceil((double)maxNps * 1.15 / 50.0) * 50.0));
+        static float s_fRange = 100.0f;
+        if (target > s_fRange)
+            s_fRange += (target - s_fRange) * 0.25f;
+        else
+            s_fRange += (target - s_fRange) * 0.5f;
+        if (s_fRange < 100.0f)
+            s_fRange = 100.0f;
+        const float yTop = s_fRange;
+        const float step = (g1.x - g0.x) / 600.0f;
+        ImVec2 pts[600];
+        for (size_t k = 0; k < n; k++)
+        {
+            float x0 = g1.x - (float)(n - k) * step;
+            float hgt = (float)m_dNPSHistory[k] / yTop * (g1.y - g0.y);
+            if (hgt > g1.y - g0.y)
+                hgt = g1.y - g0.y;
+            pts[k] = ImVec2(x0, g1.y - hgt);
+        }
+        for (size_t k = 0; k + 1 < n; k++)
+            dl->AddRectFilled(ImVec2(pts[k].x, pts[k].y), ImVec2(pts[k + 1].x, g1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddRectFilled(ImVec2(pts[n - 1].x, pts[n - 1].y), ImVec2(g1.x, g1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddPolyline(pts, (int)n, IM_COL32(255, 255, 255, 220), 0, 2.0f * scale);
+        char peakB[64];
+        snprintf(peakB, sizeof(peakB) - 1, "max %lld/s", (long long)yTop);
+        dl->AddText(ImVec2(g1.x - ImGui::CalcTextSize(peakB).x, graphTop - 14.0f * scale), 0xFF9A9A9A, peakB);
+    }
+
+    // Actual frame interval history. This deliberately uses the real timer, not
+    // the smoothed FPS counter, so a single 40/100/200 ms hitch is visible.
+    const float frameGraphTop = graphTop + graphH + graphGap;
+    const ImVec2 f0(panelLeft + 6.0f * scale, frameGraphTop);
+    const ImVec2 f1(panelRight - 6.0f * scale, frameGraphTop + graphH);
+    dl->AddRectFilled(f0, f1, 0x30000000);
+    for (int gi = 0; gi <= 4; gi++)
+    {
+        float y = f0.y + (f1.y - f0.y) * gi / 4.0f;
+        dl->AddLine(ImVec2(f0.x, y), ImVec2(f1.x, y), 0x20FFFFFF);
+    }
+
+    const size_t fn = m_dFrameTimeHistory.size();
+    float frameRange = 33.333f;
+    if (fn > 0)
+    {
+        float maxMs = 0.0f;
+        for (float ms : m_dFrameTimeHistory)
+            maxMs = max(maxMs, ms);
+        const float targetMs = max(33.333f, ceil(maxMs / 5.0f) * 5.0f);
+        static float s_fFrameRange = 33.333f;
+        if (targetMs > s_fFrameRange)
+            s_fFrameRange += (targetMs - s_fFrameRange) * 0.35f;
+        else
+            s_fFrameRange += (targetMs - s_fFrameRange) * 0.10f;
+        s_fFrameRange = max(s_fFrameRange, 33.333f);
+        frameRange = s_fFrameRange;
+
+        auto drawFpsLine = [&](float ms, ImU32 color) {
+            if (ms > frameRange)
+                return;
+            const float y = f1.y - ms / frameRange * (f1.y - f0.y);
+            dl->AddLine(ImVec2(f0.x, y), ImVec2(f1.x, y), color);
+        };
+        drawFpsLine(16.6667f, IM_COL32(255, 255, 255, 55)); // 60 FPS
+        drawFpsLine(33.3333f, IM_COL32(255, 255, 255, 35)); // 30 FPS
+
+        const float step = (f1.x - f0.x) / 600.0f;
+        ImVec2 pts[600];
+        for (size_t k = 0; k < fn; ++k)
+        {
+            const float x = f1.x - (float)(fn - k) * step;
+            const float ms = min(m_dFrameTimeHistory[k], frameRange);
+            pts[k] = ImVec2(x, f1.y - ms / frameRange * (f1.y - f0.y));
+        }
+        for (size_t k = 0; k + 1 < fn; ++k)
+            dl->AddRectFilled(ImVec2(pts[k].x, pts[k].y), ImVec2(pts[k + 1].x, f1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddRectFilled(ImVec2(pts[fn - 1].x, pts[fn - 1].y), ImVec2(f1.x, f1.y), IM_COL32(255, 255, 255, 40));
+        dl->AddPolyline(pts, (int)fn, IM_COL32(255, 255, 255, 220), 0, 2.0f * scale);
+    }
+
+    char frameLabel[96];
+    const float currentMs = fn > 0 ? m_dFrameTimeHistory.back() : 0.0f;
+    const float currentFps = currentMs > 0.001f ? 1000.0f / currentMs : 0.0f;
+    snprintf(frameLabel, sizeof(frameLabel) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
+    dl->AddText(ImVec2(f0.x, frameGraphTop - 14.0f * scale), 0xFF9A9A9A, frameLabel);
+    char frameMaxB[64];
+    snprintf(frameMaxB, sizeof(frameMaxB) - 1, "max %.0f ms", frameRange);
+    dl->AddText(ImVec2(f1.x - ImGui::CalcTextSize(frameMaxB).x, frameGraphTop - 14.0f * scale), 0xFF9A9A9A, frameMaxB);
+
+'''
+          replace_between(
+              'PianoFromAbove/GameStateLegacy.inc',
+              graph_start,
+              graph_end,
+              graph_replacement,
+              'sysstats graph block')
+
+          # Pause is not Stop. Keep the already-prepared CPU/GPU cache alive on
+          # pause, and only arm prewarm on a real paused->playing transition.
+          replace_once(
+              'PianoFromAbove/Config.h',
+              '''    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { ImageBufferPrewarmPlaybackRequested( !bPaused ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }''',
+              '''    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { const bool bWasPaused = m_bPaused; if ( bWasPaused && !bPaused ) ImageBufferPrewarmPlaybackRequested( TRUE ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }''',
+              'pause/resume prewarm lifecycle')
+
+          # Huge-MIDI collector: use the loader-built event handle list whenever
+          # the chunk is one of the hot ones, avoiding the global event search.
+          replace_once(
+              'PianoFromAbove/GameState.cpp',
+              '''        } else { \\
+            const long long imageBufferMaxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen; \\
+            ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, \\
+                imageBufferMaxLen, bTickMode, \\
+                [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \\
+                    return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \\
+                }); \\
+        } \\
+    }; \\''',
+              '''        } else { \\
+            const bool imageBufferHotCollected = !bTickMode && \\
+                CollectImageBufferHotChunk(chunkNotes, imageBufferChunk, T); \\
+            if (!imageBufferHotCollected) { \\
+                const long long imageBufferMaxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen; \\
+                ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, \\
+                    imageBufferMaxLen, bTickMode, \\
+                    [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \\
+                        return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \\
+                    }); \\
+            } \\
+        } \\
+    }; \\''',
+              'huge hot collector')
+
+          # If the CPU full-source path is intentionally unavailable, still show
+          # the GPU hot-cache stage instead of hiding the progress UI.
+          replace_once(
+              'PianoFromAbove/GameState.cpp',
+              '''    } else if (cpu.unsupported) {
+        return;
+    }
+
+    if (!initializing && (total == 0 || done >= total))''',
+              '''    } else if (cpu.unsupported && !gpuStage) {
+        return;
+    }
+
+    if (!initializing && (total == 0 || done >= total))''',
+              'huge prewarm progress')
+
+          # Replace the old >50M "unsupported -> play immediately" path with a
+          # bounded hot-chunk GPU prewarm. If the note-speed span changed since
+          # load, remap the hot absolute time ranges and do the exact collection
+          # while playback is held rather than while playback is running.
+          old_huge = '''                        if (!ImageBufferFullPreparedSupported( \\
+                            imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI)) { \\
+                            ImageBufferLogFullPrewarmSkip(imageBufferPrewarmSelf, \\
+                                imageBufferPrewarmSelf->m_vEvents.size(), \\
+                                imageBufferPrewarmSelf->m_MIDI.GetInfo().iNoteCount); \\
+                            ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \\
+                            UpdateImageBufferPrewarmGpuProgress( \\
+                                imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, 1, 0, false); \\
+                        } else { \\'''
+          new_huge = '''                        if (!ImageBufferFullPreparedSupported( \\
+                            imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI)) { \\
+                            ImageBufferLogFullPrewarmSkip(imageBufferPrewarmSelf, \\
+                                imageBufferPrewarmSelf->m_vEvents.size(), \\
+                                imageBufferPrewarmSelf->m_MIDI.GetInfo().iNoteCount); \\
+                            ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \\
+                            std::vector<long long> imageBufferPrewarmHotChunks; \\
+                            if (!imageBufferPrewarmTickMode && imageBufferPrewarmSelf->m_llImageBufferHotTimeSpan > 0) { \\
+                                for (const auto& imageBufferPrewarmHot : imageBufferPrewarmSelf->m_vImageBufferHotChunks) { \\
+                                    const long long imageBufferHotOldStart = imageBufferPrewarmHot.chunk * imageBufferPrewarmSelf->m_llImageBufferHotTimeSpan; \\
+                                    const long long imageBufferHotOldEnd = imageBufferHotOldStart + imageBufferPrewarmSelf->m_llImageBufferHotTimeSpan - 1; \\
+                                    long long imageBufferHotFirst = ImageBufferPreparedFloorDiv(imageBufferHotOldStart, imageBufferPrewarmT); \\
+                                    long long imageBufferHotLast = ImageBufferPreparedFloorDiv(imageBufferHotOldEnd, imageBufferPrewarmT); \\
+                                    if (imageBufferHotLast - imageBufferHotFirst > 3) \\
+                                        imageBufferHotLast = imageBufferHotFirst + 3; \\
+                                    for (long long imageBufferHotChunk = imageBufferHotFirst; imageBufferHotChunk <= imageBufferHotLast; ++imageBufferHotChunk) { \\
+                                        if (std::find(imageBufferPrewarmHotChunks.begin(), imageBufferPrewarmHotChunks.end(), imageBufferHotChunk) == imageBufferPrewarmHotChunks.end()) \\
+                                            imageBufferPrewarmHotChunks.push_back(imageBufferHotChunk); \\
+                                        if (imageBufferPrewarmHotChunks.size() >= (size_t)Renderer::ChunkPoolSize - 8) \\
+                                            break; \\
+                                    } \\
+                                    if (imageBufferPrewarmHotChunks.size() >= (size_t)Renderer::ChunkPoolSize - 8) \\
+                                        break; \\
+                                } \\
+                            } \\
+                            { \\
+                                std::lock_guard<std::mutex> imageBufferPrewarmLock(s_ImageBufferPrewarmGpuMutex); \\
+                                const bool imageBufferKeepPlay = s_ImageBufferPrewarmGpu.playRequested; \\
+                                s_ImageBufferPrewarmGpu.owner = imageBufferPrewarmSelf; \\
+                                s_ImageBufferPrewarmGpu.renderer = imageBufferPrewarmSelf->m_pRenderer; \\
+                                s_ImageBufferPrewarmGpu.initialized = true; \\
+                                s_ImageBufferPrewarmGpu.cacheRequired = !imageBufferPrewarmHotChunks.empty(); \\
+                                s_ImageBufferPrewarmGpu.cached = CountImageBufferPrewarmCached(imageBufferPrewarmSelf->m_pRenderer, imageBufferPrewarmHotChunks); \\
+                                s_ImageBufferPrewarmGpu.total = imageBufferPrewarmHotChunks.size(); \\
+                                s_ImageBufferPrewarmGpu.chunks = imageBufferPrewarmHotChunks; \\
+                                s_ImageBufferPrewarmGpu.playRequested = imageBufferKeepPlay; \\
+                            } \\
+                            long long imageBufferPrewarmBakeChunk = Renderer::ImageBufferInvalidChunk; \\
+                            for (long long imageBufferPrewarmChunk : imageBufferPrewarmHotChunks) { \\
+                                if (!imageBufferPrewarmSelf->m_pRenderer->ImageBufferChunkCached(imageBufferPrewarmChunk)) { \\
+                                    imageBufferPrewarmBakeChunk = imageBufferPrewarmChunk; \\
+                                    break; \\
+                                } \\
+                            } \\
+                            if (imageBufferPrewarmBakeChunk != Renderer::ImageBufferInvalidChunk) { \\
+                                auto& imageBufferPrewarmMp = ImageBufferMPGet(imageBufferPrewarmSelf->m_pRenderer); \\
+                                if (imageBufferPrewarmMp.chunk == imageBufferPrewarmBakeChunk && !imageBufferPrewarmMp.notes.empty()) { \\
+                                    imageBufferPrewarmSelf->m_pRenderer->ImageBufferRenderChunk(imageBufferPrewarmBakeChunk, nullptr, 0); \\
+                                } else { \\
+                                    std::vector<NoteData> imageBufferPrewarmNotes; \\
+                                    bool imageBufferPrewarmCollected = imageBufferPrewarmSelf->CollectImageBufferHotChunk( \\
+                                        imageBufferPrewarmNotes, imageBufferPrewarmBakeChunk, imageBufferPrewarmT); \\
+                                    if (!imageBufferPrewarmCollected) { \\
+                                        const long long imageBufferPrewarmMaxLen = imageBufferPrewarmSelf->m_llMaxNoteLen; \\
+                                        ImageBufferCollectHugeLocal(imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI, \\
+                                            imageBufferPrewarmNotes, imageBufferPrewarmBakeChunk, imageBufferPrewarmT, imageBufferPrewarmE, \\
+                                            imageBufferPrewarmMaxLen, false, \\
+                                            [&](MIDIChannelEvent imageBufferPrewarmNote, long long imageBufferPrewarmChunkStart) { \\
+                                                return imageBufferPrewarmSelf->BuildChunkNoteData(imageBufferPrewarmNote, imageBufferPrewarmChunkStart); \\
+                                            }); \\
+                                    } \\
+                                    imageBufferPrewarmSelf->m_pRenderer->ImageBufferRenderChunk( \\
+                                        imageBufferPrewarmBakeChunk, imageBufferPrewarmNotes.data(), (unsigned)imageBufferPrewarmNotes.size()); \\
+                                } \\
+                            } \\
+                        } else { \\'''
+          replace_once(
+              'PianoFromAbove/GameState.cpp',
+              old_huge,
+              new_huge,
+              'huge pre-play GPU cache')
+
+          # Viz preferences should not duplicate controls owned by RenderMode.
+          replace_once(
+              'PianoFromAbove/RendererBaseLegacy.inc',
+              '''                    ImGui::Checkbox("Nerd Stats", &viz.bNerdStats);
+                    ImGui::Checkbox("Sys Stats", &viz.bSysStats);
+                    ImGui::Checkbox("Bounce stats to the beat", &viz.bBounceStats);
+                    if (viz.bBounceStats) {
+                        ImGui::Indent();
+                        ImGui::SetNextItemWidth(200);
+                        ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
+                        ImGui::Unindent();
+                    }
+                    ImGui::Checkbox("Dump Frames", &viz.bDumpFrames);''',
+              '''                    ImGui::Checkbox("Nerd Stats", &viz.bNerdStats);
+                    ImGui::Checkbox("Sys Stats", &viz.bSysStats);
+                    ImGui::Checkbox("Dump Frames", &viz.bDumpFrames);''',
+              'remove duplicate bounce viz controls')
+
+          # Delete this one-shot patcher so the PR contains only product code.
+          Path('.github/workflows/apply-image-buffer-prewarm-frametime.yml').unlink()
+
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F "imghot:index" PianoFromAbove/GameStateLegacy.inc
+          grep -F "CollectImageBufferHotChunk" PianoFromAbove/GameState.cpp
+          grep -F "Frame %.1f ms / %.0f FPS" PianoFromAbove/GameStateLegacy.inc
+          grep -F "bWasPaused && !bPaused" PianoFromAbove/Config.h
+          test "$(grep -F 'Bounce stats to the beat' PianoFromAbove/RendererBaseLegacy.inc | wc -l)" -eq 1
+
+      - name: Build Release x64
+        shell: pwsh
+        run: msbuild PianoFromAbove.sln /m /p:Configuration=Release /p:Platform=x64
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Prewarm huge image-buffer chunks and add frametime stats"
+          git push origin HEAD:fix/image-buffer-prewarm-frametime
