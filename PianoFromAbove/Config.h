@@ -113,7 +113,7 @@ public:
     // Set accessors. A bit more advanced because they optionally update the GUI
     void SetPlayMode( GameState::State ePlayMode, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetPlayMode( ePlayMode ); m_ePlayMode = ePlayMode; }
     void SetPlayable( bool bPlayable, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetPlayable( bPlayable ); m_bPlayable = bPlayable; }
-    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { const bool bWasPaused = m_bPaused; if ( bWasPaused && !bPaused ) ImageBufferPrewarmPlaybackRequested( TRUE ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }
+    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { if ( !bPaused ) ImageBufferPrewarmPlaybackRequested( TRUE ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }
     void SetStopped( bool bUpdateGUI = false ) { ImageBufferPrewarmPlaybackRequested( FALSE ); if ( bUpdateGUI ) ::SetPlayPauseStop( false, false, true ); m_bPaused = true; }
     void SetSpeed( double dSpeed, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetSpeed( dSpeed ); m_dSpeed = dSpeed; }
     void SetNSpeed( double dNSpeed, bool bUpdateGUI = false ) { dNSpeed = max(min(dNSpeed, 10.0), 0.005); if ( bUpdateGUI ) ::SetNSpeed( dNSpeed ); m_dNSpeed = dNSpeed; }
