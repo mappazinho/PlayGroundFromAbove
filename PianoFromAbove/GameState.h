@@ -18,6 +18,9 @@
 #include <tuple>
 #include <unordered_map>
 #include <cstdint>
+#include <thread>
+#include <atomic>
+#include <memory>
 using namespace std;
 
 //#include "ProtoBuf\MetaData.pb.h"
@@ -37,8 +40,8 @@ public:
     static GameError ChangeState( GameState *pNextState, GameState **pDestObj );
 
     // Constructors
-    GameState( HWND hWnd, Renderer *pRenderer ) : m_hWnd( hWnd ), m_pRenderer( pRenderer ), m_pNextState( NULL ) {};
-    virtual ~GameState( void ) {};
+    GameState( HWND hWnd, Renderer *pRenderer ) : m_hWnd( hWnd ), m_pRenderer( pRenderer ), m_pNextState( NULL ) {}
+    virtual ~GameState( void ) {}
 
     virtual const char* DebugName() const = 0;
     virtual bool IsFreePlay() const { return false; }
@@ -94,8 +97,10 @@ public:
     const char* DebugName() const override { return "SplashScreen"; }
 
     GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError MsgProcLegacy( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
     GameError Init() override;
     GameError Logic() override;
+    GameError LogicLegacy();
     GameError Render() override;
 
 private:
@@ -147,8 +152,10 @@ public:
     const char* DebugName() const override { return "IntroScreen"; }
 
     GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError MsgProcLegacy( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
     GameError Init() override;
     GameError Logic() override;
+    GameError LogicLegacy();
     GameError Render() override;
 };
 
@@ -157,25 +164,105 @@ typedef struct {
     unsigned sister_idx;
 } thread_work_t;
 
+// MainScreen's legacy Logic() still performs visual event/state bookkeeping.
+// Once the independent playback thread takes ownership, these hidden methods
+// make every legacy output operation a no-op while preserving the exact class
+// interface used by the old code. Splash/FreePlay keep using MIDIOutDevice
+// normally, so live keyboard input remains immediate.
+class MainPlaybackMIDIOutDevice : public MIDIOutDevice
+{
+public:
+    void SetThreadOwned(bool owned, bool kdmapi)
+    {
+        if (owned && !m_bThreadOwned)
+            MIDIOutDevice::Close();
+        m_bThreadOwned = owned;
+        m_bThreadKDMAPI = kdmapi;
+    }
+
+    bool Open(int iDev)
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::Open(iDev);
+    }
+    bool OpenKDMAPI()
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::OpenKDMAPI();
+    }
+    void Close()
+    {
+        if (!m_bThreadOwned)
+            MIDIOutDevice::Close();
+    }
+    void Reset()
+    {
+        if (!m_bThreadOwned)
+            MIDIOutDevice::Reset();
+    }
+    bool IsOpen() const
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::IsOpen();
+    }
+    bool IsKDMAPI() const
+    {
+        return m_bThreadOwned ? m_bThreadKDMAPI : MIDIOutDevice::IsKDMAPI();
+    }
+    void SetVolume(double dVolume)
+    {
+        if (!m_bThreadOwned)
+            MIDIOutDevice::SetVolume(dVolume);
+    }
+    void AllNotesOff()
+    {
+        if (!m_bThreadOwned)
+            MIDIOutDevice::AllNotesOff();
+    }
+    void AllNotesOff(const vector<int>& channels)
+    {
+        if (!m_bThreadOwned)
+            MIDIOutDevice::AllNotesOff(channels);
+    }
+    bool PlayEventAcrossChannels(unsigned char status, unsigned char p1, unsigned char p2)
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::PlayEventAcrossChannels(status, p1, p2);
+    }
+    bool PlayEventAcrossChannels(unsigned char status, unsigned char p1, unsigned char p2, const vector<int>& channels)
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::PlayEventAcrossChannels(status, p1, p2, channels);
+    }
+    bool PlayEvent(unsigned char status, unsigned char p1, unsigned char p2 = 0)
+    {
+        return m_bThreadOwned ? true : MIDIOutDevice::PlayEvent(status, p1, p2);
+    }
+
+private:
+    bool m_bThreadOwned = false;
+    bool m_bThreadKDMAPI = false;
+};
+
 class MainScreen : public GameState
 {
 public:
     static const float KBPercent;
 
     MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer *pRenderer );
+    ~MainScreen() override;
 
     const char* DebugName() const override { return "MainScreen"; }
     virtual bool IsFreePlay() const { return false; }
 
     GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
+    GameError MsgProcLegacy( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
     GameError Init() override;
     GameError Logic( void ) override;
+    GameError LogicLegacy( void );
     GameError Render( void ) override;
     void Discard() override;
+    void DiscardLegacy();
 
     bool IsValid() const { return m_MIDI.IsValid(); }
     const MIDI& GetMIDI() const { return m_MIDI; }
     float GetStatsBounceScaleForOverlay() const { return GetStatsBounceScale(); }
+    double GetAudioSchedulerFPSForOverlay() const { return m_dPlaybackAudioSchedulerHz.load(std::memory_order_relaxed); }
 
     void ToggleMuted( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bMuted =
                                                   !m_vTrackSettings[iTrack].aChannels[iChannel].bMuted; }
@@ -202,6 +289,13 @@ protected:
 
     void UpdateState(int key, const thread_work_t& work);
     void JumpTo(long long llStartTime, bool bUpdateGUI = true);
+
+    void StartPlaybackAudioThread();
+    void StopPlaybackAudioThread();
+    void SyncPlaybackAudioThread(bool forceSeek = false);
+    void PlaybackAudioThreadMain();
+    void PlaybackAudioSeek(long long songUs);
+    long long PlaybackAudioClockNow() const;
 
     void PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange);
     void ApplyMarker(unsigned char* data, size_t size);
@@ -281,6 +375,34 @@ void RenderText();
     bool m_bTickMode = false;
     bool m_bAudioStarted = false; // Pre-rendered audio: started once per screen
 
+    // Independent live-MIDI clock/scheduler. The renderer only snapshots control
+    // changes; this thread owns the output provider and advances from QPC even
+    // when Present/Render is blocked for multiple visual frames.
+    std::thread m_PlaybackAudioThread;
+    std::atomic<bool> m_bPlaybackAudioExit{ false };
+    std::atomic<bool> m_bPlaybackAudioRunning{ false };
+    std::atomic<bool> m_bPlaybackAudioLiveEnabled{ false };
+    std::atomic<bool> m_bPlaybackAudioPaused{ true };
+    std::atomic<bool> m_bPlaybackAudioMute{ false };
+    std::atomic<bool> m_bPlaybackAudioWantKDMAPI{ false };
+    std::atomic<int> m_iPlaybackAudioDevice{ -1 };
+    std::atomic<double> m_dPlaybackAudioSpeed{ 1.0 };
+    std::atomic<double> m_dPlaybackAudioVelocityScale{ 1.0 };
+    std::atomic<float> m_fPlaybackAudioCorruption{ 0.0f };
+    std::atomic<long long> m_llPlaybackAudioControlSongUs{ 0 };
+    std::atomic<long long> m_llPlaybackAudioClockUs{ 0 };
+    std::atomic<unsigned long long> m_uPlaybackAudioControlSerial{ 0 };
+    std::atomic<unsigned long long> m_uPlaybackAudioSeekSerial{ 0 };
+    std::atomic<double> m_dPlaybackAudioSchedulerHz{ 0.0 };
+    std::shared_ptr<const std::vector<uint16_t>> m_pPlaybackAudioMuteMask;
+    std::vector<uint16_t> m_vPlaybackAudioLastMuteMask;
+    bool m_bPlaybackAudioControlInitialized = false;
+    bool m_bPlaybackAudioLastPaused = true;
+    bool m_bPlaybackAudioLastLive = false;
+    bool m_bPlaybackAudioLastKDMAPI = false;
+    int m_iPlaybackAudioLastDevice = -2;
+    double m_dPlaybackAudioLastSpeed = 1.0;
+
     // FPS variables
     bool m_bShowFPS;
     int m_iFPSCount;
@@ -292,7 +414,7 @@ void RenderText();
     long long m_llMaxLateMicros = 0;
     unsigned long long m_ullLateEvents = 0;
 
-    MIDIOutDevice m_OutDevice;
+    MainPlaybackMIDIOutDevice m_OutDevice;
 
     static const float SharpRatio;
     static const float KeyRatio;
@@ -360,7 +482,9 @@ public:
 
     GameError Init() override;
     GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
+    GameError MsgProcLegacy(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     GameError Logic() override;
+    GameError LogicLegacy();
     GameError Render() override { return Success; }
     bool IsFreePlay() const override { return true; }
     const char* DebugName() const override { return "FreePlayScreen"; }
