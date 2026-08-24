@@ -1,0 +1,65 @@
+name: Retry parallel sort tail source materialization
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-source:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply source wiring
+        shell: python
+        run: |
+          from pathlib import Path
+          workflow = Path('.github/workflows/apply-parallel-sort-keyboard.yml')
+          lines = workflow.read_text(encoding='utf-8').splitlines()
+          step = next(i for i, line in enumerate(lines) if line.strip() == '- name: Apply source wiring and renderer state fix')
+          run = next(i for i in range(step + 1, len(lines)) if lines[i].strip() == 'run: |')
+          end = next(i for i in range(run + 1, len(lines)) if lines[i].strip() == '- name: Validate patched source')
+          body = lines[run + 1:end]
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body) + '\n'
+          exec(compile(script, str(workflow) + ':source-wiring', 'exec'), {'__name__': '__main__'})
+          Path('.retry-sort-keyboard').unlink(missing_ok=True)
+
+      - name: Validate patched source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          test -f PianoFromAbove/ParallelPostProcess.h
+          grep -F 'PostProcessParallel(vChannelEvents' PianoFromAbove/MIDI.cpp
+          grep -F 'parallel event lanes' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'Chunk quads clip to notes_scissor' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'Chunk quads leave the command list clipped' PianoFromAbove/RendererD3D12Legacy.inc
+          grep -F 'parallel merge path' PianoFromAbove/ParallelPostProcess.h
+          grep -F 'Sister-index pass' PianoFromAbove/ParallelPostProcess.h
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit actual source changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Parallelize event finalization and restore image-buffer keyboard'
+          git push origin HEAD:${{ github.head_ref }}
