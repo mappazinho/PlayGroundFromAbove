@@ -9,6 +9,7 @@
 *************************************************************************************************/
 #include "MIDI.h"
 #include "ParallelMIDIPos.h"
+#include "ParallelPostProcess.h"
 #include <fstream>
 #include <stack>
 #include <array>
@@ -1124,6 +1125,14 @@ void MIDI::MIDIInfo::AddTrackInfo( const MIDITrack &mTrack )
 
 void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges, vector<MIDIMetaEvent*>* vMetaEvents, eventvec_t* vTempo, eventvec_t* vSignature, eventvec_t* vMarkers)
 {
+    LogLoadStage("PostProcess parallel start", this);
+    PostProcessParallel(vChannelEvents, vProgramChanges, vMetaEvents, vTempo, vSignature, vMarkers);
+    LogLoadStage("PostProcess parallel end", this);
+    return;
+
+    // Legacy single-consumer implementation retained below as a correctness
+    // reference/fallback while the active path above performs every heavy pass
+    // across the physical-core worker pool.
     ParallelMIDIPos midiPos( *this );
     bool bIsStandard = midiPos.IsStandard();
     int iTicksPerBeat = midiPos.GetTicksPerBeat();

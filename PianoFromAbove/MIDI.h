@@ -195,6 +195,8 @@ public:
 
     void PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,
         vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);
+    void PostProcessParallel(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,
+        vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);
     void ConnectNotes();
     void clear( void );
     void ReleaseOwnedData( void );

@@ -2024,6 +2024,10 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         }
     }
 
+    // Chunk quads leave the command list clipped to notes_scissor. Restore a
+    // full-screen scissor before EndScene draws the post-split piano keyboard.
+    const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
+    m_pCommandList->RSSetScissorRects(1, &fullScissor);
     return S_OK;
 }
 

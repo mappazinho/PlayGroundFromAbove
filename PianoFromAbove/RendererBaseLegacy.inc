@@ -1710,7 +1710,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             ImGui::ProgressBar(prog, ImVec2(350, 0));
             const unsigned sortWorkers = g_LoadingProgress.sortWorkerCount.load(std::memory_order_acquire);
             if (g_LoadingProgress.stage == MIDILoadingProgress::SortEvents && sortWorkers > 0) {
-                ImGui::TextDisabled("%u parallel sort lanes", sortWorkers);
+                ImGui::TextDisabled("%u parallel event lanes", sortWorkers);
                 const bool twoColumns = sortWorkers > 8;
                 const float laneWidth = twoColumns ? 170.0f : 350.0f;
                 for (unsigned lane = 0; lane < sortWorkers; ++lane) {
