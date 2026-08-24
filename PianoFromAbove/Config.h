@@ -113,7 +113,7 @@ public:
     // Set accessors. A bit more advanced because they optionally update the GUI
     void SetPlayMode( GameState::State ePlayMode, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetPlayMode( ePlayMode ); m_ePlayMode = ePlayMode; }
     void SetPlayable( bool bPlayable, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetPlayable( bPlayable ); m_bPlayable = bPlayable; }
-    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { ImageBufferPrewarmPlaybackRequested( !bPaused ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }
+    void SetPaused( bool bPaused, bool bUpdateGUI = false ) { const bool bWasPaused = m_bPaused; if ( bWasPaused && !bPaused ) ImageBufferPrewarmPlaybackRequested( TRUE ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }
     void SetStopped( bool bUpdateGUI = false ) { ImageBufferPrewarmPlaybackRequested( FALSE ); if ( bUpdateGUI ) ::SetPlayPauseStop( false, false, true ); m_bPaused = true; }
     void SetSpeed( double dSpeed, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetSpeed( dSpeed ); m_dSpeed = dSpeed; }
     void SetNSpeed( double dNSpeed, bool bUpdateGUI = false ) { dNSpeed = max(min(dNSpeed, 10.0), 0.005); if ( bUpdateGUI ) ::SetNSpeed( dNSpeed ); m_dNSpeed = dNSpeed; }
@@ -291,27 +291,27 @@ public:
 
     void SetVisualSettings(const VisualSettings &VisualSettings) { m_VisualSettings = VisualSettings; }
     void SetAudioSettings(const AudioSettings &audioSettings) { m_AudioSettings = audioSettings; }
-    void SetVideoSettings(const VideoSettings &videoSettings) { m_VideoSettings = videoSettings; }
+    void SetVideoSettings(const VideoSettings &VideoSettings) { m_VideoSettings = VideoSettings; }
     void SetControlsSettings(const ControlsSettings &ControlsSettings) { m_ControlsSettings = ControlsSettings; }
-    void SetVizSettings(const VizSettings& VizSettings) { m_VizSettings = VizSettings; }
+    void SetVizSettings(const VizSettings &VizSettings) { m_VizSettings = VizSettings; }
 
-    // i really need to start writting getters and setters
-    bool m_bManualTimer = false;
-    bool m_bPianoOverride = false;
+    SongLibrary& GetSongLibrary() { return m_SongLibrary; }
+    const SongLibrary& GetSongLibrary() const { return m_SongLibrary; }
+
+    bool IsSet() { return m_bIsSet; }
 
 private:
-    // Singleton
     Config();
-    ~Config() {}
-    Config( const Config& );
-    Config &operator=( const Config& );
+    Config( Config const& );
+    Config& operator=( Config const& );
 
+    bool m_bIsSet;
     VisualSettings m_VisualSettings;
     AudioSettings m_AudioSettings;
     VideoSettings m_VideoSettings;
     ControlsSettings m_ControlsSettings;
-    SongLibrary m_SongLibrary;
     PlaybackSettings m_PlaybackSettings;
     ViewSettings m_ViewSettings;
     VizSettings m_VizSettings;
+    SongLibrary m_SongLibrary;
 };
