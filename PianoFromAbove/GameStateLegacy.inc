@@ -3866,7 +3866,7 @@ void MainScreen::RenderText()
     if (m_bShowFPS && !m_bDumpFrames)
         iLines++;
     if (viz.bNerdStats)
-        iLines += 7;
+        iLines += 8;
     if (viz.bNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
         iLines += 3;
     if (m_Timer.m_bManualTimer && !m_bDumpFrames)
@@ -4147,6 +4147,8 @@ void MainScreen::RenderStatus(int lines)
             nps += std::get<1>(m_dNPSNotes[i]);
 
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "NPS:", "%lld", nps);
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Audio FPS:", "%.0f",
+            m_dPlaybackAudioSchedulerHz.load(std::memory_order_relaxed));
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Rendered:", "%llu", m_pRenderer->GetRenderedNotesCount());
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "File notes:", "%llu", m_MIDI.GetInfo().iNoteCount);
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "MIDI sent:", "%llu", m_OutDevice.GetEventsSent());

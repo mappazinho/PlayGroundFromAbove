@@ -1395,10 +1395,32 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     }
     auto s_t2 = std::chrono::steady_clock::now();
 
-    if (!g_bDisableBlur)
-        ApplyBlur();
-
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
+    if (!g_bDisableBlur) {
+        ApplyBlur();
+    } else if (bloomViz.bBloom && m_pSceneCopy) {
+        // Normal blur owns the scene copy in the legacy path; bloom needs the
+        // same fresh capture even when that blur work is disabled.
+        auto* backbuffer = m_pRenderTargets[m_uFrameIndex].Get();
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(backbuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_pCommandList->ResourceBarrier(1, &toCopy);
+        if (m_SceneCopyState != D3D12_RESOURCE_STATE_COPY_DEST) {
+            auto sceneToCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_pSceneCopy.Get(),
+                m_SceneCopyState, D3D12_RESOURCE_STATE_COPY_DEST);
+            m_pCommandList->ResourceBarrier(1, &sceneToCopy);
+            m_SceneCopyState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        m_pCommandList->CopyResource(m_pSceneCopy.Get(), backbuffer);
+        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(backbuffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        m_pCommandList->ResourceBarrier(1, &fromCopy);
+        auto sceneToRead = CD3DX12_RESOURCE_BARRIER::Transition(m_pSceneCopy.Get(),
+            m_SceneCopyState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_pCommandList->ResourceBarrier(1, &sceneToRead);
+        m_SceneCopyState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+
     // "Disable all blurs" covers UI/background/roll blur only. Bloom is
     // an independent post effect and must remain controlled solely by bBloom.
     if (bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {

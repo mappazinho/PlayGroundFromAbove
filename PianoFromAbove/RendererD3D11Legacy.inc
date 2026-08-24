@@ -813,10 +813,21 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         m_pContext->DrawIndexed((UINT)((rect_count - rect_split) / 4 * 6), (UINT)(rect_split / 4 * 6), 0);
     }
 
-    if (!g_bDisableBlur)
-        ApplyBlur();
-
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
+    if (!g_bDisableBlur) {
+        ApplyBlur();
+    } else if (bloomViz.bBloom && m_pSceneCopy) {
+        // Bloom shares the scene-copy texture with the normal blur pipeline.
+        // Capture it even when UI/background blur is disabled so bloom always
+        // extracts from the current frame rather than stale texture contents.
+        ID3D11Resource* backbuffer = nullptr;
+        m_pRTVs[m_uFrameIndex]->GetResource(&backbuffer);
+        if (backbuffer) {
+            m_pContext->CopyResource(m_pSceneCopy.Get(), backbuffer);
+            backbuffer->Release();
+        }
+    }
+
     // "Disable all blurs" covers UI/background/roll blur only. Bloom is
     // an independent post effect and must remain controlled solely by bBloom.
     if (bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
