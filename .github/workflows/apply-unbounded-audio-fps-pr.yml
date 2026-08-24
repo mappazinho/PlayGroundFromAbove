@@ -1,0 +1,99 @@
+name: Apply uncapped audio scheduler PR fix
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/unbounded-audio-fps-preserve-bloom'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply source fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {count}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          audio = 'PianoFromAbove/PlaybackAudioThread.inc'
+          replace_once(audio,
+              '''        // The scheduler itself runs independently at ~1 kHz. Keep the host\n        // cursor strictly due-now even for native SVMS: dense equal-time events\n        // are still submitted as one exact-QPC batch, but pause/mute/provider\n        // changes can never leave already-queued future MIDI behind.\n''',
+              '''        // The scheduler is intentionally uncapped while live playback is\n        // running. It busy-polls the independent QPC clock as fast as this CPU\n        // can execute the loop; dense equal-time events still use one exact-QPC\n        // batch at a time. Paused/inactive states sleep separately below.\n''',
+              'scheduler comment')
+
+          replace_once(audio,
+              '''        if (processed >= maxEventsThisPass) {\n            SwitchToThread();\n            continue;\n        }\n\n        Sleep(1);\n''',
+              '''        // Never yield or sleep on the active playback path. A full batch\n        // immediately continues into the next batch, while an idle iteration\n        // immediately polls QPC again. This deliberately consumes one scheduler\n        // thread/core when playing in exchange for the lowest possible ingress\n        // latency and an effectively unlimited audio/MIDI FPS.\n        if (processed >= maxEventsThisPass)\n            continue;\n''',
+              'active scheduler cap removal')
+
+          replace_once('PianoFromAbove/GameState.cpp',
+              '''        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f Hz", currentMs, currentFps, audioSchedulerHz);''',
+              '''        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f FPS", currentMs, currentFps, audioSchedulerHz);''',
+              'audio fps label')
+
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc',
+              '''    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {''',
+              '''    // "Disable all blurs" affects UI/background/roll blur, not bloom.\n    if (bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {''',
+              'D3D11 bloom independence')
+
+          replace_once('PianoFromAbove/RendererD3D12Legacy.inc',
+              '''    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {''',
+              '''    // "Disable all blurs" affects UI/background/roll blur, not bloom.\n    if (bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {''',
+              'D3D12 bloom independence')
+
+          Path('.github/workflows/apply-unbounded-audio-fps.yml').unlink(missing_ok=True)
+          Path('.audio-fps-trigger').unlink(missing_ok=True)
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'effectively unlimited audio/MIDI FPS' PianoFromAbove/PlaybackAudioThread.inc
+          grep -F 'Audio %.0f FPS' PianoFromAbove/GameState.cpp
+          grep -F 'if (bloomViz.bBloom && m_pBloomPS' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'if (bloomViz.bBloom && m_pBloomPipelineState' PianoFromAbove/RendererD3D12Legacy.inc
+          ! grep -F 'SwitchToThread();' PianoFromAbove/PlaybackAudioThread.inc
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('PianoFromAbove/PlaybackAudioThread.inc').read_text(encoding='utf-8')
+          needle = 'if (processed >= maxEventsThisPass)\n            continue;'
+          assert needle in text
+          after = text[text.index(needle) + len(needle):]
+          assert 'Sleep(1);' not in after.split('output.Panic();', 1)[0]
+          PY
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Uncap audio scheduler and preserve bloom'
+          git push origin HEAD:${{ github.head_ref }}
