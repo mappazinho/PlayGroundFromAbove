@@ -1399,7 +1399,9 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         ApplyBlur();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
-    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
+    // "Disable all blurs" covers UI/background/roll blur only. Bloom is
+    // an independent post effect and must remain controlled solely by bBloom.
+    if (bloomViz.bBloom && m_pBloomPipelineState && m_pBloomExtractPipelineState && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
         ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
         m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
 
