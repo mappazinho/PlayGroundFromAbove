@@ -1,0 +1,32 @@
+name: Final fix source diagnostics
+
+on:
+  push:
+    branches: [ feature/final-stability-svms-horizontal ]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Dump relevant source contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== RenderMode / Viz ==='
+          rg -n -C 14 'RenderMode|DualRoll|Horizontal|VBO|Overclock|Corrupt|Image Buffer Notes|Blur' PianoFromAbove/RendererBaseLegacy.inc || true
+          echo '=== custom audio / BASS lifecycle ==='
+          rg -n -C 16 'CustomAudio|BASS_Init|BASS_Free|InitBASS|DisposeBASS|bPreRenderAudio|m_bUseCustomAudio' PianoFromAbove || true
+          echo '=== render layout ==='
+          rg -n -C 14 'bDualPianoRoll|RenderNotes\(|RenderKeys\(|RenderLines\(|notes_x|notes_cx|notes_y|notes_cy|PianoRollStrip' PianoFromAbove/GameStateLegacy.inc PianoFromAbove/GameState.cpp || true
+          echo '=== device loss / image buffer ==='
+          rg -n -C 16 'DeviceLost|RecoverDevice|DEVICE_REMOVED|DEVICE_RESET|ImageBuffer|m_vChunkBuilds|noteOffset|noteCount' PianoFromAbove/RendererBase.cpp PianoFromAbove/RendererBaseLegacy.inc PianoFromAbove/RendererD3D11Legacy.inc PianoFromAbove/RendererD3D12Legacy.inc || true
+          echo '=== midi output provider lifecycle ==='
+          rg -n -C 18 'OpenKDMAPI|GetOmniMIDIProc|SendDirectData|LoadLibrary|FreeLibrary|TerminateKDMAPI|MIDIOutDevice' PianoFromAbove/MIDI.cpp PianoFromAbove/MIDI.h || true
+          echo '=== settings persistence ==='
+          rg -n -C 12 'bDualPianoRoll|VBO|Blur|Corrupt|Overclock|ImageBuffer|RenderMode' PianoFromAbove/Config.h PianoFromAbove/Config.cpp || true
