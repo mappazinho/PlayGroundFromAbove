@@ -71,8 +71,6 @@ jobs:
               '''    // For live synth playback the audio QPC clock is authoritative, including\n    // the exact pause position. Resetting the legacy frame timer here prevents\n    // its old FPS-based elapsed step from double-advancing after the snap.\n    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering) {''',
               'pause clock visual snap')
 
-          # Compile and link the complete Release x64 target before the trusted
-          # wrapper performs its normal FxCompile/ClCompile validation.
           vswhere = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe'
           found = subprocess.check_output([
               str(vswhere), '-latest', '-products', '*',
@@ -81,10 +79,16 @@ jobs:
           ], text=True).strip().splitlines()
           if not found:
               raise RuntimeError('MSBuild.exe not found via vswhere')
-          subprocess.check_call([
+          cmd = [
               found[0], r'PianoFromAbove\PianoFromAbove.vcxproj', '/m', '/t:Build',
               '/p:Configuration=Release', '/p:Platform=x64'
-          ])
+          ]
+          build = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          lines = build.stdout.splitlines()
+          if build.returncode != 0:
+              print('\n'.join(lines[-140:]))
+              raise RuntimeError(f'Full Release x64 build failed with exit code {build.returncode}')
+          print('\n'.join(lines[-40:]))
 
       - name: Validate patched source
         shell: bash
