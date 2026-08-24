@@ -26,11 +26,11 @@
 
 // The immutable full-song prepared source is deliberately a memory-for-speed
 // optimization. Its persistent cost is driven by the number of notes stored in
-// the compact prepared source, not by controller/meta events that are only
-// scanned once. Keep the 20M-note guard, while allowing event-heavy files such
-// as the 59.4M-event stress case to use the real pre-play preparation path.
-static constexpr size_t ImageBufferFullPreparedMaxEvents = 100000000;
-static constexpr size_t ImageBufferFullPreparedMaxNotes = 20000000;
+// the compact prepared source. The observed 59.4M-event stress case contains
+// 29.7M notes, so keep enough headroom for it while still bounding the extra
+// prepared-source memory to roughly one GiB of raw-note records.
+static constexpr size_t ImageBufferFullPreparedMaxEvents = 64000000;
+static constexpr size_t ImageBufferFullPreparedMaxNotes = 32000000;
 
 struct ImageBufferPrewarmGpuState {
     const void* owner = nullptr;
