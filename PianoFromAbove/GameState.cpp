@@ -611,7 +611,7 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     const float currentFps = currentMs > 0.001f ? 1000.0f / currentMs : 0.0f;
     char label[128];
     if (audioSchedulerHz > 0.0)
-        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f Hz", currentMs, currentFps, audioSchedulerHz);
+        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f FPS", currentMs, currentFps, audioSchedulerHz);
     else
         snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
     dl->AddText(ImVec2(panelLeft + 6.0f * scale, panelTop + 3.0f * scale),

@@ -817,7 +817,9 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         ApplyBlur();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
-    if (!g_bDisableBlur && bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
+    // "Disable all blurs" covers UI/background/roll blur only. Bloom is
+    // an independent post effect and must remain controlled solely by bBloom.
+    if (bloomViz.bBloom && m_pBloomPS && m_pBloomExtractCS && bloomViz.fBloomIntensity > 0.0f && m_pBloomHalf) {
         // Extract bright parts into the half-res buffer
         m_pContext->CSSetShader(m_pBloomExtractCS.Get(), nullptr, 0);
         m_pContext->CSSetConstantBuffers(0, 1, m_pBloomExtractConstants.GetAddressOf());
