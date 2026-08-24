@@ -31,9 +31,6 @@ jobs:
           end_index = next(i for i in range(run_index + 1, len(lines)) if lines[i].strip() == '- name: Validate source')
           body = lines[run_index + 1:end_index]
           script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body) + '\n'
-          # The original helper uses str.count(), so a forward declaration also
-          # matches the substring inside friend declarations. Keep its one-only
-          # replacement, but require at least one match instead of exactly one.
           script = script.replace('if count != 1:', 'if count < 1:')
           exec(compile(script, str(workflow) + ':Apply fixes', 'exec'), {'__name__': '__main__'})
 
@@ -51,9 +48,6 @@ jobs:
                   data = b'\xef\xbb\xbf' + data
               p.write_bytes(data)
 
-          # GetStatsBounceScale is protected. Expose only the calculated value
-          # through a public const wrapper so the late free helper can obtain the
-          # exact existing animation without duplicating its formula.
           p, text, bom = read_src('PianoFromAbove/GameState.h')
           needle = '    const MIDI& GetMIDI() const { return m_MIDI; }\n'
           replacement = needle + '    float GetStatsBounceScaleForOverlay() const { return GetStatsBounceScale(); }\n'
@@ -63,14 +57,8 @@ jobs:
           write_src(p, text, bom)
 
           p, text, bom = read_src('PianoFromAbove/GameState.cpp')
-          setup = '''    const VizSettings& viz = Config::GetConfig().GetVizSettings();
-    if (!viz.bSysStats || g_bVideoRendering)
-        return;
-'''
-          setup_new = setup + '''
-    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
-    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
-'''
+          setup = '    const VizSettings& viz = Config::GetConfig().GetVizSettings();\n    if (!viz.bSysStats || g_bVideoRendering)\n        return;\n'
+          setup_new = setup + '\n    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);\n    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;\n'
           marker = 'static void DrawFrameTimeGraphLate(Renderer* renderer)\n{'
           start = text.find(marker)
           if start < 0:
@@ -79,10 +67,11 @@ jobs:
           if pos < 0:
               raise RuntimeError('frametime viz block not found')
           text = text[:pos] + setup_new + text[pos + len(setup):]
-          tail = text.find('0.20f, GetStatsBounceScale(), 750.0f);', start)
+          old_call = '0.20f, GetStatsBounceScale(), 750.0f);'
+          tail = text.find(old_call, start)
           if tail < 0:
               raise RuntimeError('frametime bounce call not found')
-          text = text[:tail] + '0.20f, bounceScale, 750.0f);' + text[tail + len('0.20f, GetStatsBounceScale(), 750.0f);'):]
+          text = text[:tail] + '0.20f, bounceScale, 750.0f);' + text[tail + len(old_call):]
           write_src(p, text, bom)
 
       - name: Validate patched source
