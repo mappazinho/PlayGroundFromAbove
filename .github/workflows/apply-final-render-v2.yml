@@ -1,0 +1,183 @@
+name: Apply final renderer stability v2
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-source:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply source changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def load(path): return Path(path).read_text(encoding='utf-8-sig')
+          def save(path, s): Path(path).write_text(s, encoding='utf-8')
+          def once(s, old, new, label):
+              n = s.count(old)
+              if n != 1: raise RuntimeError(f'{label}: expected 1, found {n}: {old[:100]!r}')
+              return s.replace(old, new, 1)
+
+          # Config fields/default/load/save.
+          p='PianoFromAbove/Config.h'; s=load(p)
+          s=once(s, '    bool bDualPianoRoll;\n    bool bDualRollKeyboard;\n',
+                 '    bool bDualPianoRoll;\n    bool bHorizontalPianoRoll;\n    bool bDualRollKeyboard;\n    bool bDisableBlurs;\n', 'Config.h render fields')
+          save(p,s)
+
+          p='PianoFromAbove/Config.cpp'; s=load(p)
+          s=once(s, '    this->bDualPianoRoll = false;\n    this->bDualRollKeyboard = true;\n',
+                 '    this->bDualPianoRoll = false;\n    this->bHorizontalPianoRoll = false;\n    this->bDualRollKeyboard = true;\n    this->bDisableBlurs = false;\n', 'Config defaults')
+          old='    if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)\n        bDualPianoRoll = (iAttrVal != 0);\n    if (txViz->QueryIntAttribute("DualRollKeyboard", &iAttrVal) == TIXML_SUCCESS)\n        bDualRollKeyboard = (iAttrVal != 0);\n'
+          new='    if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)\n        bDualPianoRoll = (iAttrVal != 0);\n    if (txViz->QueryIntAttribute("HorizontalPianoRoll", &iAttrVal) == TIXML_SUCCESS)\n        bHorizontalPianoRoll = (iAttrVal != 0);\n    if (txViz->QueryIntAttribute("DualRollKeyboard", &iAttrVal) == TIXML_SUCCESS)\n        bDualRollKeyboard = (iAttrVal != 0);\n    if (txViz->QueryIntAttribute("DisableBlurs", &iAttrVal) == TIXML_SUCCESS)\n        bDisableBlurs = (iAttrVal != 0);\n    if (bDualPianoRoll && bHorizontalPianoRoll)\n        bHorizontalPianoRoll = false;\n'
+          s=once(s,old,new,'Config load')
+          s=once(s, '    txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);\n    txViz->SetAttribute("DualRollKeyboard", bDualRollKeyboard);\n',
+                 '    txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);\n    txViz->SetAttribute("HorizontalPianoRoll", bHorizontalPianoRoll);\n    txViz->SetAttribute("DualRollKeyboard", bDualRollKeyboard);\n    txViz->SetAttribute("DisableBlurs", bDisableBlurs);\n', 'Config save')
+          save(p,s)
+
+          # Shared renderer: global blur gate and image-buffer-incompatible controls.
+          p='PianoFromAbove/RendererBaseLegacy.inc'; s=load(p)
+          s=once(s, 'bool Renderer::PresentPrelude() {\n    HeartbeatLog("present:start");\n',
+                 'bool Renderer::PresentPrelude() {\n    HeartbeatLog("present:start");\n    const auto& runtimeViz = Config::GetConfig().GetVizSettings();\n    g_bDisableBlur = runtimeViz.bDisableBlurs;\n    if (runtimeViz.bImageBufferNotes)\n        m_bOverclockArtifacts = false;\n', 'PresentPrelude gate')
+          s=once(s, '        if (ImGui::BeginMenu("Fun")) {\n            int vbo = (int)m_NotesPerPass;\n',
+                 '        if (ImGui::BeginMenu("Fun")) {\n            const bool imageBufferLocksFun = viz.bImageBufferNotes;\n            ImGui::BeginDisabled(imageBufferLocksFun);\n            int vbo = (int)m_NotesPerPass;\n', 'Fun begin')
+          s=once(s, '            ImGui::Text("Effective: %d%%", (int)(m_fLastCorruption * 100.0f + 0.5f));\n            ImGui::Separator();\n            int lag =',
+                 '            ImGui::Text("Effective: %d%%", (int)(m_fLastCorruption * 100.0f + 0.5f));\n            ImGui::EndDisabled();\n            ImGui::Separator();\n            int lag =', 'Fun VBO/corruption unlock')
+          s=once(s, '            ImGui::Separator();\n            ImGui::Checkbox("GPU Overclock Artifacts", &m_bOverclockArtifacts);\n            ImGui::Separator();\n            ImGui::Checkbox("Bounce stats to the beat",',
+                 '            ImGui::Separator();\n            ImGui::BeginDisabled(imageBufferLocksFun);\n            ImGui::Checkbox("GPU Overclock Artifacts", &m_bOverclockArtifacts);\n            ImGui::EndDisabled();\n            ImGui::Separator();\n            ImGui::Checkbox("Bounce stats to the beat",', 'GPU overclock lock')
+          old='            if (ImGui::MenuItem("Default", nullptr, !viz.bDualPianoRoll))\n                viz.bDualPianoRoll = false;\n            if (ImGui::MenuItem("DualRoll", nullptr, viz.bDualPianoRoll))\n                viz.bDualPianoRoll = true;\n'
+          new='            if (ImGui::MenuItem("Default", nullptr, !viz.bDualPianoRoll && !viz.bHorizontalPianoRoll)) {\n                viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = false;\n            }\n            if (ImGui::MenuItem("DualRoll", nullptr, viz.bDualPianoRoll)) {\n                viz.bDualPianoRoll = true; viz.bHorizontalPianoRoll = false;\n            }\n            if (ImGui::MenuItem("Horizontal", nullptr, viz.bHorizontalPianoRoll)) {\n                viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = true;\n            }\n'
+          s=once(s,old,new,'RenderMode choices')
+          s=once(s, '            ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);\n            ImGui::Checkbox("Image Buffer Notes",',
+                 '            ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);\n            ImGui::Checkbox("Disable all blurs", &viz.bDisableBlurs);\n            ImGui::Checkbox("Image Buffer Notes",', 'RenderMode blur toggle')
+          n=s.count('if (m_BlurTextureID) {')
+          if n < 4: raise RuntimeError(f'UI blur sites: expected >=4, found {n}')
+          s=s.replace('if (m_BlurTextureID) {','if (!g_bDisableBlur && m_BlurTextureID) {')
+          s=once(s, 'HRESULT Renderer::RecoverDevice(HWND hWnd, bool bLimitFPS) {\n    HeartbeatLog("recover:start");\n',
+                 'HRESULT Renderer::RecoverDevice(HWND hWnd, bool bLimitFPS) {\n    HeartbeatLog("recover:start");\n    ImageBufferInvalidate();\n    m_vChunkNotes.clear();\n    m_vChunkBuilds.clear();\n    m_vChunkQuads.clear();\n', 'device recovery')
+          save(p,s)
+
+          # Main-screen background, full-screen horizontal mode and safe state indices.
+          p='PianoFromAbove/GameStateLegacy.inc'; s=load(p)
+          s=once(s, '    if (m_bBackgroundLoaded && cViz.fBGBlur != m_fLastBGBlur) {\n        m_pRenderer->SetBackgroundBlur(cViz.fBGBlur);\n        m_fLastBGBlur = cViz.fBGBlur;\n    }\n',
+                 '    const float effectiveBGBlur = cViz.bDisableBlurs ? 0.0f : cViz.fBGBlur;\n    if (m_bBackgroundLoaded && effectiveBGBlur != m_fLastBGBlur) {\n        m_pRenderer->SetBackgroundBlur(effectiveBGBlur);\n        m_fLastBGBlur = effectiveBGBlur;\n    }\n', 'effective BG blur')
+          s=once(s, '        RenderLines();\n        auto t1 = std::chrono::steady_clock::now();\n        RenderNotes();\n        auto t2 = std::chrono::steady_clock::now();\n        if ( m_bShowKB )\n            RenderKeys();\n        RenderBorder();\n        RenderText();\n',
+                 '        if (!cViz.bHorizontalPianoRoll) RenderLines();\n        auto t1 = std::chrono::steady_clock::now();\n        RenderNotes();\n        auto t2 = std::chrono::steady_clock::now();\n        if (!cViz.bHorizontalPianoRoll && m_bShowKB) RenderKeys();\n        if (!cViz.bHorizontalPianoRoll) RenderBorder();\n        RenderText();\n', 'Horizontal main render')
+          s=once(s, '    const int64_t eventCount = (int64_t)m_vEvents.size();\n    const bool hasStrip = Config::GetConfig().GetVizSettings().bDualPianoRoll;\n',
+                 '    const int64_t eventCount = (int64_t)m_vEvents.size();\n    const auto& renderViz = Config::GetConfig().GetVizSettings();\n    const bool horizontalOnly = renderViz.bHorizontalPianoRoll;\n    const bool hasStrip = renderViz.bDualPianoRoll || horizontalOnly;\n', 'Horizontal RenderNotes header')
+          vertical_start=s.index('    if (bImageBuffer) {', s.index('void MainScreen::RenderNotes()'))
+          vertical_end=s.index('\n\n    if (hasStrip) {', vertical_start)
+          vertical=s[vertical_start:vertical_end]
+          wrapped='    if (!horizontalOnly) {\n' + '\n'.join('    '+line if line else line for line in vertical.splitlines()) + '\n    }'
+          s=s[:vertical_start]+wrapped+s[vertical_end:]
+          old='                RenderPianoRollStripNote(m_vEvents[*it]);\n'
+          # There is exactly one strip-state occurrence in MainScreen.
+          target='            for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {\n'+old+'            }\n'
+          repl='            for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {\n                if (*it >= 0 && (size_t)*it < m_vEvents.size())\n                    RenderPianoRollStripNote(m_vEvents[*it]);\n            }\n'
+          s=once(s,target,repl,'strip state bounds')
+          save(p,s)
+
+          # Reuse the existing horizontal strip renderer, but make it full-screen.
+          for path, cls, api in [('PianoFromAbove/RendererD3D11Legacy.inc','D3D11Renderer','11'),('PianoFromAbove/RendererD3D12Legacy.inc','D3D12Renderer','12')]:
+              s=load(path)
+              start=s.index(f'void {cls}::DrawPianoRollStrip() {{')
+              end=s.index(f'HRESULT {cls}::EnsureChunkResources',start)
+              seg=s[start:end]
+              seg=once(seg, '    if (!Config::GetConfig().GetVizSettings().bDualPianoRoll)\n        return;\n',
+                       '    const auto& stripViz = Config::GetConfig().GetVizSettings();\n    const bool horizontal = stripViz.bHorizontalPianoRoll;\n    if (!stripViz.bDualPianoRoll && !horizontal)\n        return;\n', path+' strip guard')
+              seg=once(seg, '    const float stripTop = menuBarHeight + toolbarHeight;\n',
+                       '    const float stripTop = horizontal ? 0.0f : menuBarHeight + toolbarHeight;\n', path+' strip top')
+              seg=once(seg, '    const float stripH = max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));\n',
+                       '    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));\n', path+' strip height')
+              s=s[:start]+seg+s[end:]
+
+              bgstart=s.index(f'void {cls}::DrawPianoRollStripBackground() {{')
+              bgend=s.index(f'void {cls}::DrawPianoRollStrip()',bgstart)
+              bg=s[bgstart:bgend]
+              bg=once(bg, '    if (g_bDisableBlur || !Config::GetConfig().GetVizSettings().bDualPianoRoll || !m_pBlurOutput)\n        return;\n',
+                      '    const auto& stripViz = Config::GetConfig().GetVizSettings();\n    if (g_bDisableBlur || (!stripViz.bDualPianoRoll && !stripViz.bHorizontalPianoRoll) || !m_pBlurOutput)\n        return;\n', path+' bg guard')
+              if api=='11':
+                  branch=[
+                    '    if (stripViz.bHorizontalPianoRoll) {',
+                    '        const D3D11_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };',
+                    '        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };',
+                    '        SetPipeline(Pipeline::Background);',
+                    '        m_pContext->UpdateSubresource(m_pBackgroundConstants.Get(), 0, nullptr, &fullConstants, 0, 0);',
+                    '        ID3D11ShaderResourceView* blurSRV = m_pBlurOutputSRV.Get();',
+                    '        m_pContext->PSSetShaderResources(0, 1, &blurSRV);',
+                    '        m_pContext->RSSetScissorRects(1, &fullScissor);',
+                    '        m_pContext->Draw(3, 0);',
+                    '        return;', '    }','']
+              else:
+                  branch=[
+                    '    if (stripViz.bHorizontalPianoRoll) {',
+                    '        const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };',
+                    '        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };',
+                    '        SetPipeline(Pipeline::Background);',
+                    '        ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };',
+                    '        m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);',
+                    '        m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(fullConstants) / 4, &fullConstants, 0);',
+                    '        m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BlurOutputSRVGPU);',
+                    '        m_pCommandList->RSSetScissorRects(1, &fullScissor);',
+                    '        m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);',
+                    '        return;', '    }','']
+              insert=bg.index('\n\n', bg.index('return;'))+2
+              bg=bg[:insert]+'\n'.join(branch)+bg[insert:]
+              s=s[:bgstart]+bg+s[bgend:]
+
+              # Bloom is blur too.
+              s=once(s, '    if (bloomViz.bBloom && ', '    if (!g_bDisableBlur && bloomViz.bBloom && ', path+' bloom gate')
+
+              # Reject malformed/stale chunk build ranges before memcpy/GPU VA math.
+              rstart=s.index(f'HRESULT {cls}::RenderImageBuffer() {{')
+              marker='    if (W <= 0 || H <= 0)\n        return S_OK;\n'
+              mpos=s.index(marker,rstart)+len(marker)
+              validation='\n    for (const auto& req : m_vChunkBuilds) {\n        const size_t offset = (size_t)req.noteOffset;\n        const size_t count = (size_t)req.noteCount;\n        if (offset > m_vChunkNotes.size() || count > m_vChunkNotes.size() - offset || count > MaxNotesPerPass) {\n            char buf[192];\n            sprintf_s(buf, "imgbuf:reject-range chunk=%lld off=%zu count=%zu total=%zu cap=%u", req.chunk, offset, count, m_vChunkNotes.size(), (unsigned)MaxNotesPerPass);\n            HeartbeatLog(buf);\n            ImageBufferInvalidate();\n            return S_OK;\n        }\n    }\n'
+              s=s[:mpos]+validation+s[mpos:]
+              save(path,s)
+
+          p='PianoFromAbove/RendererBase.cpp'; s=load(p)
+          s=once(s, '    static constexpr size_t kImageBufferNotesPerPass = 200000;\n    static constexpr size_t kImageBufferNotesPerFrame = 200000;\n',
+                 '    static constexpr size_t kImageBufferNotesPerPass = 65536;\n    static constexpr size_t kImageBufferNotesPerFrame = 65536;\n', 'image-buffer GPU budget')
+          save(p,s)
+
+      - name: Validate source diff
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'bHorizontalPianoRoll' PianoFromAbove/Config.h
+          grep -F 'Disable all blurs' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'imgbuf:reject-range' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'imgbuf:reject-range' PianoFromAbove/RendererD3D12Legacy.inc
+          grep -F 'kImageBufferNotesPerFrame = 65536' PianoFromAbove/RendererBase.cpp
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PianoFromAbove/Config.h PianoFromAbove/Config.cpp PianoFromAbove/RendererBase.cpp PianoFromAbove/RendererBaseLegacy.inc PianoFromAbove/RendererD3D11Legacy.inc PianoFromAbove/RendererD3D12Legacy.inc PianoFromAbove/GameStateLegacy.inc
+          git commit -m 'Add Horizontal RenderMode and harden image-buffer rendering'
+          git push origin HEAD:${{ github.head_ref }}
