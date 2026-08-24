@@ -1,1 +1,1 @@
-Temporary one-shot patch kick. Deleted together with the patch workflows after the source build succeeds.
+Temporary one-shot patch kick. Retrigger after bounce-scope compiler fix.
