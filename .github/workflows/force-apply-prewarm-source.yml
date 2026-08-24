@@ -37,32 +37,53 @@ jobs:
           script = script.replace('if count != 1:', 'if count < 1:')
           exec(compile(script, str(workflow) + ':Apply fixes', 'exec'), {'__name__': '__main__'})
 
-          # The frametime drawer is a free helper, while GetStatsBounceScale is
-          # a protected MainScreen member. Pass the scale out of the EndText
-          # member-call site instead of trying to call the member from the free
-          # helper or duplicating its bounce formula.
-          p = Path('PianoFromAbove/GameState.cpp')
-          raw = p.read_bytes()
-          bom = raw.startswith(b'\xef\xbb\xbf')
-          if bom:
-              raw = raw[3:]
-          text = raw.decode('utf-8').replace('\r\n', '\n')
-          text = text.replace(
-              'static void DrawFrameTimeGraphLate(Renderer* renderer);',
-              'static void DrawFrameTimeGraphLate(Renderer* renderer, float bounceScale);', 1)
-          text = text.replace(
-              'DrawFrameTimeGraphLate(m_pRenderer)',
-              'DrawFrameTimeGraphLate(m_pRenderer, GetStatsBounceScale())', 1)
-          text = text.replace(
-              'static void DrawFrameTimeGraphLate(Renderer* renderer)\n{',
-              'static void DrawFrameTimeGraphLate(Renderer* renderer, float bounceScale)\n{', 1)
-          text = text.replace(
-              '0.20f, GetStatsBounceScale(), 750.0f);',
-              '0.20f, bounceScale, 750.0f);', 1)
-          data = text.replace('\n', '\r\n').encode('utf-8')
-          if bom:
-              data = b'\xef\xbb\xbf' + data
-          p.write_bytes(data)
+          def read_src(path):
+              p = Path(path)
+              raw = p.read_bytes()
+              bom = raw.startswith(b'\xef\xbb\xbf')
+              if bom:
+                  raw = raw[3:]
+              return p, raw.decode('utf-8').replace('\r\n', '\n'), bom
+
+          def write_src(p, text, bom):
+              data = text.replace('\n', '\r\n').encode('utf-8')
+              if bom:
+                  data = b'\xef\xbb\xbf' + data
+              p.write_bytes(data)
+
+          # GetStatsBounceScale is protected. Expose only the calculated value
+          # through a public const wrapper so the late free helper can obtain the
+          # exact existing animation without duplicating its formula.
+          p, text, bom = read_src('PianoFromAbove/GameState.h')
+          needle = '    const MIDI& GetMIDI() const { return m_MIDI; }\n'
+          replacement = needle + '    float GetStatsBounceScaleForOverlay() const { return GetStatsBounceScale(); }\n'
+          if needle not in text:
+              raise RuntimeError('MainScreen public bounce wrapper insertion point not found')
+          text = text.replace(needle, replacement, 1)
+          write_src(p, text, bom)
+
+          p, text, bom = read_src('PianoFromAbove/GameState.cpp')
+          setup = '''    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    if (!viz.bSysStats || g_bVideoRendering)
+        return;
+'''
+          setup_new = setup + '''
+    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
+    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
+'''
+          marker = 'static void DrawFrameTimeGraphLate(Renderer* renderer)\n{'
+          start = text.find(marker)
+          if start < 0:
+              raise RuntimeError('frametime helper definition not found')
+          pos = text.find(setup, start)
+          if pos < 0:
+              raise RuntimeError('frametime viz block not found')
+          text = text[:pos] + setup_new + text[pos + len(setup):]
+          tail = text.find('0.20f, GetStatsBounceScale(), 750.0f);', start)
+          if tail < 0:
+              raise RuntimeError('frametime bounce call not found')
+          text = text[:tail] + '0.20f, bounceScale, 750.0f);' + text[tail + len('0.20f, GetStatsBounceScale(), 750.0f);'):]
+          write_src(p, text, bom)
 
       - name: Validate patched source
         shell: bash
@@ -74,7 +95,8 @@ jobs:
           grep -F "imgprep:full-prime dense=%zu jobs=%zu" PianoFromAbove/ImageBufferPreparedChunks.h
           grep -F "ImageBufferChunkPinned(this" PianoFromAbove/RendererBase.cpp
           grep -F "Match Sys Stats exactly" PianoFromAbove/GameState.cpp
-          grep -F "DrawFrameTimeGraphLate(m_pRenderer, GetStatsBounceScale())" PianoFromAbove/GameState.cpp
+          grep -F "GetStatsBounceScaleForOverlay" PianoFromAbove/GameState.h
+          grep -F "statsScreen->GetStatsBounceScaleForOverlay()" PianoFromAbove/GameState.cpp
           grep -F "0.20f, bounceScale, 750.0f" PianoFromAbove/GameState.cpp
           grep -F "ParallelMIDIPos midiPos" PianoFromAbove/MIDI.cpp
           grep -F "parallel sort lanes" PianoFromAbove/RendererBaseLegacy.inc
