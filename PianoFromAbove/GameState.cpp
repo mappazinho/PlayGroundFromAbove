@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <mutex>
 #include <type_traits>
+#include <deque>
+#include <chrono>
 #include "Globals.h"
 #include "GameState.h"
 #include "Config.h"
@@ -23,12 +25,12 @@
 #include "ImageBufferPreparedChunks.h"
 
 // The immutable full-song prepared source is deliberately a memory-for-speed
-// optimization. Above this point it can cost hundreds of MB to multiple GB and
-// can hold Play while scanning an enormous event array. Keep the known 19.6M
-// event stress case on the fast path, but make truly gigantic songs fall back
-// to local chunk collection instead of making playback depend on that source.
-static constexpr size_t ImageBufferFullPreparedMaxEvents = 50000000;
-static constexpr size_t ImageBufferFullPreparedMaxNotes = 20000000;
+// optimization. Its persistent cost is driven by the number of notes stored in
+// the compact prepared source. The observed 59.4M-event stress case contains
+// 29.7M notes, so keep enough headroom for it while still bounding the extra
+// prepared-source memory to roughly one GiB of raw-note records.
+static constexpr size_t ImageBufferFullPreparedMaxEvents = 64000000;
+static constexpr size_t ImageBufferFullPreparedMaxNotes = 32000000;
 
 struct ImageBufferPrewarmGpuState {
     const void* owner = nullptr;
@@ -301,6 +303,8 @@ static void DrawImageBufferPrewarmProgressLate(Renderer* renderer)
     DrawImageBufferPrewarmProgress(renderer, 0.0f, bufferW, bufferH * 0.75f);
 }
 
+static void DrawFrameTimeGraphLate(Renderer* renderer);
+
 static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
 {
     std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
@@ -480,11 +484,123 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
         } \
     } \
 }(this))
-#define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer)
+#define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer); DrawFrameTimeGraphLate(m_pRenderer)
 #include "GameStateLegacy.inc"
 #undef EndText
 #undef ClearAndBeginScene
 #undef CollectChunk
+
+// Frametime is sampled at the same late-render point as the system-stat panel,
+// so it measures real presented-frame cadence without perturbing MainScreen's
+// playback timer. The graph is visually attached immediately below Sys Stats.
+static void DrawFrameTimeGraphLate(Renderer* renderer)
+{
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point s_last;
+    static std::deque<float> s_history;
+    static float s_rangeMs = 33.333f;
+
+    const Clock::time_point now = Clock::now();
+    float frameMs = 0.0f;
+    if (s_last.time_since_epoch().count() != 0)
+        frameMs = (float)std::chrono::duration<double, std::milli>(now - s_last).count();
+    s_last = now;
+
+    if (!renderer)
+        return;
+
+    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    if (!viz.bSysStats || g_bVideoRendering)
+        return;
+
+    if (frameMs > 0.05f && frameMs < 5000.0f) {
+        s_history.push_back(frameMs);
+        if (s_history.size() > 600)
+            s_history.pop_front();
+    }
+
+    ImDrawList* dl = renderer->GetDrawList();
+    if (!dl)
+        return;
+
+    const float scale = (std::max)(viz.fUIScale, 0.5f);
+    const float bh = (float)renderer->GetBufferHeight();
+    const float graphH = 64.0f * scale;
+    const float panelW = 220.0f * scale;
+    const float textH = (6.0f + 16.0f * 4.0f) * scale;
+
+    const float contentTop = ImGui::GetFrameHeight() + 35.0f;
+    float toolbarBottom = contentTop + 10.0f;
+    if (viz.bDualPianoRoll) {
+        const float stripH = (std::max)(190.0f,
+            (std::min)(bh * 0.45f, bh * 0.28f));
+        toolbarBottom = 20.0f + 35.0f + stripH + 10.0f;
+    }
+
+    const float sysStatsH = textH + graphH + 10.0f * scale;
+    const float panelLeft = 10.0f;
+    const float panelTop = toolbarBottom + sysStatsH + 10.0f * scale;
+    const float panelRight = panelLeft + panelW;
+    const float panelBottom = panelTop + graphH + 26.0f * scale;
+    DrawBlurPanel(renderer, panelLeft, panelTop, panelRight, panelBottom, 10.0f * scale);
+
+    const ImVec2 g0(panelLeft + 6.0f * scale, panelTop + 20.0f * scale);
+    const ImVec2 g1(panelRight - 6.0f * scale, g0.y + graphH);
+    dl->AddRectFilled(g0, g1, 0x30000000);
+    for (int i = 0; i <= 4; ++i) {
+        const float y = g0.y + (g1.y - g0.y) * (float)i / 4.0f;
+        dl->AddLine(ImVec2(g0.x, y), ImVec2(g1.x, y), 0x20FFFFFF);
+    }
+
+    float maxSeen = 0.0f;
+    for (float ms : s_history)
+        maxSeen = (std::max)(maxSeen, ms);
+    const float targetRange = (std::max)(33.333f,
+        (float)std::ceil((double)maxSeen / 5.0) * 5.0f);
+    if (targetRange > s_rangeMs)
+        s_rangeMs += (targetRange - s_rangeMs) * 0.35f;
+    else
+        s_rangeMs += (targetRange - s_rangeMs) * 0.10f;
+    s_rangeMs = (std::max)(s_rangeMs, 33.333f);
+
+    auto drawReference = [&](float ms, ImU32 color) {
+        if (ms > s_rangeMs)
+            return;
+        const float y = g1.y - ms / s_rangeMs * (g1.y - g0.y);
+        dl->AddLine(ImVec2(g0.x, y), ImVec2(g1.x, y), color);
+    };
+    drawReference(16.6667f, IM_COL32(255, 255, 255, 60));
+    drawReference(33.3333f, IM_COL32(255, 255, 255, 38));
+
+    const size_t n = s_history.size();
+    if (n > 0) {
+        const float step = (g1.x - g0.x) / 600.0f;
+        ImVec2 pts[600];
+        for (size_t i = 0; i < n; ++i) {
+            const float x = g1.x - (float)(n - i) * step;
+            const float ms = (std::min)(s_history[i], s_rangeMs);
+            pts[i] = ImVec2(x, g1.y - ms / s_rangeMs * (g1.y - g0.y));
+        }
+        for (size_t i = 0; i + 1 < n; ++i)
+            dl->AddRectFilled(ImVec2(pts[i].x, pts[i].y),
+                ImVec2(pts[i + 1].x, g1.y), IM_COL32(255, 255, 255, 36));
+        dl->AddRectFilled(ImVec2(pts[n - 1].x, pts[n - 1].y),
+            ImVec2(g1.x, g1.y), IM_COL32(255, 255, 255, 36));
+        dl->AddPolyline(pts, (int)n, IM_COL32(255, 255, 255, 220), 0, 2.0f * scale);
+    }
+
+    const float currentMs = n > 0 ? s_history.back() : 0.0f;
+    const float currentFps = currentMs > 0.001f ? 1000.0f / currentMs : 0.0f;
+    char label[96];
+    snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);
+    dl->AddText(ImVec2(panelLeft + 6.0f * scale, panelTop + 3.0f * scale),
+        0xFF9A9A9A, label);
+
+    char rangeLabel[48];
+    snprintf(rangeLabel, sizeof(rangeLabel) - 1, "max %.0f ms", s_rangeMs);
+    dl->AddText(ImVec2(g1.x - ImGui::CalcTextSize(rangeLabel).x,
+        panelTop + 3.0f * scale), 0xFF9A9A9A, rangeLabel);
+}
 
 VOID ImageBufferPrewarmRendererSeen(Renderer* pRenderer)
 {
