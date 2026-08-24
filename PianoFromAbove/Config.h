@@ -291,27 +291,27 @@ public:
 
     void SetVisualSettings(const VisualSettings &VisualSettings) { m_VisualSettings = VisualSettings; }
     void SetAudioSettings(const AudioSettings &audioSettings) { m_AudioSettings = audioSettings; }
-    void SetVideoSettings(const VideoSettings &VideoSettings) { m_VideoSettings = VideoSettings; }
+    void SetVideoSettings(const VideoSettings &videoSettings) { m_VideoSettings = videoSettings; }
     void SetControlsSettings(const ControlsSettings &ControlsSettings) { m_ControlsSettings = ControlsSettings; }
-    void SetVizSettings(const VizSettings &VizSettings) { m_VizSettings = VizSettings; }
+    void SetVizSettings(const VizSettings& VizSettings) { m_VizSettings = VizSettings; }
 
-    SongLibrary& GetSongLibrary() { return m_SongLibrary; }
-    const SongLibrary& GetSongLibrary() const { return m_SongLibrary; }
-
-    bool IsSet() { return m_bIsSet; }
+    // i really need to start writting getters and setters
+    bool m_bManualTimer = false;
+    bool m_bPianoOverride = false;
 
 private:
+    // Singleton
     Config();
-    Config( Config const& );
-    Config& operator=( Config const& );
+    ~Config() {}
+    Config( const Config& );
+    Config &operator=( const Config& );
 
-    bool m_bIsSet;
     VisualSettings m_VisualSettings;
     AudioSettings m_AudioSettings;
     VideoSettings m_VideoSettings;
     ControlsSettings m_ControlsSettings;
+    SongLibrary m_SongLibrary;
     PlaybackSettings m_PlaybackSettings;
     ViewSettings m_ViewSettings;
     VizSettings m_VizSettings;
-    SongLibrary m_SongLibrary;
 };
