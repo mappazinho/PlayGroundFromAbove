@@ -1,0 +1,280 @@
+name: Apply final UI/audio/bloom fixes
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/stop-replay-nerdstats-gui-theme-bloom'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply source fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              n = text.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {n}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          # ---- Stop -> Play scheduler restart ----
+          audio = 'PianoFromAbove/PlaybackAudioThread.inc'
+          replace_once(audio,
+          '''void MainScreen::StopPlaybackAudioThread()\n{\n    m_bPlaybackAudioExit.store(true, std::memory_order_release);\n    if (m_PlaybackAudioThread.joinable() && m_PlaybackAudioThread.get_id() != std::this_thread::get_id())\n        m_PlaybackAudioThread.join();\n    m_bPlaybackAudioRunning.store(false, std::memory_order_release);\n    m_bPlaybackAudioLiveEnabled.store(false, std::memory_order_release);\n    m_dPlaybackAudioSchedulerHz.store(0.0, std::memory_order_relaxed);\n}\n''',
+          '''void MainScreen::StopPlaybackAudioThread()\n{\n    m_bPlaybackAudioExit.store(true, std::memory_order_release);\n    if (m_PlaybackAudioThread.joinable() && m_PlaybackAudioThread.get_id() != std::this_thread::get_id())\n        m_PlaybackAudioThread.join();\n    m_bPlaybackAudioRunning.store(false, std::memory_order_release);\n    m_bPlaybackAudioLiveEnabled.store(false, std::memory_order_release);\n    m_dPlaybackAudioSchedulerHz.store(0.0, std::memory_order_relaxed);\n\n    // A Stop is a real output-session boundary. Clear the UI-side transition\n    // cache as well as the worker so the next Play cannot inherit a stale\n    // provider/live state from the previous run.\n    m_bPlaybackAudioControlInitialized = false;\n    m_bPlaybackAudioLastPaused = true;\n    m_bPlaybackAudioLastLive = false;\n    m_bPlaybackAudioLastKDMAPI = false;\n    m_iPlaybackAudioLastDevice = -2;\n    m_dPlaybackAudioLastSpeed = 1.0;\n}\n''', 'stop cache reset')
+
+          replace_once(audio,
+          '''GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)\n{\n    const long long before = m_llStartTime;\n    GameError result = MsgProcLegacy(hWnd, msg, wParam, lParam);\n    if (!IsFreePlay() && m_llStartTime != before) {\n        StartPlaybackAudioThread();\n        PlaybackAudioSeek(m_llStartTime);\n    }\n    return result;\n}\n''',
+          '''GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)\n{\n    const long long before = m_llStartTime;\n    const bool wasPaused = Config::GetConfig().GetPlaybackSettings().GetPaused();\n    GameError result = MsgProcLegacy(hWnd, msg, wParam, lParam);\n    const bool nowPaused = Config::GetConfig().GetPlaybackSettings().GetPaused();\n\n    const bool isStop = msg == WM_COMMAND && LOWORD(wParam) == ID_PLAY_STOP;\n    if (isStop) {\n        // Tear the output provider down completely at Stop. The following Play\n        // starts a fresh scheduler/provider and reseeks from the reset position.\n        StopPlaybackAudioThread();\n        m_llPlaybackAudioControlSongUs.store(m_llStartTime, std::memory_order_relaxed);\n        m_llPlaybackAudioClockUs.store(m_llStartTime, std::memory_order_relaxed);\n        return result;\n    }\n\n    if (!IsFreePlay() && wasPaused && !nowPaused) {\n        StartPlaybackAudioThread();\n        PlaybackAudioSeek(m_llStartTime);\n        SyncPlaybackAudioThread(true);\n    } else if (!IsFreePlay() && m_llStartTime != before) {\n        StartPlaybackAudioThread();\n        PlaybackAudioSeek(m_llStartTime);\n    }\n    return result;\n}\n''', 'stop/play message restart')
+
+          # ---- Audio FPS belongs to Nerd Stats, not frametime panel ----
+          replace_once('PianoFromAbove/GameState.cpp',
+          '''    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);\n    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;\n    const double audioSchedulerHz = statsScreen ? statsScreen->GetAudioSchedulerFPSForOverlay() : 0.0;\n''',
+          '''    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);\n    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;\n''', 'remove audio fps from graph capture')
+
+          replace_once('PianoFromAbove/GameState.cpp',
+          '''    char label[128];\n    if (audioSchedulerHz > 0.0)\n        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS  |  Audio %.0f FPS", currentMs, currentFps, audioSchedulerHz);\n    else\n        snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);\n''',
+          '''    char label[96];\n    snprintf(label, sizeof(label) - 1, "Frame %.1f ms / %.0f FPS", currentMs, currentFps);\n''', 'frametime label only')
+
+          gs = 'PianoFromAbove/GameStateLegacy.inc'
+          replace_once(gs,
+          '''    if (viz.bNerdStats)\n        iLines += 7;\n''',
+          '''    if (viz.bNerdStats)\n        iLines += 8;\n''', 'nerd stat line count')
+
+          replace_once(gs,
+          '''        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "NPS:", "%lld", nps);\n        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Rendered:", "%llu", m_pRenderer->GetRenderedNotesCount());\n''',
+          '''        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "NPS:", "%lld", nps);\n        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Audio FPS:", "%.0f",\n            m_dPlaybackAudioSchedulerHz.load(std::memory_order_relaxed));\n        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Rendered:", "%llu", m_pRenderer->GetRenderedNotesCount());\n''', 'audio fps nerd stat')
+
+          # ---- Persistent ImGui color customization ----
+          replace_once('PianoFromAbove/Config.h',
+          '''    bool bDisableUI;\n    float fUIScale;\n    std::wstring sUIFont;\n''',
+          '''    bool bDisableUI;\n    float fUIScale;\n    std::wstring sUIFont;\n    bool bCustomGUIColors;\n    unsigned int uGUIPaletteBase;\n    std::vector<unsigned int> vGUIColors;\n''', 'gui theme config fields')
+
+          replace_once('PianoFromAbove/Config.cpp',
+          '''    this->bDisableUI = false;\n    this->fUIScale = 1.0f;\n    this->sUIFont = L"";\n''',
+          '''    this->bDisableUI = false;\n    this->fUIScale = 1.0f;\n    this->sUIFont = L"";\n    this->bCustomGUIColors = false;\n    // ImGui packed ABGR: RGB(64, 140, 255).\n    this->uGUIPaletteBase = 0xFFFF8C40u;\n    this->vGUIColors.clear();\n''', 'gui theme defaults')
+
+          replace_once('PianoFromAbove/Config.cpp',
+          '''    txViz->QueryStringAttribute("UIFont", &sTempStr);\n    sUIFont = Util::StringToWstring(sTempStr);\n    if (txViz->QueryIntAttribute("BounceStats", &iAttrVal) == TIXML_SUCCESS)\n''',
+          '''    txViz->QueryStringAttribute("UIFont", &sTempStr);\n    sUIFont = Util::StringToWstring(sTempStr);\n    if (txViz->QueryIntAttribute("CustomGUIColors", &iAttrVal) == TIXML_SUCCESS)\n        bCustomGUIColors = (iAttrVal != 0);\n    if (const char* base = txViz->Attribute("GUIPaletteBase"))\n        uGUIPaletteBase = (unsigned int)strtoul(base, nullptr, 16);\n    vGUIColors.clear();\n    if (TiXmlElement* txColors = txViz->FirstChildElement("GUIColors")) {\n        for (TiXmlElement* txColor = txColors->FirstChildElement("Color"); txColor;\n             txColor = txColor->NextSiblingElement("Color")) {\n            const char* value = txColor->Attribute("Value");\n            if (value)\n                vGUIColors.push_back((unsigned int)strtoul(value, nullptr, 16));\n        }\n    }\n    if (txViz->QueryIntAttribute("BounceStats", &iAttrVal) == TIXML_SUCCESS)\n''', 'gui theme load')
+
+          replace_once('PianoFromAbove/Config.cpp',
+          '''    txViz->SetDoubleAttribute("UIScale", fUIScale);\n    txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));\n    txViz->SetAttribute("BounceStats", bBounceStats);\n''',
+          '''    txViz->SetDoubleAttribute("UIScale", fUIScale);\n    txViz->SetAttribute("UIFont", Util::WstringToString(sUIFont));\n    txViz->SetAttribute("CustomGUIColors", bCustomGUIColors);\n    char guiBase[16] = {};\n    sprintf_s(guiBase, "%08X", uGUIPaletteBase);\n    txViz->SetAttribute("GUIPaletteBase", guiBase);\n    if (!vGUIColors.empty()) {\n        TiXmlElement* txColors = new TiXmlElement("GUIColors");\n        txViz->LinkEndChild(txColors);\n        for (unsigned int color : vGUIColors) {\n            TiXmlElement* txColor = new TiXmlElement("Color");\n            char value[16] = {};\n            sprintf_s(value, "%08X", color);\n            txColor->SetAttribute("Value", value);\n            txColors->LinkEndChild(txColor);\n        }\n    }\n    txViz->SetAttribute("BounceStats", bBounceStats);\n''', 'gui theme save')
+
+          rb = 'PianoFromAbove/RendererBaseLegacy.inc'
+          helper_anchor = '''void Renderer::RenderImGuiFrame() {\n    auto& io = ImGui::GetIO();\n    auto& viz = Config::GetConfig().GetVizSettings();\n'''
+          helper_code = r'''static ImVec4 PGFAGuiColorFromHSV(float h, float s, float v, float a = 1.0f)
+{
+    while (h < 0.0f) h += 1.0f;
+    while (h >= 1.0f) h -= 1.0f;
+    float r, g, b;
+    ImGui::ColorConvertHSVtoRGB(h, max(0.0f, min(s, 1.0f)), max(0.0f, min(v, 1.0f)), r, g, b);
+    return ImVec4(r, g, b, a);
+}
+
+static void PGFAGenerateGuiPalette(VizSettings& viz, const ImVec4& base)
+{
+    ImGuiStyle generated;
+    ImGui::StyleColorsDark(&generated);
+    float h = 0.0f, s = 0.0f, v = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(base.x, base.y, base.z, h, s, v);
+    s = max(s, 0.35f);
+
+    auto c = [&](float value, float satScale = 1.0f, float alpha = 1.0f, float hueShift = 0.0f) {
+        return PGFAGuiColorFromHSV(h + hueShift, min(1.0f, s * satScale), value, alpha);
+    };
+    ImVec4* col = generated.Colors;
+    col[ImGuiCol_Text] = c(0.95f, 0.10f);
+    col[ImGuiCol_TextDisabled] = c(0.55f, 0.18f);
+    col[ImGuiCol_WindowBg] = c(0.075f, 0.35f, 0.96f);
+    col[ImGuiCol_ChildBg] = c(0.060f, 0.30f, 0.92f);
+    col[ImGuiCol_PopupBg] = c(0.090f, 0.38f, 0.98f);
+    col[ImGuiCol_Border] = c(0.42f, 0.65f, 0.55f);
+    col[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+    col[ImGuiCol_FrameBg] = c(0.15f, 0.65f, 0.95f);
+    col[ImGuiCol_FrameBgHovered] = c(0.30f, 0.90f, 0.95f);
+    col[ImGuiCol_FrameBgActive] = c(0.40f, 1.00f, 1.00f);
+    col[ImGuiCol_TitleBg] = c(0.095f, 0.48f, 1.00f);
+    col[ImGuiCol_TitleBgActive] = c(0.22f, 0.90f, 1.00f);
+    col[ImGuiCol_TitleBgCollapsed] = c(0.075f, 0.35f, 0.80f);
+    col[ImGuiCol_MenuBarBg] = c(0.10f, 0.45f, 1.00f);
+    col[ImGuiCol_ScrollbarBg] = c(0.055f, 0.25f, 0.80f);
+    col[ImGuiCol_ScrollbarGrab] = c(0.25f, 0.65f, 0.90f);
+    col[ImGuiCol_ScrollbarGrabHovered] = c(0.38f, 0.90f, 1.00f);
+    col[ImGuiCol_ScrollbarGrabActive] = c(0.50f, 1.00f, 1.00f);
+    col[ImGuiCol_CheckMark] = c(0.98f, 0.90f);
+    col[ImGuiCol_SliderGrab] = c(0.72f, 0.95f);
+    col[ImGuiCol_SliderGrabActive] = c(1.00f, 0.95f);
+    col[ImGuiCol_Button] = c(0.23f, 0.85f, 0.85f);
+    col[ImGuiCol_ButtonHovered] = c(0.40f, 1.00f, 0.95f);
+    col[ImGuiCol_ButtonActive] = c(0.52f, 1.00f, 1.00f);
+    col[ImGuiCol_Header] = c(0.22f, 0.85f, 0.80f);
+    col[ImGuiCol_HeaderHovered] = c(0.38f, 1.00f, 0.90f);
+    col[ImGuiCol_HeaderActive] = c(0.48f, 1.00f, 1.00f);
+    col[ImGuiCol_Separator] = c(0.35f, 0.60f, 0.60f);
+    col[ImGuiCol_SeparatorHovered] = c(0.62f, 1.00f, 0.90f);
+    col[ImGuiCol_SeparatorActive] = c(0.82f, 1.00f, 1.00f);
+    col[ImGuiCol_ResizeGrip] = c(0.34f, 0.85f, 0.45f);
+    col[ImGuiCol_ResizeGripHovered] = c(0.58f, 1.00f, 0.85f);
+    col[ImGuiCol_ResizeGripActive] = c(0.82f, 1.00f, 0.95f);
+    col[ImGuiCol_Tab] = c(0.13f, 0.55f, 0.95f);
+    col[ImGuiCol_TabHovered] = c(0.40f, 1.00f, 0.95f);
+    col[ImGuiCol_TabActive] = c(0.30f, 0.95f, 1.00f);
+    col[ImGuiCol_TabUnfocused] = c(0.09f, 0.35f, 0.90f);
+    col[ImGuiCol_TabUnfocusedActive] = c(0.19f, 0.68f, 1.00f);
+    col[ImGuiCol_PlotLines] = c(0.78f, 0.55f);
+    col[ImGuiCol_PlotLinesHovered] = c(1.00f, 1.00f);
+    col[ImGuiCol_PlotHistogram] = c(0.88f, 0.90f, 1.0f, 0.08f);
+    col[ImGuiCol_PlotHistogramHovered] = c(1.00f, 1.00f, 1.0f, 0.08f);
+    col[ImGuiCol_TableHeaderBg] = c(0.16f, 0.55f);
+    col[ImGuiCol_TableBorderStrong] = c(0.36f, 0.55f);
+    col[ImGuiCol_TableBorderLight] = c(0.22f, 0.45f);
+    col[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
+    col[ImGuiCol_TableRowBgAlt] = c(0.14f, 0.25f, 0.40f);
+    col[ImGuiCol_TextSelectedBg] = c(0.48f, 1.00f, 0.45f);
+    col[ImGuiCol_DragDropTarget] = c(1.00f, 1.00f, 0.95f);
+    col[ImGuiCol_NavHighlight] = c(0.86f, 1.00f, 1.00f);
+    col[ImGuiCol_NavWindowingHighlight] = c(1.00f, 0.25f, 0.70f);
+    col[ImGuiCol_NavWindowingDimBg] = c(0.05f, 0.20f, 0.35f);
+    col[ImGuiCol_ModalWindowDimBg] = c(0.03f, 0.20f, 0.72f);
+
+    viz.vGUIColors.resize(ImGuiCol_COUNT);
+    for (int i = 0; i < ImGuiCol_COUNT; ++i)
+        viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(col[i]);
+    viz.bCustomGUIColors = true;
+}
+
+static void PGFAApplyGuiPalette(VizSettings& viz)
+{
+    static bool captured = false;
+    static ImVec4 defaults[ImGuiCol_COUNT];
+    ImGuiStyle& style = ImGui::GetStyle();
+    if (!captured) {
+        for (int i = 0; i < ImGuiCol_COUNT; ++i)
+            defaults[i] = style.Colors[i];
+        captured = true;
+    }
+
+    if (viz.vGUIColors.size() != ImGuiCol_COUNT) {
+        viz.vGUIColors.resize(ImGuiCol_COUNT);
+        for (int i = 0; i < ImGuiCol_COUNT; ++i)
+            viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(defaults[i]);
+    }
+
+    for (int i = 0; i < ImGuiCol_COUNT; ++i)
+        style.Colors[i] = viz.bCustomGUIColors
+            ? ImGui::ColorConvertU32ToFloat4(viz.vGUIColors[i])
+            : defaults[i];
+}
+
+void Renderer::RenderImGuiFrame() {
+    auto& io = ImGui::GetIO();
+    auto& viz = Config::GetConfig().GetVizSettings();
+    PGFAApplyGuiPalette(viz);
+'''
+          replace_once(rb, helper_anchor, helper_code, 'gui palette helpers')
+
+          customize_anchor = '''                    ImGui::SliderFloat("UI Scale", &viz.fUIScale, 0.1f, 10.0f, "%.2f");\n                    ImGui::EndTabItem();\n                }\n                ImGui::EndTabBar();\n'''
+          customize_code = r'''                    ImGui::SliderFloat("UI Scale", &viz.fUIScale, 0.1f, 10.0f, "%.2f");
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Customize")) {
+                    PGFAApplyGuiPalette(viz);
+                    ImGui::Checkbox("Use custom GUI colors", &viz.bCustomGUIColors);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset to default")) {
+                        viz.bCustomGUIColors = false;
+                        viz.vGUIColors.clear();
+                        PGFAApplyGuiPalette(viz);
+                    }
+
+                    ImVec4 base = ImGui::ColorConvertU32ToFloat4(viz.uGUIPaletteBase);
+                    if (ImGui::ColorEdit3("Palette base color", &base.x)) {
+                        base.w = 1.0f;
+                        viz.uGUIPaletteBase = ImGui::ColorConvertFloat4ToU32(base);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Generate palette"))
+                        PGFAGenerateGuiPalette(viz, base);
+                    ImGui::TextDisabled("Generates a dark UI palette around one hue; individual colors remain editable below.");
+                    ImGui::Separator();
+
+                    if (viz.vGUIColors.size() != ImGuiCol_COUNT)
+                        PGFAApplyGuiPalette(viz);
+                    if (ImGui::BeginChild("##GuiColorParameters", ImVec2(0, 0), true)) {
+                        for (int i = 0; i < ImGuiCol_COUNT; ++i) {
+                            ImGui::PushID(i);
+                            ImVec4 color = ImGui::ColorConvertU32ToFloat4(viz.vGUIColors[i]);
+                            ImGui::SetNextItemWidth(180.0f);
+                            if (ImGui::ColorEdit4("##color", &color.x, ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf)) {
+                                viz.vGUIColors[i] = ImGui::ColorConvertFloat4ToU32(color);
+                                viz.bCustomGUIColors = true;
+                            }
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted(ImGui::GetStyleColorName(i));
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+'''
+          replace_once(rb, customize_anchor, customize_code, 'customize tab')
+
+          # ---- Bloom must get a fresh scene capture even when normal blur is disabled ----
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc',
+          '''    if (!g_bDisableBlur)\n        ApplyBlur();\n\n    const auto& bloomViz = Config::GetConfig().GetVizSettings();\n''',
+          '''    const auto& bloomViz = Config::GetConfig().GetVizSettings();\n    if (!g_bDisableBlur) {\n        ApplyBlur();\n    } else if (bloomViz.bBloom && m_pSceneCopy) {\n        // Bloom shares the scene-copy texture with the normal blur pipeline.\n        // Capture it even when UI/background blur is disabled so bloom always\n        // extracts from the current frame rather than stale texture contents.\n        ID3D11Resource* backbuffer = nullptr;\n        m_pRTVs[m_uFrameIndex]->GetResource(&backbuffer);\n        if (backbuffer) {\n            m_pContext->CopyResource(m_pSceneCopy.Get(), backbuffer);\n            backbuffer->Release();\n        }\n    }\n\n''', 'D3D11 bloom scene capture')
+
+          replace_once('PianoFromAbove/RendererD3D12Legacy.inc',
+          '''    if (!g_bDisableBlur)\n        ApplyBlur();\n\n    const auto& bloomViz = Config::GetConfig().GetVizSettings();\n''',
+          '''    const auto& bloomViz = Config::GetConfig().GetVizSettings();\n    if (!g_bDisableBlur) {\n        ApplyBlur();\n    } else if (bloomViz.bBloom && m_pSceneCopy) {\n        // Normal blur owns the scene copy in the legacy path; bloom needs the\n        // same fresh capture even when that blur work is disabled.\n        auto* backbuffer = m_pRenderTargets[m_uFrameIndex].Get();\n        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(backbuffer,\n            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);\n        m_pCommandList->ResourceBarrier(1, &toCopy);\n        if (m_SceneCopyState != D3D12_RESOURCE_STATE_COPY_DEST) {\n            auto sceneToCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_pSceneCopy.Get(),\n                m_SceneCopyState, D3D12_RESOURCE_STATE_COPY_DEST);\n            m_pCommandList->ResourceBarrier(1, &sceneToCopy);\n            m_SceneCopyState = D3D12_RESOURCE_STATE_COPY_DEST;\n        }\n        m_pCommandList->CopyResource(m_pSceneCopy.Get(), backbuffer);\n        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(backbuffer,\n            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);\n        m_pCommandList->ResourceBarrier(1, &fromCopy);\n        auto sceneToRead = CD3DX12_RESOURCE_BARRIER::Transition(m_pSceneCopy.Get(),\n            m_SceneCopyState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);\n        m_pCommandList->ResourceBarrier(1, &sceneToRead);\n        m_SceneCopyState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;\n    }\n\n''', 'D3D12 bloom scene capture')
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'A Stop is a real output-session boundary' PianoFromAbove/PlaybackAudioThread.inc
+          grep -F 'Audio FPS:' PianoFromAbove/GameStateLegacy.inc
+          ! grep -F 'Audio %.0f FPS' PianoFromAbove/GameState.cpp
+          grep -F 'BeginTabItem("Customize")' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'Generate palette' PianoFromAbove/RendererBaseLegacy.inc
+          grep -F 'GUIColors' PianoFromAbove/Config.cpp
+          grep -F 'Capture it even when UI/background blur is disabled' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'same fresh capture even when that blur work is disabled' PianoFromAbove/RendererD3D12Legacy.inc
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix stop replay, move audio FPS, add GUI themes, preserve bloom'
+          git push origin HEAD:${{ github.head_ref }}
