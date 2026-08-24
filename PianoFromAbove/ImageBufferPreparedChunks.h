@@ -859,25 +859,40 @@ inline void ImageBufferPreparedPrimeAllDense(
     const long long last = ImageBufferPreparedFloorDiv(
         ImageBufferOverlapSaturatingAdd(lastStart, margin), timeSpan) + 1;
 
-    size_t denseCount = 0;
-    for (long long chunk = first; chunk <= last; ++chunk) {
+    std::vector<std::pair<long long, size_t>> dense;
+    dense.reserve((size_t)(last - first + 1));
+    for (long long center = first; center <= last; ++center) {
         const size_t estimate = ImageBufferPreparedEstimateStarts(
-            *source, chunk, timeSpan, margin, tickMode);
-        if (estimate < ImageBufferPreparedDenseThreshold)
-            continue;
-
-        ++denseCount;
-        const ImageBufferPreparedKey key{ source.get(), chunk, signature };
-        const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
-            chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
-        const long long distance = chunk >= first ? chunk - first : 0;
-        const int priority = 10 + (int)(std::min)(distance, 1000000LL);
-        manager.Schedule(key, source, params, priority, estimate, true);
+  *source, center, timeSpan, margin, tickMode);
+        if (estimate >= ImageBufferPreparedDenseThreshold)
+  dense.push_back({ center, estimate });
     }
 
-    char log[160];
-    sprintf_s(log, "imgprep:full-prime dense=%zu horizon=%lld..%lld",
-        denseCount, first, last);
+    std::unordered_set<long long> scheduled;
+    for (const auto& center : dense) {
+        const long long lo = (std::max)(first,
+  center.first - (long long)ImageBufferPreparedPreloadRadius);
+        const long long hi = (std::min)(last,
+  center.first + (long long)ImageBufferPreparedPreloadRadius);
+        for (long long chunk = lo; chunk <= hi; ++chunk) {
+  const bool firstSchedule = scheduled.insert(chunk).second;
+  const size_t estimate = ImageBufferPreparedEstimateStarts(
+      *source, chunk, timeSpan, margin, tickMode);
+  const ImageBufferPreparedKey key{ source.get(), chunk, signature };
+  const ImageBufferPreparedParams params = ImageBufferPreparedMakeParams(
+      chunk, timeSpan, margin, tickMode, corruption, trackCount, rows);
+  const int priority = 10 + (int)(std::min)(
+      std::llabs(chunk - center.first), 1000000LL);
+  // Schedule duplicates too: Schedule() is idempotent, but a chunk
+  // reached from a nearer dense center may receive a better priority.
+  manager.Schedule(key, source, params, priority, estimate, true);
+  (void)firstSchedule;
+        }
+    }
+
+    char log[176];
+    sprintf_s(log, "imgprep:full-prime dense=%zu jobs=%zu horizon=%lld..%lld",
+        dense.size(), scheduled.size(), first, last);
     HeartbeatLog(log);
 }
 

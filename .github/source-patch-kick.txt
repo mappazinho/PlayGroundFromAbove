@@ -1,1 +1,0 @@
-Trigger actual source materialization after compile-only CI fix.

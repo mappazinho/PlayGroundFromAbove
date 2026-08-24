@@ -2,6 +2,7 @@
 #include "Renderer.h"
 #include "ImageBufferMultipass.h"
 #include "ImageBufferPreparedChunks.h"
+#include "ImageBufferGpuPins.h"
 #include <cmath>
 #include <unordered_map>
 
@@ -333,7 +334,8 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
             for (unsigned i = 0; i < ChunkPoolSize; ++i) {
                 if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||
                     m_ChunkCache[i].chunk == ImageBufferInvalidChunk ||
-                    m_ChunkCache[i].chunk == ImageBufferInvalidChunk - 1)
+                    m_ChunkCache[i].chunk == ImageBufferInvalidChunk - 1 ||
+                    ImageBufferChunkPinned(this, m_ChunkCache[i].chunk))
                     continue;
                 if (m_ChunkCache[i].lastUsed < oldest) {
                     oldest = m_ChunkCache[i].lastUsed;

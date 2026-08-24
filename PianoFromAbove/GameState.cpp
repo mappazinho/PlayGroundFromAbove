@@ -23,6 +23,7 @@
 #include "ImageBufferMultipass.h"
 #include "ImageBufferOverlapIndex.h"
 #include "ImageBufferPreparedChunks.h"
+#include "ImageBufferGpuPins.h"
 
 // The immutable full-song prepared source is deliberately a memory-for-speed
 // optimization. Its persistent cost is driven by the number of notes stored in
@@ -141,6 +142,7 @@ static void UpdateImageBufferPrewarmGpuProgress(
         return;
 
     if (cpu.unsupported) {
+        ImageBufferClearPinnedChunks(renderer);
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         s_ImageBufferPrewarmGpu.owner = owner;
         s_ImageBufferPrewarmGpu.renderer = renderer;
@@ -191,8 +193,12 @@ static void UpdateImageBufferPrewarmGpuProgress(
 
     // The cache is associative: sparse chunks elsewhere in the song do not
     // matter. Only the dense/preload working set has to fit in the 64 slots.
+    // Keep a few slots free for visible sparse chunks. Without this
+    // reserve, a fully pinned dense set could leave ordinary playback nowhere
+    // to cache the current screen.
+    static constexpr size_t kImageBufferRuntimeReserveSlots = 8;
     const bool fitsTextureCache =
-        prewarmChunks.size() <= (size_t)Renderer::ChunkPoolSize;
+        prewarmChunks.size() <= (size_t)Renderer::ChunkPoolSize - kImageBufferRuntimeReserveSlots;
 
     // A failed full-prime center falls back to exact rendering. Do not make Play
     // wait forever for a texture that cannot be produced.
@@ -200,6 +206,14 @@ static void UpdateImageBufferPrewarmGpuProgress(
     const size_t cached = requireGpu
         ? CountImageBufferPrewarmCached(renderer, prewarmChunks)
         : 0;
+
+    // Protect the exact set Play waited for from speculative-lookahead LRU
+    // eviction. This is what turns prewarm into lasting residency rather than
+    // work that can be thrown away before the dense passage is reached.
+    if (requireGpu)
+        ImageBufferSetPinnedChunks(renderer, prewarmChunks);
+    else
+        ImageBufferClearPinnedChunks(renderer);
 
     std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
     const bool keepPlayRequest = s_ImageBufferPrewarmGpu.playRequested;
@@ -238,9 +252,12 @@ static void DrawImageBufferPrewarmProgress(
         }
     }
 
+    // Never leave a stale 0/N prewarm bar on screen after the Play
+    // request has been cancelled or the gate has legitimately opened.
+    if (!playRequested)
+        return;
+
     if (!cpu.initialized) {
-        if (!playRequested)
-            return;
         initializing = true;
         done = 0;
         total = 1;
@@ -434,21 +451,6 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
                                     imageBufferPrewarmTickMode, imageBufferPrewarmCorrupt, \
                                     imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows, \
                                     imageBufferPrewarmSignature); \
-                                const long long imageBufferPrewarmFirstStart = ImageBufferPreparedStartValue( \
-                                    imageBufferPrewarmSource->notes.front(), imageBufferPrewarmTickMode); \
-                                const long long imageBufferPrewarmLastStart = ImageBufferPreparedStartValue( \
-                                    imageBufferPrewarmSource->notes.back(), imageBufferPrewarmTickMode); \
-                                const long long imageBufferPrewarmFirst = ImageBufferPreparedFloorDiv( \
-                                    ImageBufferOverlapSaturatingAdd(imageBufferPrewarmFirstStart, -imageBufferPrewarmE), \
-                                    imageBufferPrewarmT) - 1; \
-                                const long long imageBufferPrewarmLast = ImageBufferPreparedFloorDiv( \
-                                    ImageBufferOverlapSaturatingAdd(imageBufferPrewarmLastStart, imageBufferPrewarmE), \
-                                    imageBufferPrewarmT) + 1; \
-                                ImageBufferPreparedPrime( \
-                                    imageBufferPrewarmSource, imageBufferPrewarmFirst, imageBufferPrewarmLast, \
-                                    imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode, \
-                                    imageBufferPrewarmCorrupt, imageBufferPrewarmSelf->m_vTrackSettings.size(), \
-                                    imageBufferPrewarmRows, imageBufferPrewarmSignature); \
                                 UpdateImageBufferPrewarmGpuProgress( \
                                     imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, \
                                     imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode); \
@@ -513,6 +515,9 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     if (!viz.bSysStats || g_bVideoRendering)
         return;
 
+    const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
+    const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
+
     if (frameMs > 0.05f && frameMs < 5000.0f) {
         s_history.push_back(frameMs);
         if (s_history.size() > 600)
@@ -522,6 +527,7 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     ImDrawList* dl = renderer->GetDrawList();
     if (!dl)
         return;
+    const int frameTimeVtxStart = dl->VtxBuffer.Size;
 
     const float scale = (std::max)(viz.fUIScale, 0.5f);
     const float bh = (float)renderer->GetBufferHeight();
@@ -600,6 +606,13 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     snprintf(rangeLabel, sizeof(rangeLabel) - 1, "max %.0f ms", s_rangeMs);
     dl->AddText(ImVec2(g1.x - ImGui::CalcTextSize(rangeLabel).x,
         panelTop + 3.0f * scale), 0xFF9A9A9A, rangeLabel);
+
+    // Match Sys Stats exactly: same yaw, same beat scale, same perspective.
+    const int frameTimeVtxEnd = dl->VtxBuffer.Size;
+    const ImVec2 frameTimeCenter((panelLeft + panelRight) * 0.5f,
+        (panelTop + panelBottom) * 0.5f);
+    Apply3DTilt(dl, frameTimeVtxStart, frameTimeVtxEnd, frameTimeCenter,
+        0.20f, bounceScale, 750.0f);
 }
 
 VOID ImageBufferPrewarmRendererSeen(Renderer* pRenderer)
@@ -616,6 +629,7 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
         {
             std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
             s_ImageBufferPrewarmGpu.playRequested = false;
+            ImageBufferClearPinnedChunks(s_ImageBufferPrewarmGpu.renderer);
         }
         ImageBufferPreparedCancelPlaybackGate();
         return;
@@ -626,6 +640,7 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
         {
             std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
             s_ImageBufferPrewarmGpu.playRequested = false;
+            ImageBufferClearPinnedChunks(s_ImageBufferPrewarmGpu.renderer);
         }
         ImageBufferPreparedCancelPlaybackGate();
         return;

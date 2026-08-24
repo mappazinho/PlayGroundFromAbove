@@ -26,6 +26,7 @@ class MIDIEvent;
 class MIDIMetaEvent;
 class MIDISysExEvent;
 class MIDIPos;
+class ParallelMIDIPos;
 
 // the MIDI object (SoA). The handle itself is 4 bytes; before this change every
 typedef uint32_t MIDIChannelEvent;
@@ -199,6 +200,7 @@ public:
     void ReleaseOwnedData( void );
 
     friend class MIDIPos;
+    friend class ParallelMIDIPos;
     friend class MIDITrack;
     friend class MIDIEvent;
 
@@ -263,6 +265,7 @@ public:
     void clear( void );
 
     friend class MIDIPos;
+    friend class ParallelMIDIPos;
     friend class MIDI;
 
     struct MIDITrackInfo
@@ -417,11 +420,15 @@ private:
 class MIDILoadingProgress {
 public:
     enum Stage { CopyToMem, Decompress, ParseTracks, ConnectNotes, SortEvents, Finalize, Done };
+    static constexpr unsigned MaxSortWorkers = 64;
 
     Stage stage;
     std::wstring name;
     std::atomic<uint64_t> progress;
     uint64_t max;
+    std::atomic<unsigned> sortWorkerCount{ 0 };
+    std::atomic<uint64_t> sortProgress[MaxSortWorkers]{};
+    std::atomic<uint64_t> sortMax[MaxSortWorkers]{};
 };
 
 extern MIDILoadingProgress g_LoadingProgress;

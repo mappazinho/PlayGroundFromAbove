@@ -175,6 +175,7 @@ public:
 
     bool IsValid() const { return m_MIDI.IsValid(); }
     const MIDI& GetMIDI() const { return m_MIDI; }
+    float GetStatsBounceScaleForOverlay() const { return GetStatsBounceScale(); }
 
     void ToggleMuted( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bMuted =
                                                   !m_vTrackSettings[iTrack].aChannels[iChannel].bMuted; }
