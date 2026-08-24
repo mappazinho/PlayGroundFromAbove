@@ -384,6 +384,7 @@ void RenderText();
     std::atomic<bool> m_bPlaybackAudioLiveEnabled{ false };
     std::atomic<bool> m_bPlaybackAudioPaused{ true };
     std::atomic<bool> m_bPlaybackAudioMute{ false };
+    std::atomic<bool> m_bPlaybackAudioPianoOverride{ false };
     std::atomic<bool> m_bPlaybackAudioWantKDMAPI{ false };
     std::atomic<int> m_iPlaybackAudioDevice{ -1 };
     std::atomic<double> m_dPlaybackAudioSpeed{ 1.0 };

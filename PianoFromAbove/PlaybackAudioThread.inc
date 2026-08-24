@@ -201,6 +201,33 @@ public:
         return true;
     }
 
+    // Pause/mute must silence currently sounding notes without resetting
+    // channel/program state. The scheduler never queues future host events, so
+    // All Notes Off + sustain off is sufficient and avoids expensive synth resets.
+    void Silence()
+    {
+        if (m_mode == Mode::SvmsNative) {
+            if (!m_svms.send_short) return;
+            for (unsigned channel = 0; channel < 16; ++channel) {
+                m_svms.send_short(m_svmsSession,
+                    (uint32_t)(0xB0u | channel | (0x7Bu << 8)));
+                m_svms.send_short(m_svmsSession,
+                    (uint32_t)(0xB0u | channel | (0x40u << 8)));
+            }
+            return;
+        }
+        if (m_mode == Mode::KDMAPI) {
+            if (!m_sendDirectData) return;
+            for (unsigned channel = 0; channel < 16; ++channel) {
+                m_sendDirectData((DWORD)(0xB0u | channel | (0x7Bu << 8)));
+                m_sendDirectData((DWORD)(0xB0u | channel | (0x40u << 8)));
+            }
+            return;
+        }
+        if (m_mode == Mode::WinMM)
+            m_winmm.AllNotesOff();
+    }
+
     void Panic()
     {
         if (m_mode == Mode::SvmsNative) {
@@ -395,6 +422,7 @@ void MainScreen::SyncPlaybackAudioThread(bool forceSeek)
     const bool live = !g_bVideoRendering && !customAudio && (!preConfigured || s_bPreFailed);
     const bool paused = playback.GetPaused();
     const bool muted = playback.GetMute();
+    const bool pianoOverride = config.m_bPianoOverride;
     const bool wantKDMAPI = viz.bKDMAPI;
     const int device = audio.iOutDevice;
     const double speed = (std::max)(0.0001, playback.GetSpeed());
@@ -409,6 +437,7 @@ void MainScreen::SyncPlaybackAudioThread(bool forceSeek)
     m_bPlaybackAudioLiveEnabled.store(live, std::memory_order_release);
     m_bPlaybackAudioPaused.store(paused, std::memory_order_release);
     m_bPlaybackAudioMute.store(muted, std::memory_order_release);
+    m_bPlaybackAudioPianoOverride.store(pianoOverride, std::memory_order_release);
     m_bPlaybackAudioWantKDMAPI.store(wantKDMAPI, std::memory_order_release);
     m_iPlaybackAudioDevice.store(device, std::memory_order_release);
     m_dPlaybackAudioSpeed.store(speed, std::memory_order_release);
@@ -559,11 +588,11 @@ void MainScreen::PlaybackAudioThreadMain()
         }
         providerWasLive = output.IsOpen();
 
-        // Pause/mute transitions flush once. In particular, do not call reset
-        // on every 1 ms scheduler iteration while paused: some KDMAPI synths do
-        // expensive pool maintenance on ResetKDMAPIStream.
+        // Pause/mute transitions silence once without resetting the synth.
+        // No future host MIDI is queued, so this cannot leave scheduled notes
+        // behind and it preserves program/controller state across resume.
         if ((localPaused && !lastPanicPaused) || (globalMute && !lastPanicMute))
-            output.Panic();
+            output.Silence();
         lastPanicPaused = localPaused;
         lastPanicMute = globalMute;
 
@@ -576,12 +605,12 @@ void MainScreen::PlaybackAudioThreadMain()
         const float corruptor = m_fPlaybackAudioCorruption.load(std::memory_order_acquire);
         const auto muteSnapshot = std::atomic_load_explicit(&m_pPlaybackAudioMuteMask, std::memory_order_acquire);
 
-        // Native SVMS accepts exact QPC timestamps, so queue a tiny future
-        // window. Generic WinMM/KDMAPI stays due-now because those APIs do not
-        // provide a timestamped contract. Either way the iteration cadence is
-        // independent of renderer FPS.
+        // The scheduler itself runs independently at ~1 kHz. Keep the host
+        // cursor strictly due-now even for native SVMS: dense equal-time events
+        // are still submitted as one exact-QPC batch, but pause/mute/provider
+        // changes can never leave already-queued future MIDI behind.
         const bool exactBatch = output.HasExactQpcBatch();
-        const long long lookAheadWallUs = exactBatch ? 8000LL : 0LL;
+        const long long lookAheadWallUs = 0LL;
         const long long deadlineSongUs = songUs + (long long)(lookAheadWallUs * localSpeed + 0.5);
         const size_t startPos = eventPos;
         eventBatch.clear();
@@ -621,7 +650,8 @@ void MainScreen::PlaybackAudioThreadMain()
             }
 
             bool send = true;
-            if (type == MIDI::ProgramChange && m_MIDI.GetEventChannel(event) != MIDI::Drums && Config::GetConfig().m_bPianoOverride)
+            if (type == MIDI::ProgramChange && m_MIDI.GetEventChannel(event) != MIDI::Drums &&
+                m_bPlaybackAudioPianoOverride.load(std::memory_order_acquire))
                 p1 = 0;
             if (type == MIDI::PitchBend) {
                 const int bend = p2;
@@ -717,11 +747,10 @@ GameState::GameError MainScreen::Logic(void)
     StartPlaybackAudioThread();
     SyncPlaybackAudioThread(false);
 
-    // For live synth playback the audio QPC clock is authoritative. Resetting
-    // the legacy frame timer here prevents its old FPS-based elapsed step from
-    // double-advancing the song after we snap visuals to the audio clock.
-    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) &&
-        !m_bPlaybackAudioPaused.load(std::memory_order_acquire) && !g_bVideoRendering) {
+    // For live synth playback the audio QPC clock is authoritative, including
+    // the exact pause position. Resetting the legacy frame timer here prevents
+    // its old FPS-based elapsed step from double-advancing after the snap.
+    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering) {
         const long long audioClock = PlaybackAudioClockNow();
         if (audioClock >= GetMinTime() && audioClock <= GetMaxTime()) {
             m_llStartTime = audioClock;
