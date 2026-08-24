@@ -8,6 +8,7 @@
 *
 *************************************************************************************************/
 #include "MIDI.h"
+#include "ParallelMIDIPos.h"
 #include <fstream>
 #include <stack>
 #include <array>
@@ -1123,7 +1124,7 @@ void MIDI::MIDIInfo::AddTrackInfo( const MIDITrack &mTrack )
 
 void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges, vector<MIDIMetaEvent*>* vMetaEvents, eventvec_t* vTempo, eventvec_t* vSignature, eventvec_t* vMarkers)
 {
-    MIDIPos midiPos( *this );
+    ParallelMIDIPos midiPos( *this );
     bool bIsStandard = midiPos.IsStandard();
     int iTicksPerBeat = midiPos.GetTicksPerBeat();
     int iTicksPerSecond = midiPos.GetTicksPerSecond();

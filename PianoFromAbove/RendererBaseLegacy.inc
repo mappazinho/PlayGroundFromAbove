@@ -1708,6 +1708,24 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             auto progMax = g_LoadingProgress.max;
             float prog = progMax > 0 ? (float)progLoaded / (float)progMax : 0.0f;
             ImGui::ProgressBar(prog, ImVec2(350, 0));
+            const unsigned sortWorkers = g_LoadingProgress.sortWorkerCount.load(std::memory_order_acquire);
+            if (g_LoadingProgress.stage == MIDILoadingProgress::SortEvents && sortWorkers > 0) {
+                ImGui::TextDisabled("%u parallel sort lanes", sortWorkers);
+                const bool twoColumns = sortWorkers > 8;
+                const float laneWidth = twoColumns ? 170.0f : 350.0f;
+                for (unsigned lane = 0; lane < sortWorkers; ++lane) {
+                    const uint64_t laneDone = g_LoadingProgress.sortProgress[lane].load(std::memory_order_relaxed);
+                    const uint64_t laneMax = g_LoadingProgress.sortMax[lane].load(std::memory_order_relaxed);
+                    const float laneFrac = laneMax > 0 ? (float)laneDone / (float)laneMax : 0.0f;
+                    char laneLabel[32];
+                    snprintf(laneLabel, sizeof(laneLabel), "Sort %u", lane + 1);
+                    ImGui::PushID((int)lane);
+                    ImGui::ProgressBar(laneFrac, ImVec2(laneWidth, 0), laneLabel);
+                    ImGui::PopID();
+                    if (twoColumns && (lane & 1u) == 0u && lane + 1 < sortWorkers)
+                        ImGui::SameLine();
+                }
+            }
             char buf[128];
             {
                 static double s_fStageStart = 0.0;
