@@ -2946,9 +2946,10 @@ GameState::GameError MainScreen::Render()
         m_sCurBackground = cViz.sBackground;
         m_fLastBGBlur = -1.0f;
     }
-    if (m_bBackgroundLoaded && cViz.fBGBlur != m_fLastBGBlur) {
-        m_pRenderer->SetBackgroundBlur(cViz.fBGBlur);
-        m_fLastBGBlur = cViz.fBGBlur;
+    const float effectiveBGBlur = cViz.bDisableBlurs ? 0.0f : cViz.fBGBlur;
+    if (m_bBackgroundLoaded && effectiveBGBlur != m_fLastBGBlur) {
+        m_pRenderer->SetBackgroundBlur(effectiveBGBlur);
+        m_fLastBGBlur = effectiveBGBlur;
     }
 
     {
@@ -2957,13 +2958,12 @@ GameState::GameError MainScreen::Render()
         auto t0 = std::chrono::steady_clock::now();
         m_pRenderer->ClearAndBeginScene( 0x00000000 );
         auto t0b = std::chrono::steady_clock::now();
-        RenderLines();
+        if (!cViz.bHorizontalPianoRoll) RenderLines();
         auto t1 = std::chrono::steady_clock::now();
         RenderNotes();
         auto t2 = std::chrono::steady_clock::now();
-        if ( m_bShowKB )
-            RenderKeys();
-        RenderBorder();
+        if (!cViz.bHorizontalPianoRoll && m_bShowKB) RenderKeys();
+        if (!cViz.bHorizontalPianoRoll) RenderBorder();
         RenderText();
         auto t3 = std::chrono::steady_clock::now();
         tClear += std::chrono::duration<double, std::milli>(t0b - t0).count();
@@ -3310,7 +3310,9 @@ float MainScreen::GetCorruptorAmount() const
 void MainScreen::RenderNotes()
 {
     const int64_t eventCount = (int64_t)m_vEvents.size();
-    const bool hasStrip = Config::GetConfig().GetVizSettings().bDualPianoRoll;
+    const auto& renderViz = Config::GetConfig().GetVizSettings();
+    const bool horizontalOnly = renderViz.bHorizontalPianoRoll;
+    const bool hasStrip = renderViz.bDualPianoRoll || horizontalOnly;
 
     if ( m_iEndPos < 0 || m_iStartPos >= eventCount )
     {
@@ -3323,20 +3325,22 @@ void MainScreen::RenderNotes()
     const bool bImageBuffer = Config::GetConfig().GetVizSettings().bImageBufferNotes &&
                               m_pRenderer->ImageBufferCanRender();
 
-    if (bImageBuffer) {
-        RenderNotesImageBuffer();
-    } else {
-        for (auto i = m_iEndPos; i >= m_iStartPos; i--) {
-            MIDIChannelEvent pEvent = m_vEvents[i];
-            if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
-                m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
-                RenderNote(pEvent);
+    if (!horizontalOnly) {
+        if (bImageBuffer) {
+            RenderNotesImageBuffer();
+        } else {
+            for (auto i = m_iEndPos; i >= m_iStartPos; i--) {
+                MIDIChannelEvent pEvent = m_vEvents[i];
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                    m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
+                    RenderNote(pEvent);
+                }
             }
-        }
 
-        for (size_t i = 0; i < 128; i++) {
-            for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
-                RenderNote(m_vEvents[*it]);
+            for (size_t i = 0; i < 128; i++) {
+                for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
+                    RenderNote(m_vEvents[*it]);
+                }
             }
         }
     }
@@ -3367,7 +3371,8 @@ void MainScreen::RenderNotes()
 
         for (size_t i = 0; i < 128; i++) {
             for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
-                RenderPianoRollStripNote(m_vEvents[*it]);
+                if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                    RenderPianoRollStripNote(m_vEvents[*it]);
             }
         }
     }

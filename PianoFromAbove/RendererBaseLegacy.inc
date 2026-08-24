@@ -85,6 +85,10 @@ HRESULT Renderer::ResetDeviceIfNeeded() {
 
 HRESULT Renderer::RecoverDevice(HWND hWnd, bool bLimitFPS) {
     HeartbeatLog("recover:start");
+    ImageBufferInvalidate();
+    m_vChunkNotes.clear();
+    m_vChunkBuilds.clear();
+    m_vChunkQuads.clear();
     ImGuiBackendShutdown();
     ImGui_ImplWin32_Shutdown();
     ReleaseDeviceResources();
@@ -123,6 +127,10 @@ void Renderer::UpdateWarpConstants() {
 // gate active) and Present() should not touch the swapchain.
 bool Renderer::PresentPrelude() {
     HeartbeatLog("present:start");
+    const auto& runtimeViz = Config::GetConfig().GetVizSettings();
+    g_bDisableBlur = runtimeViz.bDisableBlurs;
+    if (runtimeViz.bImageBufferNotes)
+        m_bOverclockArtifacts = false;
     static int s_branch = -1;
     static int s_frames = 0;
     static long long s_fpsStart = 0;
@@ -612,6 +620,8 @@ void Renderer::RenderImGuiFrame() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Fun")) {
+            const bool imageBufferLocksFun = viz.bImageBufferNotes;
+            ImGui::BeginDisabled(imageBufferLocksFun);
             int vbo = (int)m_NotesPerPass;
             if (ImGui::Checkbox("VBO Scale: Unlimited", &m_bUnlimitedNotes)) {
                 m_NotesPerPass = max(100u, min(m_NotesPerPass, MaxNotesPerPass));
@@ -632,12 +642,15 @@ void Renderer::RenderImGuiFrame() {
                 m_fCorruption = corrupt / 100.0f;
             ImGui::EndDisabled();
             ImGui::Text("Effective: %d%%", (int)(m_fLastCorruption * 100.0f + 0.5f));
+            ImGui::EndDisabled();
             ImGui::Separator();
             int lag = (int)m_iLagIntensity - 1;
             if (ImGui::Combo("Lag Intensifier", &lag, "1x (No Lag)\0" "2x\0" "3x\0" "4x\0\0"))
                 m_iLagIntensity = (unsigned)lag + 1;
             ImGui::Separator();
+            ImGui::BeginDisabled(imageBufferLocksFun);
             ImGui::Checkbox("GPU Overclock Artifacts", &m_bOverclockArtifacts);
+            ImGui::EndDisabled();
             ImGui::Separator();
             ImGui::Checkbox("Bounce stats to the beat", &viz.bBounceStats);
             if (viz.bBounceStats) {
@@ -649,15 +662,21 @@ void Renderer::RenderImGuiFrame() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("RenderMode")) {
-            if (ImGui::MenuItem("Default", nullptr, !viz.bDualPianoRoll))
-                viz.bDualPianoRoll = false;
-            if (ImGui::MenuItem("DualRoll", nullptr, viz.bDualPianoRoll))
-                viz.bDualPianoRoll = true;
+            if (ImGui::MenuItem("Default", nullptr, !viz.bDualPianoRoll && !viz.bHorizontalPianoRoll)) {
+                viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = false;
+            }
+            if (ImGui::MenuItem("DualRoll", nullptr, viz.bDualPianoRoll)) {
+                viz.bDualPianoRoll = true; viz.bHorizontalPianoRoll = false;
+            }
+            if (ImGui::MenuItem("Horizontal", nullptr, viz.bHorizontalPianoRoll)) {
+                viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = true;
+            }
             ImGui::BeginDisabled(!viz.bDualPianoRoll);
             ImGui::Checkbox("DualRoll Keyboard", &viz.bDualRollKeyboard);
             ImGui::EndDisabled();
             ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
             ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
+            ImGui::Checkbox("Disable all blurs", &viz.bDisableBlurs);
             ImGui::Checkbox("Image Buffer Notes", &viz.bImageBufferNotes);
             if (viz.bImageBufferNotes) {
                 ImGui::SameLine();
@@ -833,7 +852,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     float cy = (rowMin.y + rowMax.y) * 0.5f;
                     ImVec2 c0 = ImVec2(p0.x - hpad, cy - radius);
                     ImVec2 c1 = ImVec2(p0.x + wsz.x + hpad, cy + radius);
-                    if (m_BlurTextureID) {
+                    if (!g_bDisableBlur && m_BlurTextureID) {
                         float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
                         bgl->AddImageRounded(m_BlurTextureID, c0, c1,
                             ImVec2(c0.x / bw, c0.y / bh), ImVec2(c1.x / bw, c1.y / bh),
@@ -859,7 +878,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
         ImGui::SetNextWindowSize(ImVec2(520, 420), ImGuiCond_FirstUseEver);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         if (ImGui::Begin("Preferences", &m_bShowPreferences, ImGuiWindowFlags_NoCollapse)) {
-            if (m_BlurTextureID) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
                 ImVec2 wpos = ImGui::GetWindowPos();
                 ImVec2 wsize = ImGui::GetWindowSize();
                 float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
@@ -1225,7 +1244,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
         ImGui::SetNextWindowSize(ImVec2(560, 530), ImGuiCond_FirstUseEver);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         if (ImGui::Begin("Render to Video", &m_bShowRenderDialog, ImGuiWindowFlags_NoCollapse)) {
-            if (m_BlurTextureID) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
                 ImVec2 wpos = ImGui::GetWindowPos();
                 ImVec2 wsize = ImGui::GetWindowSize();
                 float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
@@ -1621,7 +1640,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
         ImGui::SetNextWindowSize(ImVec2(400, 250), ImGuiCond_FirstUseEver);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         if (ImGui::Begin("About PlayGroundFromAbove", &m_bShowAbout, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-            if (m_BlurTextureID) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
                 ImVec2 wpos = ImGui::GetWindowPos();
                 ImVec2 wsize = ImGui::GetWindowSize();
                 float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
@@ -1648,7 +1667,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
         ImGui::SetNextWindowSize(ImVec2(250, 120), ImGuiCond_FirstUseEver);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         if (ImGui::Begin("Set Window Size", &m_bShowSetResolution, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-            if (m_BlurTextureID) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
                 ImVec2 wpos = ImGui::GetWindowPos();
                 ImVec2 wsize = ImGui::GetWindowSize();
                 float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
@@ -1683,7 +1702,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
         ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0, 0, 0, 0));
         ImGui::OpenPopup("Loading Song");
         if (ImGui::BeginPopupModal("Loading Song", &g_bShowLoading, ImGuiWindowFlags_AlwaysAutoResize)) {
-            if (m_BlurTextureID) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
                 ImVec2 wpos = ImGui::GetWindowPos();
                 ImVec2 wsize = ImGui::GetWindowSize();
                 float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;

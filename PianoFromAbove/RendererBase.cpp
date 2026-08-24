@@ -266,8 +266,8 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
 
     // A pass this size is large enough to amortize state changes but bounded
     // enough that a multi-million-note chunk cannot monopolize one frame.
-    static constexpr size_t kImageBufferNotesPerPass = 200000;
-    static constexpr size_t kImageBufferNotesPerFrame = 200000;
+    static constexpr size_t kImageBufferNotesPerPass = 65536;
+    static constexpr size_t kImageBufferNotesPerFrame = 65536;
 
     auto& state = ImageBufferMPGet(this);
     if (state.generation != m_ullImageBufferGeneration) {
