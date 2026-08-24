@@ -150,8 +150,10 @@ static void UpdateImageBufferPrewarmGpuProgress(
         return;
     }
 
-    // The CPU stage must settle first; until then the set of successfully
-    // prepared dense chunks is still changing and the GPU stage is premature.
+    // Full-prime discovers every truly dense center first. Runtime preparation
+    // deliberately expands each center by +/- ImageBufferPreparedPreloadRadius,
+    // so pre-play GPU work must use that same expanded set or playback will
+    // gradually discover and bake extra chunks after the gate has opened.
     if (cpu.done < cpu.total)
         return;
 
@@ -160,7 +162,7 @@ static void UpdateImageBufferPrewarmGpuProgress(
     if (overlap.owner != owner || !source || source->notes.empty() || timeSpan <= 0)
         return;
 
-    std::vector<long long> denseChunks;
+    std::vector<long long> prewarmChunks;
     const long long firstStart = ImageBufferPreparedStartValue(source->notes.front(), tickMode);
     const long long lastStart = ImageBufferPreparedStartValue(source->notes.back(), tickMode);
     const long long first = ImageBufferPreparedFloorDiv(
@@ -168,25 +170,33 @@ static void UpdateImageBufferPrewarmGpuProgress(
     const long long last = ImageBufferPreparedFloorDiv(
         ImageBufferOverlapSaturatingAdd(lastStart, margin), timeSpan) + 1;
 
-    const bool fitsTextureCache = (last >= first) &&
-        (uint64_t)(last - first + 1) <= (uint64_t)Renderer::ChunkPoolSize;
+    for (long long center = first; center <= last; ++center) {
+        const size_t estimate = ImageBufferPreparedEstimateStarts(
+            *source, center, timeSpan, margin, tickMode);
+        if (estimate < ImageBufferPreparedDenseThreshold)
+            continue;
 
-    // If worker preparation failed, retain the exact fallback and do not make
-    // playback wait on a potentially huge raw multipass bake. The CPU wait has
-    // still done everything it safely can ahead of time.
-    const bool requireGpu = fitsTextureCache && cpu.failed == 0;
-    if (requireGpu) {
-        denseChunks.reserve(cpu.total);
-        for (long long chunk = first; chunk <= last; ++chunk) {
-            const size_t estimate = ImageBufferPreparedEstimateStarts(
-                *source, chunk, timeSpan, margin, tickMode);
-            if (estimate >= ImageBufferPreparedDenseThreshold)
-                denseChunks.push_back(chunk);
-        }
+        const long long lo = (std::max)(first,
+            center - (long long)ImageBufferPreparedPreloadRadius);
+        const long long hi = (std::min)(last,
+            center + (long long)ImageBufferPreparedPreloadRadius);
+        long long appendFrom = lo;
+        if (!prewarmChunks.empty())
+            appendFrom = (std::max)(appendFrom, prewarmChunks.back() + 1);
+        for (long long chunk = appendFrom; chunk <= hi; ++chunk)
+            prewarmChunks.push_back(chunk);
     }
 
+    // The cache is associative: sparse chunks elsewhere in the song do not
+    // matter. Only the dense/preload working set has to fit in the 64 slots.
+    const bool fitsTextureCache =
+        prewarmChunks.size() <= (size_t)Renderer::ChunkPoolSize;
+
+    // A failed full-prime center falls back to exact rendering. Do not make Play
+    // wait forever for a texture that cannot be produced.
+    const bool requireGpu = fitsTextureCache && cpu.failed == 0;
     const size_t cached = requireGpu
-        ? CountImageBufferPrewarmCached(renderer, denseChunks)
+        ? CountImageBufferPrewarmCached(renderer, prewarmChunks)
         : 0;
 
     std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
@@ -194,10 +204,10 @@ static void UpdateImageBufferPrewarmGpuProgress(
     s_ImageBufferPrewarmGpu.owner = owner;
     s_ImageBufferPrewarmGpu.renderer = renderer;
     s_ImageBufferPrewarmGpu.initialized = true;
-    s_ImageBufferPrewarmGpu.cacheRequired = requireGpu && !denseChunks.empty();
+    s_ImageBufferPrewarmGpu.cacheRequired = requireGpu && !prewarmChunks.empty();
     s_ImageBufferPrewarmGpu.cached = cached;
-    s_ImageBufferPrewarmGpu.total = denseChunks.size();
-    s_ImageBufferPrewarmGpu.chunks = std::move(denseChunks);
+    s_ImageBufferPrewarmGpu.total = prewarmChunks.size();
+    s_ImageBufferPrewarmGpu.chunks = std::move(prewarmChunks);
     s_ImageBufferPrewarmGpu.playRequested = keepPlayRequest;
 }
 
@@ -266,7 +276,7 @@ static void DrawImageBufferPrewarmProgress(
     if (initializing) {
         sprintf_s(text, "Initializing dense image buffers...");
     } else if (gpuStage) {
-        sprintf_s(text, "Baking dense image buffers  %zu / %zu", done, total);
+        sprintf_s(text, "Prewarming dense image buffers  %zu / %zu", done, total);
     } else if (failed > 0) {
         sprintf_s(text, "Preparing dense image buffers  %zu / %zu  (%zu fallback)",
             done, total, failed);
@@ -420,6 +430,21 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
                                     imageBufferPrewarmTickMode, imageBufferPrewarmCorrupt, \
                                     imageBufferPrewarmSelf->m_vTrackSettings.size(), imageBufferPrewarmRows, \
                                     imageBufferPrewarmSignature); \
+                                const long long imageBufferPrewarmFirstStart = ImageBufferPreparedStartValue( \
+                                    imageBufferPrewarmSource->notes.front(), imageBufferPrewarmTickMode); \
+                                const long long imageBufferPrewarmLastStart = ImageBufferPreparedStartValue( \
+                                    imageBufferPrewarmSource->notes.back(), imageBufferPrewarmTickMode); \
+                                const long long imageBufferPrewarmFirst = ImageBufferPreparedFloorDiv( \
+                                    ImageBufferOverlapSaturatingAdd(imageBufferPrewarmFirstStart, -imageBufferPrewarmE), \
+                                    imageBufferPrewarmT) - 1; \
+                                const long long imageBufferPrewarmLast = ImageBufferPreparedFloorDiv( \
+                                    ImageBufferOverlapSaturatingAdd(imageBufferPrewarmLastStart, imageBufferPrewarmE), \
+                                    imageBufferPrewarmT) + 1; \
+                                ImageBufferPreparedPrime( \
+                                    imageBufferPrewarmSource, imageBufferPrewarmFirst, imageBufferPrewarmLast, \
+                                    imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode, \
+                                    imageBufferPrewarmCorrupt, imageBufferPrewarmSelf->m_vTrackSettings.size(), \
+                                    imageBufferPrewarmRows, imageBufferPrewarmSignature); \
                                 UpdateImageBufferPrewarmGpuProgress( \
                                     imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, \
                                     imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode); \
