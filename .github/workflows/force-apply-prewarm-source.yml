@@ -91,13 +91,18 @@ jobs:
           grep -F "parallel sort lanes" PianoFromAbove/RendererBaseLegacy.inc
           grep -F "PhysicalCoreCount" PianoFromAbove/ParallelMIDIPos.h
 
-      - name: Build Release x64
+      - name: Compile Release x64 source
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
           if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
-          & $msbuild PianoFromAbove.sln /m /p:Configuration=Release /p:Platform=x64
+          # The full project resource step embeds bass.dll, bassmidi.dll and SDL2.dll,
+          # which are not checked into this repository. Compile the generated shaders
+          # and every C++ translation unit without invoking ResourceCompile/Link.
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m /t:FxCompile /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m /t:ClCompile /p:Configuration=Release /p:Platform=x64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Commit actual source changes
@@ -105,7 +110,9 @@ jobs:
         run: |
           set -euxo pipefail
           rm -f .github/workflows/force-apply-prewarm-source.yml
-          rm -f .github/source-patch-kick.txt
+          rm -f .github/workflows/apply-prewarm-pins-parallel-sort.yml
+          rm -f .github/source-patch-kick*.txt
+          rm -f .patch-trigger-prewarm-sort
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
