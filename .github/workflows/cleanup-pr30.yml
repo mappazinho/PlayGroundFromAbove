@@ -1,0 +1,205 @@
+name: Clean and validate PR 30
+
+on:
+  push:
+    branches: [ fix/playpause-customaudio-dual-imgbuf-d3d11 ]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/playpause-customaudio-dual-imgbuf-d3d11
+          fetch-depth: 0
+
+      - name: Clean source
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def update(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise RuntimeError(label)
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          update('PianoFromAbove/RendererLegacy.h',
+              '    static bool ImageBufferIsStripChunkKey(long long key) { return key >= (ImageBufferStripChunkBase >> 1); }',
+              '    static bool ImageBufferIsStripChunkKey(long long key) { return key != ImageBufferInvalidChunk && key >= (ImageBufferStripChunkBase >> 1); }',
+              'strip sentinel')
+
+          update('PianoFromAbove/GameStateLegacy.inc',
+          '''    if (hasStrip) {
+              if (bImageBuffer) {
+                  RenderPianoRollStripImageBuffer();
+              } else {
+                  const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY);
+                  const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
+                  int64_t hi = max<int64_t>(m_iStartPos, 0);
+                  while (hi < eventCount) {
+                      MIDIChannelEvent pEvent = m_vEvents[hi];
+                      const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
+                      if (eventTime >= stripEnd) break;
+                      ++hi;
+                  }
+                  for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); --i) {
+                      MIDIChannelEvent pEvent = m_vEvents[i];
+                      if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                          m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
+                          RenderPianoRollStripNote(pEvent);
+                  }
+                  for (size_t i = 0; i < 128; ++i) {
+                      for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it)
+                          if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                              RenderPianoRollStripNote(m_vEvents[*it]);
+                  }
+              }
+          }
+          ''',
+          '''    if (hasStrip) {
+              if (bImageBuffer) {
+                  RenderPianoRollStripImageBuffer();
+              } else {
+                  const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY);
+                  const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
+                  int64_t hi = max<int64_t>(m_iStartPos, 0);
+                  while (hi < eventCount) {
+                      MIDIChannelEvent pEvent = m_vEvents[hi];
+                      const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
+                      if (eventTime >= stripEnd)
+                          break;
+                      ++hi;
+                  }
+                  for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); --i) {
+                      MIDIChannelEvent pEvent = m_vEvents[i];
+                      if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                          m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
+                          RenderPianoRollStripNote(pEvent);
+                  }
+                  for (size_t i = 0; i < 128; ++i) {
+                      for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it) {
+                          if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                              RenderPianoRollStripNote(m_vEvents[*it]);
+                      }
+                  }
+              }
+          }
+          ''', 'strip indentation')
+
+          for path in ['PianoFromAbove/RendererD3D11Legacy.inc', 'PianoFromAbove/RendererD3D12Legacy.inc']:
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              text = text.replace(
+                  '''    if (stripViz.bImageBufferNotes && m_vPianoRollStripNotesIntermediate.empty())
+                          return;
+                      const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+                          ? m_vPianoRollStripNotesIntermediate
+                          : m_vNotesIntermediate;
+                      if (stripNotes.empty())
+                      return;
+                  ''',
+                  '''    if (stripViz.bImageBufferNotes && m_vPianoRollStripNotesIntermediate.empty())
+                      return;
+                  const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+                      ? m_vPianoRollStripNotesIntermediate
+                      : m_vNotesIntermediate;
+                  if (stripNotes.empty())
+                      return;
+                  ''')
+              p.write_text(text, encoding='utf-8')
+
+          p = Path('PianoFromAbove/RendererD3D11Legacy.inc')
+          text = p.read_text(encoding='utf-8')
+          text = text.replace(
+          '''        D3D11RootConstants requestRoot = chunkRoot;
+                      if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                          requestRoot.stripMode = 1.0f;
+                          requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                          requestRoot.notes_y = 0.0f;
+                          requestRoot.notes_cy = (float)W;
+                          requestRoot.white_cx = (float)H / 75.0f;
+                      }
+                      SetPipeline(Pipeline::Note);
+                      m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
+          ''',
+          '''        D3D11RootConstants requestRoot = chunkRoot;
+                  if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                      requestRoot.stripMode = 1.0f;
+                      requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                      requestRoot.notes_y = 0.0f;
+                      requestRoot.notes_cy = (float)W;
+                      requestRoot.white_cx = (float)H / 75.0f;
+                  }
+                  SetPipeline(Pipeline::Note);
+                  m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
+          ''')
+          p.write_text(text, encoding='utf-8')
+
+          changed = [
+              'PianoFromAbove/GameState.cpp', 'PianoFromAbove/GameState.h',
+              'PianoFromAbove/GameStateLegacy.inc', 'PianoFromAbove/ImageBufferMultipass.h',
+              'PianoFromAbove/PlaybackAudioThread.inc', 'PianoFromAbove/RendererBase.cpp',
+              'PianoFromAbove/RendererD3D11Legacy.inc', 'PianoFromAbove/RendererD3D12Legacy.inc',
+              'PianoFromAbove/RendererLegacy.h']
+
+          for path in changed:
+              p = Path(path)
+              lines = p.read_text(encoding='utf-8').splitlines()
+              out = []
+              i = 0
+              while i < len(lines):
+                  if lines[i].lstrip().startswith('//'):
+                      j = i
+                      while j < len(lines) and lines[j].lstrip().startswith('//'):
+                          j += 1
+                      run = lines[i:j]
+                      if any('...' in line or line.lstrip().startswith('// / ') for line in run):
+                          i = j
+                          continue
+                      if len(run) > 2:
+                          run = run[:2]
+                      out.extend(run)
+                      i = j
+                  else:
+                      out.append(lines[i])
+                      i += 1
+              p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+          Path('.github/workflows/cleanup-pr30.yml').unlink(missing_ok=True)
+
+      - name: Validate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'wasPaused != nowPaused' PianoFromAbove/PlaybackAudioThread.inc
+          grep -F 'BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT | BASS_UNICODE' PianoFromAbove/GameStateLegacy.inc
+          grep -F 'RenderPianoRollStripImageBuffer' PianoFromAbove/GameStateLegacy.inc
+          grep -F 'key != ImageBufferInvalidChunk' PianoFromAbove/RendererLegacy.h
+          grep -F 'nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get()' PianoFromAbove/RendererD3D11Legacy.inc
+          ! grep -R -n '^\s*//.*\.\.\.' PianoFromAbove/GameState.cpp PianoFromAbove/GameState.h PianoFromAbove/GameStateLegacy.inc PianoFromAbove/ImageBufferMultipass.h PianoFromAbove/PlaybackAudioThread.inc PianoFromAbove/RendererBase.cpp PianoFromAbove/RendererD3D11Legacy.inc PianoFromAbove/RendererD3D12Legacy.inc PianoFromAbove/RendererLegacy.h
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Clean comments and formatting'
+          git push origin HEAD:fix/playpause-customaudio-dual-imgbuf-d3d11
