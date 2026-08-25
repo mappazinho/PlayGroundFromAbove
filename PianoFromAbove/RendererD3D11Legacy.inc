@@ -727,7 +727,12 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
 
 HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     ImGui::Render();
-    ImGui::GetDrawData()->AddDrawList(m_pDrawList);
+    ImDrawData* drawData = ImGui::GetDrawData();
+    drawData->AddDrawList(m_pDrawList);
+    for (int i = drawData->CmdListsCount - 1; i > 0; --i)
+        drawData->CmdLists[i] = drawData->CmdLists[i - 1];
+    if (drawData->CmdListsCount > 0)
+        drawData->CmdLists[0] = m_pDrawList;
 
     if (draw_bg) {
         SetPipeline(Pipeline::Background);
@@ -1424,20 +1429,9 @@ void D3D11Renderer::ApplyBlur() {
 
 void D3D11Renderer::DrawPianoRollStripBackground() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
-    if (g_bDisableBlur || (!stripViz.bDualPianoRoll && !stripViz.bHorizontalPianoRoll) || !m_pBlurOutput)
-        return;
+    if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
+    return;
 
-    if (stripViz.bHorizontalPianoRoll) {
-        const D3D11_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
-        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };
-        SetPipeline(Pipeline::Background);
-        m_pContext->UpdateSubresource(m_pBackgroundConstants.Get(), 0, nullptr, &fullConstants, 0, 0);
-        ID3D11ShaderResourceView* blurSRV = m_pBlurOutputSRV.Get();
-        m_pContext->PSSetShaderResources(0, 1, &blurSRV);
-        m_pContext->RSSetScissorRects(1, &fullScissor);
-        m_pContext->Draw(3, 0);
-        return;
-    }
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
     const float stripTop = menuBarHeight + toolbarHeight;
@@ -1768,7 +1762,8 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
 
         // Restore bindings for any later pass that relies on the defaults
         m_pContext->VSSetConstantBuffers(0, 1, m_pPerFrameConstants.GetAddressOf());
-        m_pContext->PSSetShaderResources(0, 1, nullptr);
+        ID3D11ShaderResourceView* nullChunkSRV = nullptr;
+    m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);
     }
 
     // Chunk quads clip to notes_scissor. Keyboard and border rectangles are
