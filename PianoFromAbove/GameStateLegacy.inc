@@ -1617,8 +1617,10 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
 
                 if (!m_MIDI.EventHasSister(event))
                     continue;
-                const MIDIChannelEvent sister =
-                    m_vEvents[m_MIDI.GetEventSisterIdx(event)];
+                const unsigned sisterIndex = m_MIDI.GetEventSisterIdx(event);
+                if (sisterIndex >= m_vEvents.size())
+                    continue;
+                const MIDIChannelEvent sister = m_vEvents[sisterIndex];
                 const long long lengthTime = (std::max)(0LL, (long long)m_MIDI.GetEventLength(event));
                 const long long startTick = m_MIDI.GetEventAbsT(event);
                 const long long lengthTick = (std::max)(0LL,
@@ -1693,6 +1695,10 @@ void MainScreen::Discard()
     m_sCurBackground.clear();
     m_dNPSNotes.clear();
     m_dNPSHistory.clear();
+    vector<long long>().swap(m_vImageBufferMaxEndTime);
+    vector<long long>().swap(m_vImageBufferMaxEndTick);
+    vector<long long>().swap(m_vImageBufferPrefixEndTime);
+    vector<long long>().swap(m_vImageBufferPrefixEndTick);
     m_vImageData.clear();
     PRE_DbgLog("Discard: done");
 }
@@ -3510,7 +3516,7 @@ void MainScreen::RenderPianoRollStripImageBuffer()
                 ImageBufferOverlapCollect(this, m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
             } else {
-                ImageBufferCollectHugeIndexed(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,
+                ImageBufferCollectHugeIndexedExact(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,
                     m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick,
                     m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick,
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
