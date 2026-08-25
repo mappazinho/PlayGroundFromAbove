@@ -566,7 +566,8 @@ static void UpdateImageBufferPrewarmGpuProgress(
     Renderer* renderer,
     long long timeSpan,
     long long margin,
-    bool tickMode)
+    bool tickMode,
+    long long tStart = 0)
 {
     if (!owner || !renderer || !ImageBufferPreparedGetWaitBeforePlayback())
         return;
@@ -632,15 +633,21 @@ static void UpdateImageBufferPrewarmGpuProgress(
             prewarmChunks.push_back(chunk);
     }
 
-    // The cache is associative: sparse chunks elsewhere in the song do not matter. Only the
-    // dense/preload working set has to fit in the 64 slots. Keep a few slots free for visible
     static constexpr size_t kImageBufferRuntimeReserveSlots = 8;
-    const bool fitsTextureCache =
-        prewarmChunks.size() <= (size_t)Renderer::ChunkPoolSize - kImageBufferRuntimeReserveSlots;
+    const size_t gpuCapacity = (size_t)Renderer::ChunkPoolSize - kImageBufferRuntimeReserveSlots;
+    const long long startChunk = timeSpan > 0 ? ImageBufferPreparedFloorDiv(tStart, timeSpan) : first;
 
-    // A failed full-prime center falls back to exact rendering. Do not make Play
-    // wait forever for a texture that cannot be produced.
-    const bool requireGpu = fitsTextureCache && cpu.failed == 0;
+    if (prewarmChunks.size() > gpuCapacity) {
+        std::sort(prewarmChunks.begin(), prewarmChunks.end(), [&](long long a, long long b) {
+            long long distA = a >= startChunk - 2 ? (a - startChunk + 2) : (startChunk - a + 1000000);
+            long long distB = b >= startChunk - 2 ? (b - startChunk + 2) : (startChunk - b + 1000000);
+            return distA < distB;
+        });
+        prewarmChunks.resize(gpuCapacity);
+        std::sort(prewarmChunks.begin(), prewarmChunks.end());
+    }
+
+    const bool requireGpu = !prewarmChunks.empty() && cpu.failed == 0;
     const size_t cached = requireGpu
         ? CountImageBufferPrewarmCached(renderer, prewarmChunks)
         : 0;
@@ -969,7 +976,7 @@ static void ImageBufferDriveHugePrewarm(
         kFirst, kLast, kMax, T, E, bTickMode, fCorrupt, \
         m_vTrackSettings.size(), imageBufferPrepRows); \
     if ((k) == kFirst) \
-        UpdateImageBufferPrewarmGpuProgress(this, m_pRenderer, T, E, bTickMode); \
+        UpdateImageBufferPrewarmGpuProgress(this, m_pRenderer, T, E, bTickMode, tStart); \
     if (!imageBufferPreparedHandled) \
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferExactCollector, (k)); \
 }())
@@ -994,7 +1001,7 @@ static void ImageBufferDriveHugePrewarm(
             if (!imageBufferPrewarmSelf->m_pRenderer->ImageBufferCanRender()) { \
                 ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
                 UpdateImageBufferPrewarmGpuProgress( \
-                    imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, 1, 0, false); \
+                    imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, 1, 0, false, 0); \
             } else { \
                 bool imageBufferPrewarmAnyHidden = false; \
                 for (const auto& imageBufferPrewarmTrack : imageBufferPrewarmSelf->m_vTrackSettings) { \
@@ -1063,7 +1070,7 @@ static void ImageBufferDriveHugePrewarm(
                                     imageBufferPrewarmSignature); \
                                 UpdateImageBufferPrewarmGpuProgress( \
                                     imageBufferPrewarmSelf, imageBufferPrewarmSelf->m_pRenderer, \
-                                    imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode); \
+                                    imageBufferPrewarmT, imageBufferPrewarmE, imageBufferPrewarmTickMode, imageBufferPrewarmSelf->m_llRndStartTime); \
                                 long long imageBufferPrewarmBakeChunk = Renderer::ImageBufferInvalidChunk; \
                                 { \
                                     std::lock_guard<std::mutex> imageBufferPrewarmLock(s_ImageBufferPrewarmGpuMutex); \

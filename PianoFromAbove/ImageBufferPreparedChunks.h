@@ -22,7 +22,7 @@
 
 class Renderer;
 
-static constexpr size_t ImageBufferPreparedDenseThreshold = 100000;
+static constexpr size_t ImageBufferPreparedDenseThreshold = 15000;
 static constexpr int ImageBufferPreparedPreloadRadius = 10;
 static constexpr int ImageBufferPreparedMaxRows = 1536;
 static constexpr size_t ImageBufferPreparedEntryLimit = 128;
@@ -155,19 +155,61 @@ inline size_t ImageBufferPreparedEstimateStarts(
         return 0;
 
     const long long chunkStart = chunk * timeSpan;
-    const long long loValue = ImageBufferOverlapSaturatingAdd(chunkStart, -margin);
-    const long long hiValue = ImageBufferOverlapSaturatingAdd(
-        ImageBufferOverlapSaturatingAdd(chunkStart, timeSpan), margin);
+    const long long chunkEnd = ImageBufferOverlapSaturatingAdd(chunkStart, timeSpan);
+    const long long hiValue = ImageBufferOverlapSaturatingAdd(chunkEnd, margin);
+    const long long oldestUsefulEnd = ImageBufferOverlapSaturatingAdd(chunkStart, -margin);
+    const uint64_t oldest = oldestUsefulEnd < 0 ? 0ULL : (uint64_t)oldestUsefulEnd;
 
-    auto lo = std::lower_bound(source.notes.begin(), source.notes.end(), loValue,
+    auto itHi = std::lower_bound(source.notes.begin(), source.notes.end(), hiValue,
         [&](const ImageBufferPreparedRawNote& n, long long value) {
             return ImageBufferPreparedStartValue(n, tickMode) < value;
         });
-    auto hi = std::lower_bound(source.notes.begin(), source.notes.end(), hiValue,
-        [&](const ImageBufferPreparedRawNote& n, long long value) {
-            return ImageBufferPreparedStartValue(n, tickMode) < value;
-        });
-    return (size_t)(hi - lo);
+    const size_t hi = (size_t)(itHi - source.notes.begin());
+    if (hi == 0)
+        return 0;
+
+    if (source.maxEndTime150_100us.empty() || source.prefixMaxEndTime150_100us.empty())
+        return hi;
+
+    size_t candidateCount = 0;
+    size_t block = (hi - 1) / ImageBufferPreparedRawBlockNotes;
+    for (;;) {
+        const uint64_t prefixMax = tickMode
+            ? source.prefixMaxEndTick150[block]
+            : source.prefixMaxEndTime150_100us[block] * 100ULL;
+        if (prefixMax < oldest)
+            break;
+
+        const uint64_t blockMax = tickMode
+            ? source.maxEndTick150[block]
+            : source.maxEndTime150_100us[block] * 100ULL;
+        if (blockMax >= oldest) {
+            const size_t begin = block * ImageBufferPreparedRawBlockNotes;
+            const size_t end = (std::min)(hi, begin + ImageBufferPreparedRawBlockNotes);
+            size_t subBlock = (end - 1) / ImageBufferPreparedRawSubBlockNotes;
+            const size_t firstSubBlock = begin / ImageBufferPreparedRawSubBlockNotes;
+            for (;;) {
+                const uint64_t subMax = tickMode
+                    ? source.subMaxEndTick150[subBlock]
+                    : source.subMaxEndTime150_100us[subBlock] * 100ULL;
+                if (subMax >= oldest) {
+                    const size_t subBegin = (std::max)(begin,
+                        subBlock * ImageBufferPreparedRawSubBlockNotes);
+                    const size_t subEnd = (std::min)(end,
+                        (subBlock + 1) * ImageBufferPreparedRawSubBlockNotes);
+                    candidateCount += (subEnd - subBegin);
+                }
+                if (subBlock == firstSubBlock)
+                    break;
+                --subBlock;
+            }
+        }
+
+        if (block == 0)
+            break;
+        --block;
+    }
+    return candidateCount;
 }
 
 inline long long ImageBufferPreparedFloorDiv(long long value, long long divisor)
@@ -992,9 +1034,8 @@ inline bool ImageBufferPreparedTryCollect(
         return true;
     }
 
-    out.clear();
-    manager.MarkPending(renderer, chunk);
-    return true;
+    manager.ClearPending(renderer, chunk);
+    return false;
 }
 
 inline bool ImageBufferPreparedRenderPending(Renderer* renderer, long long chunk)
