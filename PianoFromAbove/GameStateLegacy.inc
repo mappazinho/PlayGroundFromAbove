@@ -3995,6 +3995,8 @@ float MainScreen::GetStatsBounceScale() const
 
 void MainScreen::RenderStatus(int lines)
 {
+    if (StatsCoveredByUI(m_pRenderer))
+        return;
     auto dl = m_pRenderer->GetDrawList();
     const int vtx_start = dl ? dl->VtxBuffer.Size : 0;
 
