@@ -1263,7 +1263,12 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
 HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     auto s_t0 = std::chrono::steady_clock::now();
     ImGui::Render();
-    ImGui::GetDrawData()->AddDrawList(m_pDrawList);
+    ImDrawData* drawData = ImGui::GetDrawData();
+    drawData->AddDrawList(m_pDrawList);
+    for (int i = drawData->CmdListsCount - 1; i > 0; --i)
+        drawData->CmdLists[i] = drawData->CmdLists[i - 1];
+    if (drawData->CmdListsCount > 0)
+        drawData->CmdLists[0] = m_pDrawList;
     auto s_t1 = std::chrono::steady_clock::now();
 
     if (draw_bg) {
@@ -1651,21 +1656,9 @@ HRESULT D3D12Renderer::PresentBackend() {
 
 void D3D12Renderer::DrawPianoRollStripBackground() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
-    if (g_bDisableBlur || (!stripViz.bDualPianoRoll && !stripViz.bHorizontalPianoRoll) || !m_pBlurOutput)
+    if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
         return;
 
-    if (stripViz.bHorizontalPianoRoll) {
-        const D3D12_RECT fullScissor = { 0, 0, m_iBufferWidth, m_iBufferHeight };
-        const BackgroundConstants fullConstants = { .fadeStart = 0.0f, .fadeEnd = 0.0f, .fadeEnabled = 0.0f, .padding = 1.0f };
-        SetPipeline(Pipeline::Background);
-        ID3D12DescriptorHeap* heaps[] = { m_pImGuiSRVDescriptorHeap.Get() };
-        m_pCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-        m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(fullConstants) / 4, &fullConstants, 0);
-        m_pCommandList->SetGraphicsRootDescriptorTable(1, m_BlurOutputSRVGPU);
-        m_pCommandList->RSSetScissorRects(1, &fullScissor);
-        m_pCommandList->DrawIndexedInstanced(3, 1, 0, 0, 0);
-        return;
-    }
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
     const float stripTop = menuBarHeight + toolbarHeight;

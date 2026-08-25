@@ -8,13 +8,7 @@
 #include <utility>
 #include <vector>
 
-// Multicore implementation of the expensive part of MIDI::PostProcess.
-// The previous ParallelMIDIPos accelerated only the initial lane sorts. Its
-// N-way heap merge and the timestamp/output/sister walk still consumed every
-// event on one core while the UI continued to say "Sorting events". This path
-// keeps the whole heavy stage on the physical-core worker pool:
-//   lane sort -> parallel merge path -> timestamps -> ordered channel output
-//   -> equal-time note-off ordering -> sister/program-index finalization.
+// Multicore MIDI post-process. Sorting uses stable parallel radix passes.
 namespace PGFAParallelPostProcess
 {
     static inline unsigned PhysicalCoreCount()
@@ -58,23 +52,6 @@ namespace PGFAParallelPostProcess
             thread.join();
     }
 
-    template <typename Fn>
-    static inline void RunTaskPool(unsigned workers, size_t taskCount, Fn&& fn)
-    {
-        if (taskCount == 0)
-            return;
-        std::atomic<size_t> next{ 0 };
-        RunWorkers(workers, [&](unsigned worker) {
-            for (;;)
-            {
-                const size_t task = next.fetch_add(1, std::memory_order_relaxed);
-                if (task >= taskCount)
-                    break;
-                fn(worker, task);
-            }
-        });
-    }
-
     struct TempoAnchor
     {
         int tick = 0;
@@ -94,7 +71,6 @@ inline void MIDI::PostProcessParallel(
     using namespace PGFAParallelPostProcess;
     using Ref = uint32_t;
     static constexpr Ref MetaFlag = 0x80000000u;
-    static constexpr size_t SortBlock = 1u << 18;
     static constexpr uint64_t ProgressUnits = 7000;
 
     size_t metaCount = 0;
@@ -165,172 +141,91 @@ inline void MIDI::PostProcessParallel(
     auto isMeta = [&](Ref ref) { return (ref & MetaFlag) != 0; };
     auto metaIndex = [&](Ref ref) { return (size_t)(ref & ~MetaFlag); };
     auto meta = [&](Ref ref) -> MIDIEvent* { return metaRefs[metaIndex(ref)]; };
+    auto isThinRef = [&](Ref ref) { return !isMeta(ref) && ref >= m_iFullRows; };
     auto eventTickOf = [&](Ref ref) -> int {
-        return isMeta(ref) ? meta(ref)->GetAbsT() : (int)GetEventTicks((MIDIChannelEvent)ref);
+        if (isMeta(ref)) return meta(ref)->GetAbsT();
+        if (isThinRef(ref)) return (int)m_vThinTicks[(size_t)ref - m_iFullRows];
+        return (int)m_vTicks[ref];
     };
-    auto eventTrackOf = [&](Ref ref) -> int {
-        return isMeta(ref) ? meta(ref)->GetTrack() : (int)GetEventTrack((MIDIChannelEvent)ref);
-    };
-    auto eventKind = [&](Ref ref) -> int {
-        if (isMeta(ref)) return 0;
-        return IsThinRow((MIDIChannelEvent)ref) ? 2 : 1;
-    };
-    auto eventOrdinal = [&](Ref ref) -> uint32_t {
-        return isMeta(ref) ? (uint32_t)metaIndex(ref) : ref;
-    };
-    auto less = [&](Ref a, Ref b) {
-        const int at = eventTickOf(a), bt = eventTickOf(b);
-        if (at != bt) return at < bt;
-        const int atr = eventTrackOf(a), btr = eventTrackOf(b);
-        if (atr != btr) return atr < btr;
-        const int ak = eventKind(a), bk = eventKind(b);
-        if (ak != bk) return ak < bk; // meta, pool, thin: legacy merge order
-        return eventOrdinal(a) < eventOrdinal(b);
-    };
-
-    struct Range { size_t begin, end; };
-    std::vector<Range> ranges(workers);
-
-    // Per-core lane sort. Block sorting keeps every progress bar visibly moving
-    // instead of sitting at zero for one giant std::sort call.
-    RunWorkers(workers, [&](unsigned worker) {
-        const size_t begin = totalEvents * (size_t)worker / workers;
-        const size_t end = totalEvents * (size_t)(worker + 1) / workers;
-        ranges[worker] = { begin, end };
-        const size_t count = end - begin;
-        const size_t blocks = count ? (count + SortBlock - 1) / SortBlock : 0;
-        size_t mergeTasks = 0;
-        for (size_t width = SortBlock; width < count; )
-        {
-            mergeTasks += (count + width * 2 - 1) / (width * 2);
-            if (width > count / 2)
-                break;
-            width *= 2;
+    auto eventTrackOf = [&](Ref ref) -> uint32_t {
+        if (isMeta(ref)) return (uint32_t)meta(ref)->GetTrack();
+        if (isThinRef(ref)) {
+            const size_t thin = (size_t)ref - m_iFullRows;
+            const Ref owner = m_vThinOwners[thin] & ~THIN_OWNER_NOTEON_FLAG;
+            return (uint32_t)m_vEventTrack[owner];
         }
-        const size_t taskMax = (std::max)((size_t)1, blocks + mergeTasks);
-        size_t done = 0;
-
-        for (size_t left = begin; left < end; left += SortBlock)
-        {
-            const size_t right = (std::min)(end, left + SortBlock);
-            std::sort(refs.begin() + left, refs.begin() + right, less);
-            ++done;
-            setProgress(worker, (uint64_t)(done * 1000 / taskMax));
-        }
-        for (size_t width = SortBlock; width < count; )
-        {
-            const size_t pairWidth = width * 2;
-            for (size_t rel = 0; rel < count; rel += pairWidth)
-            {
-                const size_t left = begin + rel;
-                const size_t mid = (std::min)(end, left + width);
-                const size_t right = (std::min)(end, left + pairWidth);
-                if (mid < right)
-                    std::inplace_merge(refs.begin() + left, refs.begin() + mid, refs.begin() + right, less);
-                ++done;
-                setProgress(worker, (uint64_t)(done * 1000 / taskMax));
-            }
-            if (width > count / 2)
-                break;
-            width *= 2;
-        }
-        setProgress(worker, 1000);
-    });
-
-    // Merge-path co-ranking lets even the final two huge ranges be merged by
-    // every physical core instead of collapsing back to one thread.
-    auto coRank = [&](const std::vector<Ref>& src, size_t a0, size_t aLen,
-                      size_t b0, size_t bLen, size_t diagonal) -> size_t {
-        size_t low = diagonal > bLen ? diagonal - bLen : 0;
-        size_t high = (std::min)(diagonal, aLen);
-        while (low <= high)
-        {
-            const size_t i = low + (high - low) / 2;
-            const size_t j = diagonal - i;
-            if (i > 0 && j < bLen && less(src[b0 + j], src[a0 + i - 1]))
-            {
-                high = i - 1;
-            }
-            else if (j > 0 && i < aLen && less(src[a0 + i], src[b0 + j - 1]))
-            {
-                low = i + 1;
-            }
-            else
-                return i;
-        }
-        return low;
+        return (uint32_t)m_vEventTrack[ref];
+    };
+    auto eventKind = [&](Ref ref) -> uint32_t {
+        if (isMeta(ref)) return 0u;
+        return isThinRef(ref) ? 2u : 1u;
     };
 
-    struct MergeTask
-    {
-        size_t a0, a1, b0, b1, out;
-    };
+    static constexpr unsigned RadixBits = 11;
+    static constexpr size_t RadixBuckets = 1u << RadixBits;
+    static constexpr uint32_t RadixMask = (uint32_t)RadixBuckets - 1u;
+    static constexpr unsigned RadixPasses = 6;
     std::vector<Ref> scratch(totalEvents);
+    std::vector<size_t> radixOffsets((size_t)workers * RadixBuckets);
     bool sourceIsRefs = true;
-    while (ranges.size() > 1)
-    {
+    unsigned radixDone = 0;
+
+    auto radixPass = [&](auto&& keyOf, unsigned shift) {
         const std::vector<Ref>& src = sourceIsRefs ? refs : scratch;
         std::vector<Ref>& dst = sourceIsRefs ? scratch : refs;
-        std::vector<Range> nextRanges;
-        std::vector<MergeTask> tasks;
-        nextRanges.reserve((ranges.size() + 1) / 2);
+        std::fill(radixOffsets.begin(), radixOffsets.end(), 0);
 
-        for (size_t r = 0; r < ranges.size(); r += 2)
-        {
-            const Range a = ranges[r];
-            if (r + 1 >= ranges.size())
-            {
-                const size_t len = a.end - a.begin;
-                const size_t block = (std::max)((size_t)1, (len + workers * 4 - 1) / (workers * 4));
-                for (size_t off = 0; off < len; off += block)
-                {
-                    const size_t n = (std::min)(block, len - off);
-                    tasks.push_back({ a.begin + off, a.begin + off + n, 0, 0, a.begin + off });
-                }
-                nextRanges.push_back(a);
-                continue;
-            }
+        RunWorkers(workers, [&](unsigned worker) {
+            size_t* local = radixOffsets.data() + (size_t)worker * RadixBuckets;
+            const size_t begin = totalEvents * (size_t)worker / workers;
+            const size_t end = totalEvents * (size_t)(worker + 1) / workers;
+            for (size_t i = begin; i < end; ++i)
+                ++local[(keyOf(src[i]) >> shift) & RadixMask];
+        });
 
-            const Range b = ranges[r + 1];
-            const size_t aLen = a.end - a.begin;
-            const size_t bLen = b.end - b.begin;
-            const size_t total = aLen + bLen;
-            const size_t block = (std::max)((size_t)1, (total + workers * 4 - 1) / (workers * 4));
-            for (size_t d0 = 0; d0 < total; d0 += block)
-            {
-                const size_t d1 = (std::min)(total, d0 + block);
-                const size_t i0 = coRank(src, a.begin, aLen, b.begin, bLen, d0);
-                const size_t i1 = coRank(src, a.begin, aLen, b.begin, bLen, d1);
-                const size_t j0 = d0 - i0;
-                const size_t j1 = d1 - i1;
-                tasks.push_back({ a.begin + i0, a.begin + i1,
-                                  b.begin + j0, b.begin + j1,
-                                  a.begin + d0 });
+        size_t prefix = 0;
+        for (size_t bucket = 0; bucket < RadixBuckets; ++bucket) {
+            size_t offset = prefix;
+            for (unsigned worker = 0; worker < workers; ++worker) {
+                const size_t index = (size_t)worker * RadixBuckets + bucket;
+                const size_t count = radixOffsets[index];
+                radixOffsets[index] = offset;
+                offset += count;
             }
-            nextRanges.push_back({ a.begin, b.end });
+            prefix = offset;
         }
 
-        std::atomic<size_t> mergeDone{ 0 };
-        RunTaskPool(workers, tasks.size(), [&](unsigned worker, size_t taskIndex) {
-            const MergeTask& task = tasks[taskIndex];
-            if (task.b0 == task.b1)
-                std::copy(src.begin() + task.a0, src.begin() + task.a1, dst.begin() + task.out);
-            else
-                std::merge(src.begin() + task.a0, src.begin() + task.a1,
-                           src.begin() + task.b0, src.begin() + task.b1,
-                           dst.begin() + task.out, less);
-            const size_t done = mergeDone.fetch_add(1, std::memory_order_relaxed) + 1;
-            setProgress(worker, 1000 + (uint64_t)(done * 1000 / (std::max)((size_t)1, tasks.size())));
+        const uint64_t progressTarget = (uint64_t)(radixDone + 1) * 2000 / RadixPasses;
+        RunWorkers(workers, [&](unsigned worker) {
+            size_t* write = radixOffsets.data() + (size_t)worker * RadixBuckets;
+            const size_t begin = totalEvents * (size_t)worker / workers;
+            const size_t end = totalEvents * (size_t)(worker + 1) / workers;
+            for (size_t i = begin; i < end; ++i) {
+                const Ref ref = src[i];
+                const size_t bucket = (keyOf(ref) >> shift) & RadixMask;
+                dst[write[bucket]++] = ref;
+            }
+            setProgress(worker, progressTarget);
         });
-        for (unsigned worker = 0; worker < workers; ++worker)
-            setProgress(worker, 2000);
-
-        ranges.swap(nextRanges);
+        ++radixDone;
         sourceIsRefs = !sourceIsRefs;
-    }
+    };
+
+    auto kindKey = [&](Ref ref) -> uint32_t { return eventKind(ref); };
+    auto trackKey = [&](Ref ref) -> uint32_t { return eventTrackOf(ref); };
+    auto tickKey = [&](Ref ref) -> uint32_t { return (uint32_t)eventTickOf(ref) ^ 0x80000000u; };
+
+    radixPass(kindKey, 0);
+    radixPass(trackKey, 0);
+    radixPass(trackKey, 11);
+    radixPass(tickKey, 0);
+    radixPass(tickKey, 11);
+    radixPass(tickKey, 22);
+
     if (!sourceIsRefs)
         refs.swap(scratch);
     std::vector<Ref>().swap(scratch);
+    std::vector<size_t>().swap(radixOffsets);
 
     // Build tempo anchors once. Event timestamps can then be calculated
     // independently in each sorted slice with a local forward-only anchor index.
@@ -447,30 +342,22 @@ inline void MIDI::PostProcessParallel(
         setProgress(worker, 3000);
     });
 
-    // Pass 2: folded note-offs store length rather than an absolute timestamp.
-    // Full owner timestamps are complete now, so this pass is fully independent.
+    const size_t thinCount = m_vThinTicks.size();
     RunWorkers(workers, [&](unsigned worker) {
-        const size_t begin = sliceBegin[worker], end = sliceEnd[worker];
-        size_t ai = begin < end ? anchorForTick(eventTickOf(refs[begin])) : 0;
+        const size_t begin = thinCount * (size_t)worker / workers;
+        const size_t end = thinCount * (size_t)(worker + 1) / workers;
         const size_t span = (std::max)((size_t)1, end - begin);
-        for (size_t pos = begin; pos < end; ++pos)
-        {
-            const Ref ref = refs[pos];
-            if (!isMeta(ref) && IsThinRow((MIDIChannelEvent)ref))
-            {
-                const MIDIChannelEvent row = (MIDIChannelEvent)ref;
-                const int eventTick = (int)GetEventTicks(row);
-                while (ai + 1 < anchors.size() && anchors[ai + 1].tick <= eventTick)
-                    ++ai;
-                const long long eventTime = timeFromAnchor(eventTick, anchors[ai]);
-                const MIDIChannelEvent owner = GetThinOwner(row);
-                if (GetEventTicks(row) == GetEventTicks(owner))
-                    SetEventLength(row, 0);
-                else
-                    SetEventLength(row, (uint32_t)(std::max)(0LL, eventTime - GetEventTime(owner)));
-            }
-            if (((pos - begin) & 0xFFFFu) == 0)
-                setProgress(worker, 3000 + (uint64_t)((pos - begin) * 1000 / span));
+        for (size_t thin = begin; thin < end; ++thin) {
+            const int eventTick = (int)m_vThinTicks[thin];
+            const size_t ai = anchorForTick(eventTick);
+            const long long eventTime = timeFromAnchor(eventTick, anchors[ai]);
+            const MIDIChannelEvent owner = (MIDIChannelEvent)(m_vThinOwners[thin] & ~THIN_OWNER_NOTEON_FLAG);
+            if (m_vThinTicks[thin] == m_vTicks[owner])
+                m_vThinLengths[thin] = 0;
+            else
+                m_vThinLengths[thin] = (uint32_t)(std::max)(0LL, eventTime - m_vTimes[owner]);
+            if (((thin - begin) & 0xFFFFu) == 0)
+                setProgress(worker, 3000 + (uint64_t)((thin - begin) * 1000 / span));
         }
         setProgress(worker, 4000);
     });
@@ -521,9 +408,6 @@ inline void MIDI::PostProcessParallel(
 
     std::vector<Ref>().swap(refs);
 
-    // Legacy behavior restores repeated-note ordering after time conversion:
-    // within every equal-microsecond channel group, folded note-offs (thin rows)
-    // precede pool rows. Partition groups in independent physical-core slices.
     if (newChannelCount > 1)
     {
         std::vector<size_t> boundaries(workers + 1, 0);
@@ -582,9 +466,6 @@ inline void MIDI::PostProcessParallel(
             setProgress(worker, 6000);
     }
 
-    // Sister-index pass A: paired pool rows temporarily store their own final
-    // list position. Thin rows can then resolve the final owner position without
-    // a separate row->position array (which would cost hundreds of MB here).
     std::vector<std::vector<pair<long long, int>>> programLocal(workers);
     RunWorkers(workers, [&](unsigned worker) {
         const size_t begin = newChannelCount * (size_t)worker / workers;
