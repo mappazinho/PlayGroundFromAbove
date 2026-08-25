@@ -246,10 +246,21 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
         if (blockMax >= oldest) {
             const size_t begin = block * ImageBufferPreparedRawBlockNotes;
             const size_t end = (std::min)(hi, begin + ImageBufferPreparedRawBlockNotes);
-            for (size_t i = end; i != begin; ) {
-                --i;
-                const ImageBufferPreparedRawNote& raw = source.notes[i];
-                ++result.rawVisited;
+            size_t subBlock = (end - 1) / ImageBufferPreparedRawSubBlockNotes;
+            const size_t firstSubBlock = begin / ImageBufferPreparedRawSubBlockNotes;
+            for (;;) {
+                const uint64_t subMax = params.tickMode
+                    ? source.subMaxEndTick150[subBlock]
+                    : source.subMaxEndTime150_100us[subBlock] * 100ULL;
+                if (subMax >= oldest) {
+                    const size_t subBegin = (std::max)(begin,
+                        subBlock * ImageBufferPreparedRawSubBlockNotes);
+                    const size_t subEnd = (std::min)(end,
+                        (subBlock + 1) * ImageBufferPreparedRawSubBlockNotes);
+                    for (size_t i = subEnd; i != subBegin; ) {
+                        --i;
+                        const ImageBufferPreparedRawNote& raw = source.notes[i];
+                        ++result.rawVisited;
 
                 int note = raw.key;
                 int track = raw.track;
@@ -293,8 +304,13 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
                     row = next[base + row];
                 }
 
-                if (remainingCells == 0)
+                        if (remainingCells == 0)
+                            break;
+                    }
+                }
+                if (remainingCells == 0 || subBlock == firstSubBlock)
                     break;
+                --subBlock;
             }
         }
 

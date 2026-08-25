@@ -10,7 +10,9 @@
 #include <vector>
 
 static constexpr size_t ImageBufferOverlapBlockEvents = 4096;
+static constexpr size_t ImageBufferOverlapSubBlockEvents = 64;
 static constexpr size_t ImageBufferPreparedRawBlockNotes = 2048;
+static constexpr size_t ImageBufferPreparedRawSubBlockNotes = 64;
 
 struct ImageBufferPreparedRawNote {
     uint64_t seed = 0;
@@ -29,6 +31,8 @@ struct ImageBufferPreparedSource {
     // to 50%. The caller separately subtracts the start-shift margin.
     std::vector<uint64_t> maxEndTime150_100us;
     std::vector<uint64_t> maxEndTick150;
+    std::vector<uint64_t> subMaxEndTime150_100us;
+    std::vector<uint64_t> subMaxEndTick150;
     std::vector<uint64_t> prefixMaxEndTime150_100us;
     std::vector<uint64_t> prefixMaxEndTick150;
     bool timeOverflow = false;
@@ -45,6 +49,8 @@ struct ImageBufferOverlapIndexState {
     long long lastTime = 0;
     std::vector<long long> maxEndTime;
     std::vector<long long> maxEndTick;
+    std::vector<long long> subMaxEndTime;
+    std::vector<long long> subMaxEndTick;
     std::vector<long long> prefixMaxEndTime;
     std::vector<long long> prefixMaxEndTick;
     std::shared_ptr<const ImageBufferPreparedSource> preparedSource;
@@ -95,6 +101,8 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     const MIDIChannelEvent* const data = events.empty() ? nullptr : events.data();
     const size_t blockCount =
         (events.size() + ImageBufferOverlapBlockEvents - 1) / ImageBufferOverlapBlockEvents;
+    const size_t subBlockCount =
+        (events.size() + ImageBufferOverlapSubBlockEvents - 1) / ImageBufferOverlapSubBlockEvents;
     const uint64_t firstEvent = events.empty() ? 0 : (uint64_t)events.front();
     const uint64_t lastEvent = events.empty() ? 0 : (uint64_t)events.back();
     const long long firstTime = events.empty() ? 0 : midi.GetEventTime(events.front());
@@ -107,7 +115,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
         state.eventCount == events.size() && state.firstEvent == firstEvent &&
         state.lastEvent == lastEvent && state.firstTime == firstTime &&
         state.lastTime == lastTime && state.maxEndTime.size() == blockCount &&
-        state.preparedAttempted)
+        state.subMaxEndTime.size() == subBlockCount && state.preparedAttempted)
         return state;
 
     state.owner = owner;
@@ -119,6 +127,8 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     state.lastTime = lastTime;
     state.maxEndTime.assign(blockCount, (std::numeric_limits<long long>::min)());
     state.maxEndTick.assign(blockCount, (std::numeric_limits<long long>::min)());
+    state.subMaxEndTime.assign(subBlockCount, (std::numeric_limits<long long>::min)());
+    state.subMaxEndTick.assign(subBlockCount, (std::numeric_limits<long long>::min)());
     state.prefixMaxEndTime.resize(blockCount);
     state.prefixMaxEndTick.resize(blockCount);
     state.preparedSource.reset();
@@ -154,10 +164,15 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
         const long long worstTime = ImageBufferOverlapWorstEnd(startTime, lengthTime);
         const long long worstTick = ImageBufferOverlapWorstEnd(startTickLL, lengthTickLL);
         const size_t eventBlock = i / ImageBufferOverlapBlockEvents;
+        const size_t eventSubBlock = i / ImageBufferOverlapSubBlockEvents;
         if (worstTime > state.maxEndTime[eventBlock])
             state.maxEndTime[eventBlock] = worstTime;
         if (worstTick > state.maxEndTick[eventBlock])
             state.maxEndTick[eventBlock] = worstTick;
+        if (worstTime > state.subMaxEndTime[eventSubBlock])
+            state.subMaxEndTime[eventSubBlock] = worstTime;
+        if (worstTick > state.subMaxEndTick[eventSubBlock])
+            state.subMaxEndTick[eventSubBlock] = worstTick;
 
         if (!source)
             continue;
@@ -195,9 +210,14 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
             const size_t rawIndex = source->notes.size();
             source->notes.push_back(raw);
             const size_t rawBlock = rawIndex / ImageBufferPreparedRawBlockNotes;
+            const size_t rawSubBlock = rawIndex / ImageBufferPreparedRawSubBlockNotes;
             if (rawBlock >= source->maxEndTime150_100us.size()) {
                 source->maxEndTime150_100us.push_back(0);
                 source->maxEndTick150.push_back(0);
+            }
+            if (rawSubBlock >= source->subMaxEndTime150_100us.size()) {
+                source->subMaxEndTime150_100us.push_back(0);
+                source->subMaxEndTick150.push_back(0);
             }
 
             const uint64_t worst100 = (uint64_t)raw.start100us +
@@ -208,6 +228,10 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
                 source->maxEndTime150_100us[rawBlock] = worst100;
             if (worstRawTick > source->maxEndTick150[rawBlock])
                 source->maxEndTick150[rawBlock] = worstRawTick;
+            if (worst100 > source->subMaxEndTime150_100us[rawSubBlock])
+                source->subMaxEndTime150_100us[rawSubBlock] = worst100;
+            if (worstRawTick > source->subMaxEndTick150[rawSubBlock])
+                source->subMaxEndTick150[rawSubBlock] = worstRawTick;
         } catch (const std::bad_alloc&) {
             // Preparation is an optimization. Keep the exact block index and
             // abandon the compact source instead of failing song playback.
@@ -280,17 +304,33 @@ inline void ImageBufferOverlapVisit(
         if (blockMaxEnd >= oldestUsefulEnd) {
             const size_t begin = block * ImageBufferOverlapBlockEvents;
             const size_t end = (std::min)(hi, begin + ImageBufferOverlapBlockEvents);
-            for (size_t i = end; i != begin; ) {
-                --i;
-                const MIDIChannelEvent event = events[i];
-                if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
-                    midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
-                    continue;
+            size_t subBlock = (end - 1) / ImageBufferOverlapSubBlockEvents;
+            const size_t firstSubBlock = begin / ImageBufferOverlapSubBlockEvents;
+            for (;;) {
+                const long long subMaxEnd = tickMode
+                    ? state.subMaxEndTick[subBlock]
+                    : state.subMaxEndTime[subBlock];
+                if (subMaxEnd >= oldestUsefulEnd) {
+                    const size_t subBegin = (std::max)(begin,
+                        subBlock * ImageBufferOverlapSubBlockEvents);
+                    const size_t subEnd = (std::min)(end,
+                        (subBlock + 1) * ImageBufferOverlapSubBlockEvents);
+                    for (size_t i = subEnd; i != subBegin; ) {
+                        --i;
+                        const MIDIChannelEvent event = events[i];
+                        if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                            midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
+                            continue;
 
-                NoteData data = buildNote(event, chunkStart);
-                if (data.pos < (float)timeSpan &&
-                    data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
-                    visitor(data);
+                        NoteData data = buildNote(event, chunkStart);
+                        if (data.pos < (float)timeSpan &&
+                            data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
+                            visitor(data);
+                    }
+                }
+                if (subBlock == firstSubBlock)
+                    break;
+                --subBlock;
             }
         }
 
