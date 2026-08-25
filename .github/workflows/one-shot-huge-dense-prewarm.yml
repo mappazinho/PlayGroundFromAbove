@@ -1,0 +1,62 @@
+name: One-shot huge dense prewarm patch
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/huge-dense-cpu-prewarm
+          fetch-depth: 0
+
+      - name: Extract and run patch script
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          wf = Path('.github/workflows/apply-huge-dense-cpu-prewarm-v2.yml').read_text(encoding='utf-8').splitlines()
+          start = next(i for i, line in enumerate(wf) if line.strip() == 'run: |' and i > 0 and 'Patch source' in wf[i-1])
+          block = []
+          for line in wf[start + 1:]:
+              if line and not line.startswith('          '):
+                  break
+              block.append(line[10:] if line.startswith('          ') else '')
+          script = '\n'.join(block) + '\n'
+          Path('.github/apply_patch.py').write_text(script, encoding='utf-8')
+          subprocess.run(['python', '.github/apply_patch.py'], check=True)
+          Path('.github/apply_patch.py').unlink(missing_ok=True)
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'ImageBufferHugePreparedState' PianoFromAbove/GameState.cpp
+          grep -F 'cpuPrepared < s_ImageBufferPrewarmGpu.cpuTotal' PianoFromAbove/GameState.cpp
+          grep -F 'ImageBufferHugePreparedGet(this, imageBufferChunk)' PianoFromAbove/GameState.cpp
+
+      - name: Compile Release x64 source
+        shell: powershell
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild PianoFromAbove.sln /m /p:Configuration=Release /p:Platform=x64 /t:"FxCompile;ClCompile" /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit patched branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Prewarm huge dense chunks before playback"
+          git push origin HEAD:fix/huge-dense-cpu-prewarm
