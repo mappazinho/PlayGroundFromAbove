@@ -23,7 +23,8 @@ jobs:
           import subprocess
 
           wf = Path('.github/workflows/apply-huge-dense-cpu-prewarm-v2.yml').read_text(encoding='utf-8').splitlines()
-          start = next(i for i, line in enumerate(wf) if line.strip() == 'run: |' and i > 0 and 'Patch source' in wf[i-1])
+          patch_step = next(i for i, line in enumerate(wf) if 'Patch source' in line)
+          start = next(i for i in range(patch_step + 1, len(wf)) if wf[i].strip() == 'run: |')
           block = []
           for line in wf[start + 1:]:
               if line and not line.startswith('          '):
