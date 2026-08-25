@@ -727,12 +727,7 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
 
 HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     ImGui::Render();
-    ImDrawData* drawData = ImGui::GetDrawData();
-    drawData->AddDrawList(m_pDrawList);
-    for (int i = drawData->CmdListsCount - 1; i > 0; --i)
-        drawData->CmdLists[i] = drawData->CmdLists[i - 1];
-    if (drawData->CmdListsCount > 0)
-        drawData->CmdLists[0] = m_pDrawList;
+    ImGui::GetDrawData()->AddDrawList(m_pDrawList);
 
     if (draw_bg) {
         SetPipeline(Pipeline::Background);
