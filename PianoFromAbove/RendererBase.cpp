@@ -197,7 +197,7 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
                 ImageBufferPreparedCancelPlaybackGate();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Prepares every dense image-buffer chunk before a requested playback start.");
+            ImGui::SetTooltip("Prepares dense image-buffer chunks before a requested playback start.");
         ImGui::EndDisabled();
         ImGui::Unindent();
     }
