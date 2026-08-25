@@ -1,0 +1,64 @@
+name: Finalize toolbar stats layering
+
+on:
+  push:
+    branches: [fix/toolbar-stats-layering]
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate complete status panel
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p = Path("PianoFromAbove/GameStateLegacy.inc")
+          s = p.read_text(encoding="utf-8")
+          old = '''void MainScreen::RenderStatus(int lines)
+          {
+              auto dl = m_pRenderer->GetDrawList();
+          '''
+          new = '''void MainScreen::RenderStatus(int lines)
+          {
+              if (StatsCoveredByUI(m_pRenderer))
+                  return;
+              auto dl = m_pRenderer->GetDrawList();
+          '''
+          if old not in s:
+              raise SystemExit("RenderStatus entry not found")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          Path(".github/workflows/finalize-toolbar-stats-layering.yml").unlink()
+          '@ | Set-Content -Encoding UTF8 patch.py
+          python patch.py
+          Remove-Item patch.py
+
+      - name: Validate
+        shell: pwsh
+        run: |
+          $s = Get-Content PianoFromAbove/GameStateLegacy.inc -Raw
+          if ($s -notmatch 'void MainScreen::RenderStatus\(int lines\)[\s\S]*?StatsCoveredByUI\(m_pRenderer\)') { throw 'complete status guard missing' }
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $msbuild = Join-Path $install 'MSBuild\Current\Bin\MSBuild.exe'
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Hide status overlays while UI panels are open"
+          git push
