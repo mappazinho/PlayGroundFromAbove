@@ -83,9 +83,6 @@ struct FixedSizeConstants {
     float bends[16];
 };
 
-// Image buffer cache key: everything that changes the baked chunk content.
-// Warp fields are deliberately excluded: nonzero warp disables the image
-// buffer, and the warp seeds are randomized every frame even while warp is 0.
 struct ChunkCacheKey {
     int width = 0;
     int height = 0;
@@ -118,9 +115,8 @@ public:
 
     virtual ~Renderer() {}
 
-    // Picks the backend: D3D12 when the user requested it and this machine can
-    // create a D3D12 device (g_bD3D12Available probe, no boot-time fallback),
-    // otherwise D3D11.
+    // Picks the backend: D3D12 when the user requested it and this machine can create a D3D12 device
+    // (g_bD3D12Available probe, no boot-time fallback), otherwise D3D11.
     static Renderer* CreateInstance();
 
     // Human-readable name of the active backend, e.g. "DirectX 12".
@@ -221,12 +217,11 @@ public:
         m_fRibbonX = x; m_fRibbonY = y; m_fRibbonCX = cx; m_fRibbonCY = cy;
     }
 
-    // --- Image buffer (pre-rendered note chunks) -----------------------------
-    // Pre-renders fixed-size chunks of the note roll into offscreen textures
-    // and draws them as scrolling textured quads, replacing per-note vertex
-    // dispatch with a handful of quad draws in high note-density playback.
     static constexpr unsigned ChunkPoolSize = 64;
     static constexpr long long ImageBufferInvalidChunk = (std::numeric_limits<long long>::max)();
+    static constexpr long long ImageBufferStripChunkBase = (1LL << 60);
+    static long long ImageBufferStripChunkKey(long long chunk) { return ImageBufferStripChunkBase + chunk; }
+    static bool ImageBufferIsStripChunkKey(long long key) { return key != ImageBufferInvalidChunk && key >= (ImageBufferStripChunkBase >> 1); }
 
     struct ChunkBuildRequest {
         long long chunk;

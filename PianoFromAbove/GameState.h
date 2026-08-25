@@ -54,10 +54,6 @@ public:
 
     virtual GameError Render() = 0;
 
-    // Called by the game thread just before a new song load begins; frees the
-    // heavy song data so the old state stops consuming RAM while the next file
-    // is parsed. After this, Logic()/Render() are no-ops until ChangeState
-    // deletes the state.
     virtual void Discard() { m_bDiscarded = true; }
     bool IsDiscarded() const { return m_bDiscarded; }
 
@@ -164,11 +160,8 @@ typedef struct {
     unsigned sister_idx;
 } thread_work_t;
 
-// MainScreen's legacy Logic() still performs visual event/state bookkeeping.
-// Once the independent playback thread takes ownership, these hidden methods
-// make every legacy output operation a no-op while preserving the exact class
-// interface used by the old code. Splash/FreePlay keep using MIDIOutDevice
-// normally, so live keyboard input remains immediate.
+// MainScreen's legacy Logic() still performs visual event/state bookkeeping. Once the
+// independent playback thread takes ownership, these hidden methods make every legacy output
 class MainPlaybackMIDIOutDevice : public MIDIOutDevice
 {
 public:
@@ -321,6 +314,7 @@ protected:
     void RenderPianoRollStripNote(MIDIChannelEvent pNote);
     virtual NoteData BuildRenderNoteData(MIDIChannelEvent pNote) const;
     void RenderNotesImageBuffer();
+    void RenderPianoRollStripImageBuffer();
     NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
     void GenNoteXTable();
     float GetNoteX( int iNote );
@@ -375,9 +369,8 @@ void RenderText();
     bool m_bTickMode = false;
     bool m_bAudioStarted = false; // Pre-rendered audio: started once per screen
 
-    // Independent live-MIDI clock/scheduler. The renderer only snapshots control
-    // changes; this thread owns the output provider and advances from QPC even
-    // when Present/Render is blocked for multiple visual frames.
+    // Independent live-MIDI clock/scheduler. The renderer only snapshots control changes; this
+    // thread owns the output provider and advances from QPC even when Present/Render is blocked
     std::thread m_PlaybackAudioThread;
     std::atomic<bool> m_bPlaybackAudioExit{ false };
     std::atomic<bool> m_bPlaybackAudioRunning{ false };
@@ -462,12 +455,6 @@ void RenderText();
     HANDLE m_hFFPipeWrite = NULL;
     HANDLE m_hFFProc = NULL;
     std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
-    // BeginVideoRender is deferred to the top of Logic() (the click happens
-    // inside Logic's ImGui pass), and the swapchain resize itself goes through
-    // the main window's WM_SIZE -> drain -> ResetDevice path (the same one
-    // maximize/restore uses): the window is resized to the render resolution
-    // first, so the swapchain always matches its window. Forcing ResizeBuffers
-    // to a size that doesn't match the window hung the driver (TDR).
     bool m_bRenderPending = false;
     bool m_bRenderMainRectSaved = false;
     RECT m_rcRenderMainSaved = {};

@@ -6,12 +6,8 @@
 #include <cmath>
 #include <unordered_map>
 
-// Direct rendering is exact and intentionally untouched for ordinary frames.
-// Once a frame exceeds 100k submitted notes, however, millions of same-key
-// bars can be completely hidden by newer bars at the same screen pixels. Track
-// a tiny per-key row ownership set so notes that cannot contribute a visible
-// pixel never reach the giant CPU/GPU staging vectors. The ownership structure
-// uses next-unfilled-row links, so every screen row is claimed at most once.
+// Direct rendering is exact and intentionally untouched for ordinary frames. Once a frame
+// exceeds 100k submitted notes, however, millions of same-key bars can be completely hidden
 struct DirectNoteCullState {
     unsigned frame = (std::numeric_limits<unsigned>::max)();
     bool active = false;
@@ -62,9 +58,6 @@ static bool DirectNoteCullContributes(
     if (!(span > 0.0) || !(noteRows > 0.0) || state.rows <= 0)
         return true;
 
-    // Mirror the vertex shader's vertical rounding. Using the actual raster
-    // bounds rather than only time-domain intervals also accounts for deflate's
-    // minimum note height and avoids culling a row the GPU would still expose.
     const double length = (std::max)(0.0, (double)data.length);
     const double y = std::round(noteRows * (1.0 - (double)data.pos / span));
     const double cy = (std::max)(std::round(noteRows * length / span), (double)root.deflate);
@@ -126,10 +119,6 @@ bool Renderer::PushNoteDataFiltered(NoteData data)
                         state.next[base + row] = row;
                 }
 
-                // Re-run the first 100k submissions through the ownership map,
-                // preserving their original order while dropping already-hidden
-                // entries. This prevents the threshold itself becoming a fixed
-                // 100k-note GPU tax on every dense frame.
                 std::vector<NoteData> seed;
                 seed.swap(m_vNotesIntermediate);
                 m_vNotesIntermediate.reserve((std::min)(
@@ -169,11 +158,6 @@ bool Renderer::PushNoteDataFiltered(NoteData data)
     return true;
 }
 
-// Keep the RenderMode UI in the legacy renderer body, but add the dense-prewarm
-// switch immediately below its existing Image Buffer Notes checkbox without
-// duplicating the large RenderImGuiFrame implementation. The Viz tab is tracked
-// as well so controls that belong exclusively to RenderMode can be suppressed
-// there without forking the legacy UI implementation.
 namespace ImGui {
 static bool s_PGFAInVizPreferences = false;
 
@@ -199,9 +183,6 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
     const bool wasEnabled = value && *value;
     const bool changed = Checkbox(label, value);
     if (label && strcmp(label, "Image Buffer Notes") == 0) {
-        // Waiting/progress is the safe default whenever image buffering is
-        // enabled. Do this on the first UI observation too, so a config that
-        // starts with Image Buffer Notes already enabled behaves identically.
         static bool initialized = false;
         if ((!initialized && value && *value) || (changed && !wasEnabled && value && *value))
             ImageBufferPreparedSetWaitBeforePlayback(true);
@@ -232,9 +213,8 @@ static bool PGFASliderInt(const char* label, int* v, int v_min, int v_max,
 }
 }
 
-// Compile the existing shared renderer unchanged under a legacy name for the
-// one method this file replaces. These aliases add the Image Buffer wait switch
-// and hide RenderMode-only bounce controls from the Viz preferences tab.
+// Compile the existing shared renderer unchanged under a legacy name for the one method this
+// file replaces. These aliases add the Image Buffer wait switch and hide RenderMode-only
 #define BeginTabItem PGFABeginTabItem
 #define EndTabItem PGFAEndTabItem
 #define Checkbox PGFAImageBufferCheckbox
@@ -253,9 +233,8 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
     // full-song preparation even if the current lookahead is already cached.
     ImageBufferPrewarmRendererSeen(this);
 
-    // A dense chunk owned by the CPU preparation queue deliberately supplies no
-    // notes until its compact representation is ready. Do not let an empty
-    // request become a permanently cached blank texture.
+    // A dense chunk owned by the CPU preparation queue deliberately supplies no notes until its
+    // compact representation is ready. Do not let an empty request become a permanently cached
     if (ImageBufferPreparedRenderPending(this, chunk))
         return false;
 
@@ -295,9 +274,8 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
     if (state.requestQueued)
         return false;
 
-    // A newly-visible missing chunk takes priority over an unfinished future
-    // chunk. Release the reserved slot; its next first pass will clear stale
-    // color/depth before restarting from note zero.
+    // A newly-visible missing chunk takes priority over an unfinished future chunk. Release the
+    // reserved slot; its next first pass will clear stale color/depth before restarting from note
     if (state.slot >= 0 && state.chunk != chunk) {
         if (state.slot < (int)ChunkPoolSize &&
             m_ChunkCache[state.slot].generation == m_ullImageBufferGeneration &&
@@ -316,11 +294,6 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         return false;
 
     if (state.slot < 0) {
-        // Reservation happens earlier than the legacy backend allocation, before
-        // this frame's visible quad list has been populated. Use LRU here rather
-        // than the legacy lowest-chunk eviction rule: screens visible last frame
-        // have the freshest lastUsed value, while the in-progress sentinel is
-        // never considered an eviction candidate.
         int slot = -1;
         for (unsigned i = 0; i < ChunkPoolSize; ++i) {
             if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||

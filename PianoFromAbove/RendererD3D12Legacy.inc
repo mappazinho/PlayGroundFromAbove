@@ -849,10 +849,6 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
         }
 
         HeartbeatLog("resize:resizebuffers");
-        // Resize the swap chain (0x0 = follow the window; the swapchain must
-        // always match its window - forcing a size here while the window stays
-        // put hung the driver (TDR) on this GPU, so the render resizes the
-        // window instead and lets this auto-size path follow).
         res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
                                           m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(res)) {
@@ -883,9 +879,6 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
         };
         res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
         if (FAILED(res)) {
-            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1
-            // path) and fail with E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions,
-            // virtual GPUs, etc. Fall back to the bitblt model, which works everywhere.
             HeartbeatLog("swapchain:flipfailed - trying bitblt");
             m_bAllowTearing = false;
             swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -1311,10 +1304,8 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
             return res;
     }
 
-    // Chunk draws above reference slices in this frame's upload buffer. If a
-    // visible chunk overflowed the bake budget, the fallback path below needs
-    // to reuse that same buffer. Submit and retire the chunk work first so the
-    // fallback upload cannot mutate memory referenced by recorded D3D12 draws.
+    // Chunk draws above reference slices in this frame's upload buffer. If a visible chunk
+    // overflowed the bake budget, the fallback path below needs to reuse that same buffer. Submit
     if (!m_vChunkBuilds.empty() && !m_vNotesIntermediate.empty()) {
         res = m_pCommandList->Close();
         if (FAILED(res))
@@ -1731,10 +1722,12 @@ void D3D12Renderer::DrawPianoRollStrip() {
     if (!stripViz.bDualPianoRoll && !horizontal)
         return;
 
-    const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
-        ? m_vPianoRollStripNotesIntermediate
-        : m_vNotesIntermediate;
-    if (stripNotes.empty())
+    if (stripViz.bImageBufferNotes && m_vPianoRollStripNotesIntermediate.empty())
+            return;
+        const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+            ? m_vPianoRollStripNotesIntermediate
+            : m_vNotesIntermediate;
+        if (stripNotes.empty())
         return;
 
     const size_t stripCount = m_bUnlimitedNotes
@@ -1917,12 +1910,6 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         }
     }
 
-    // The chunk textures, depth and fixed buffer are shared across frames, but
-    // PresentBackend only fences the previous use of the current swapchain
-    // buffer (up to 2 frames in flight). Baking/sampling the same chunk
-    // resources in consecutive frames races the in-flight GPU work, which
-    // can hang or reset the driver. Serialize with the GPU before touching
-    // any chunk resource this frame.
     HRESULT res = WaitForGPU();
     if (FAILED(res))
         return res;
@@ -1959,10 +1946,6 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         m_pCommandList->ResourceBarrier(1, &fixed_barrier);
     }
 
-    // A D3D12 upload heap is not implicitly renamed like D3D11 WRITE_DISCARD.
-    // Upload the complete per-frame chunk-note array once and point each
-    // recorded chunk draw at its own immutable slice. Rewriting offset 0 for
-    // every draw made earlier draws observe later chunks' note data.
     if (!m_vChunkNotes.empty()) {
         const SIZE_T chunkBytes = (SIZE_T)m_vChunkNotes.size() * sizeof(NoteData);
         D3D12_RANGE noRead = { 0, 0 };
@@ -2011,8 +1994,16 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         m_pCommandList->ClearDepthStencilView(m_ChunkDSVCPU, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         if (req.noteCount > 0) {
+            RootConstants requestRoot = chunkRoot;
+            if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                requestRoot.stripMode = 1.0f;
+                requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                requestRoot.notes_y = 0.0f;
+                requestRoot.notes_cy = (float)W;
+                requestRoot.white_cx = (float)H / 75.0f;
+            }
             SetPipeline(Pipeline::Note);
-            m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(chunkRoot) / 4, &chunkRoot, 0);
+            m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(requestRoot) / 4, &requestRoot, 0);
             m_pCommandList->SetGraphicsRootShaderResourceView(1, m_pChunkFixedBuffer->GetGPUVirtualAddress());
             m_pCommandList->SetGraphicsRootShaderResourceView(2, m_pTrackColorBuffer->GetGPUVirtualAddress());
             const D3D12_GPU_VIRTUAL_ADDRESS noteBase =
@@ -2061,14 +2052,30 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
 
         for (const auto& quad : m_vChunkQuads) {
             const int slot = ImageBufferGetChunkSlot(quad.chunk);
-            if (slot < 0)
-                continue; // not baked this frame (shouldn't happen)
+            if (slot < 0) continue;
             m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
-            quadConstants.quadPos[0] = notesX;
-            quadConstants.quadPos[1] = quad.yTop;
-            quadConstants.quadSize[0] = notesCX;
-            quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
-            m_pCommandList->RSSetScissorRects(1, &notes_scissor);
+            D3D12_RECT scissor = notes_scissor;
+            if (Renderer::ImageBufferIsStripChunkKey(quad.chunk)) {
+                const auto& viz = Config::GetConfig().GetVizSettings();
+                const float top = viz.bHorizontalPianoRoll ? 0.0f : 55.0f;
+                const float height = viz.bHorizontalPianoRoll ? (float)m_iBufferHeight
+                    : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+                quadConstants.quadPos[0] = quad.yTop;
+                quadConstants.quadPos[1] = top;
+                quadConstants.quadSize[0] = max(0.0f, quad.yBottom - quad.yTop);
+                quadConstants.quadSize[1] = height;
+                scissor.left = (LONG)max(0.0f, floorf(quad.yTop));
+                scissor.right = (LONG)min((float)m_iBufferWidth, ceilf(quad.yBottom));
+                scissor.top = (LONG)max(0.0f, floorf(top));
+                scissor.bottom = (LONG)min((float)m_iBufferHeight, ceilf(top + height));
+                if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) continue;
+            } else {
+                quadConstants.quadPos[0] = notesX;
+                quadConstants.quadPos[1] = quad.yTop;
+                quadConstants.quadSize[0] = notesCX;
+                quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+            }
+            m_pCommandList->RSSetScissorRects(1, &scissor);
             m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(quadConstants) / 4, &quadConstants, 0);
             m_pCommandList->SetGraphicsRootDescriptorTable(1, m_ChunkSRVGPU[slot]);
             m_pCommandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
@@ -2369,10 +2376,8 @@ float4 main(PSInput input) : SV_TARGET {
         float denom = max(fade_start + 1.0, fade_end) - fade_start;
         float t = saturate((input.position.y - fade_start) / denom);
         float s = t * t * (3.0 - 2.0 * t);
-        // 4th cbuffer float = fade mode: 1 gives alpha = smoothstep (blur in
-        // the strip, fading out toward fade_end / bottom edge); 0 gives
-        // alpha = 1 - smoothstep (sharp above, fading out toward fade_start /
-        // top edge).
+        // 4th cbuffer float = fade mode: 1 gives alpha = smoothstep (blur in the strip, fading out
+        // toward fade_end / bottom edge); 0 gives alpha = 1 - smoothstep (sharp above, fading out
         alpha = (opacity > 0.5) ? s : (1.0 - s);
     } else {
         alpha = 1.0 - opacity * c.a;
@@ -2513,9 +2518,6 @@ static HRESULT CompileBloomShader(ID3DBlob** ppBlob) {
     return D3DCompile(g_BloomHLSL, strlen(g_BloomHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
 }
 
-// Vignette: a fullscreen multiply pass after bloom. The pixel shader computes a
-// radial falloff factor from the UVs and the frame is darkened multiplicatively
-// (DEST_COLOR x vignette factor), so no scene texture needs to be sampled.
 static const char* g_VignetteHLSL = R"(
 cbuffer VignetteConstants : register(b0) {
     float g_intensity;
@@ -3026,10 +3028,8 @@ void D3D12Renderer::DestroyBlurResources() {
 }
 
 void D3D12Renderer::ApplyBlur() {
-    // Guard against partial creation (a failed blur rebuild during a TDR recovery
-    // can leave some members null) and skip entirely while the loading modal is
-    // up: the scene behind it is frozen and the load is exactly when the driver
-    // is most at risk, so there is no reason to dispatch compute here.
+    // Guard against partial creation (a failed blur rebuild during a TDR recovery can leave some
+    // members null) and skip entirely while the loading modal is up: the scene behind it is
     if (g_bShowLoading || !m_pBlurPipelineState || !m_pSceneCopy || !m_pBlurTemp ||
         !m_pBlurOutput || !m_pBlurRootSignature)
         return;
