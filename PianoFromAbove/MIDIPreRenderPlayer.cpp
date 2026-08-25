@@ -23,7 +23,7 @@ static float* s_pRingBuffer = nullptr;
 // PRE_AudioStalled() to detect a stalled audio device (observed on this machine: the
 // DirectSound waveout thread parks on a buffer event that never fires again after a
 // display/GPU hiccup, leaving the app alive but silent).
-static volatile long long s_llLastCallbackTick = 0;
+static std::atomic<long long> s_llLastCallbackTick{ 0 };
 
 static bool PRE_OpenDevice();
 
@@ -66,7 +66,7 @@ void PRE_DbgLog(const char* format, ...)
 
 void PRE_FillAudio(void* udata, Uint8* stream, int len)
 {
-	s_llLastCallbackTick = SDL_GetTicks64();
+	s_llLastCallbackTick.store((long long)SDL_GetTicks64(), std::memory_order_relaxed);
 	SDL_memset(stream, 0, len);
 	if (PRE_MIDIAudio && s_pRingBuffer)
 	{
@@ -144,16 +144,32 @@ void PRE_Reset()
 		memset(s_pRingBuffer, 0, (size_t)s_bufferSize * sizeof(float) * (size_t)s_bufferSecs);
 }
 
+void PRE_TouchAudio()
+{
+	s_llLastCallbackTick.store((long long)SDL_GetTicks64(), std::memory_order_relaxed);
+}
+
 bool PRE_AudioStalled()
 {
-	long long now = SDL_GetTicks64();
-	long long last = s_llLastCallbackTick;
-	return (now - last) > 2000;
+	// A paused device is intentionally not producing callbacks. The game thread
+	// touches the timestamp while paused, and PRE_OpenDevice() establishes a fresh
+	// startup grace period before the first callback is expected.
+	if (SDL_GetAudioStatus() != SDL_AUDIO_PLAYING)
+		return false;
+	const long long now = (long long)SDL_GetTicks64();
+	const long long last = s_llLastCallbackTick.load(std::memory_order_relaxed);
+	if (last <= 0) {
+		PRE_TouchAudio();
+		return false;
+	}
+	return (now - last) > 2500;
 }
 
 void PRE_RestartAudio()
 {
-	PRE_DbgLog("RestartAudio: err='%s' lastCB=%lldms", SDL_GetError() ? SDL_GetError() : "(null)", (long long)s_llLastCallbackTick);
+	const long long last = s_llLastCallbackTick.load(std::memory_order_relaxed);
+	PRE_DbgLog("RestartAudio: err='%s' lastCB=%lldms",
+		SDL_GetError() ? SDL_GetError() : "(null)", last);
 	SDL_CloseAudio();
 	PRE_OpenDevice();
 }
@@ -166,6 +182,9 @@ static bool PRE_OpenDevice()
 		return false;
 	}
 	SDL_PauseAudio(1);
+	// Opening/reopening is not a stall. Give WASAPI time to dispatch its first
+	// callback after the game thread resumes the device.
+	PRE_TouchAudio();
 	PRE_DbgLog("PRE_InitAudio: SDL audio driver='%s'", SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(null)");
 	return true;
 }
