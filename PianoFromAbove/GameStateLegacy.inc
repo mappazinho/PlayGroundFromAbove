@@ -3828,17 +3828,29 @@ void MainScreen::RenderBorder()
                            iBkg, iBlack, iBlack, iBkg );
 }
 
+static bool StatsCoveredByUI(Renderer* renderer)
+{
+    return renderer && (
+        renderer->m_bShowPreferences ||
+        renderer->m_bShowAbout ||
+        renderer->m_bShowSetResolution ||
+        renderer->m_bShowTrackSettings ||
+        renderer->m_bShowRenderDialog ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId));
+}
+
 void MainScreen::RenderText()
 {
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
+    const bool showNerdStats = viz.bNerdStats && !StatsCoveredByUI(m_pRenderer);
 
     int iLines = IsFreePlay() ? 1 : 2;
     if (m_bShowFPS && !m_bDumpFrames)
         iLines++;
-    if (viz.bNerdStats)
+    if (showNerdStats)
         iLines += 8;
-    if (viz.bNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    if (showNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
         iLines += 3;
     if (m_Timer.m_bManualTimer && !m_bDumpFrames)
         iLines++;
@@ -3855,7 +3867,7 @@ void MainScreen::RenderText()
     m_pRenderer->BeginText();
 
     RenderStatus(iLines);
-    if (viz.bSysStats)
+    if (viz.bSysStats && !StatsCoveredByUI(m_pRenderer))
         RenderSysStats();
     if (!m_sMarker.empty() && viz.bShowMarkers)
         RenderMarker(m_sMarker.c_str());
@@ -3983,12 +3995,15 @@ float MainScreen::GetStatsBounceScale() const
 
 void MainScreen::RenderStatus(int lines)
 {
+    if (StatsCoveredByUI(m_pRenderer))
+        return;
     auto dl = m_pRenderer->GetDrawList();
     const int vtx_start = dl ? dl->VtxBuffer.Size : 0;
 
     // Time
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
+    const bool showNerdStats = viz.bNerdStats && !StatsCoveredByUI(m_pRenderer);
     const bool bFreePlay = IsFreePlay();
     long long llTotalMicroSecs = 0;
     if (!bFreePlay)
@@ -4111,7 +4126,7 @@ void MainScreen::RenderStatus(int lines)
     if (m_bShowFPS && !m_bDumpFrames)
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "FPS:", "%.1lf", m_dFPS);
 
-    if (viz.bNerdStats) {
+    if (showNerdStats) {
         long long nps = 0;
         for (size_t i = 0; i < m_dNPSNotes.size(); i++)
             nps += std::get<1>(m_dNPSNotes[i]);
@@ -4127,7 +4142,7 @@ void MainScreen::RenderStatus(int lines)
         RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Late evts:", "%llu", m_ullLateEvents);
     }
 
-    if (viz.bNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    if (showNerdStats && Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
     {
         char buf[64] = {};
         snprintf(buf, sizeof(buf) - 1, "%6.1f ms", PRE_MIDIAudio->GetBufferSeconds() * 1000.0);
@@ -4195,6 +4210,8 @@ static void DrawBlurPanel(Renderer* r, float left, float top, float right, float
 
 void MainScreen::RenderSysStats()
 {
+    if (StatsCoveredByUI(m_pRenderer))
+        return;
     static bool s_bDrawnLogged = false;
     if (!s_bDrawnLogged)
     {
