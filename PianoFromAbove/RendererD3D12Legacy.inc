@@ -849,8 +849,6 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
         }
 
         HeartbeatLog("resize:resizebuffers");
-        // Resize the swap chain (0x0 = follow the window; the swapchain must always match its window -
-        // forcing a size here while the window stays put hung the driver (TDR) on this GPU, so the...
         res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
                                           m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(res)) {
@@ -881,8 +879,6 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
         };
         res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
         if (FAILED(res)) {
-            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1 path) and fail with
-            // E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions, virtual GPUs, etc. Fall back to the...
             HeartbeatLog("swapchain:flipfailed - trying bitblt");
             m_bAllowTearing = false;
             swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -1914,8 +1910,6 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         }
     }
 
-    // The chunk textures, depth and fixed buffer are shared across frames, but PresentBackend only
-    // fences the previous use of the current swapchain buffer (up to 2 frames in flight)....
     HRESULT res = WaitForGPU();
     if (FAILED(res))
         return res;
@@ -1952,8 +1946,6 @@ HRESULT D3D12Renderer::RenderImageBuffer() {
         m_pCommandList->ResourceBarrier(1, &fixed_barrier);
     }
 
-    // A D3D12 upload heap is not implicitly renamed like D3D11 WRITE_DISCARD. Upload the complete
-    // per-frame chunk-note array once and point each recorded chunk draw at its own immutable...
     if (!m_vChunkNotes.empty()) {
         const SIZE_T chunkBytes = (SIZE_T)m_vChunkNotes.size() * sizeof(NoteData);
         D3D12_RANGE noRead = { 0, 0 };
@@ -2526,8 +2518,6 @@ static HRESULT CompileBloomShader(ID3DBlob** ppBlob) {
     return D3DCompile(g_BloomHLSL, strlen(g_BloomHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
 }
 
-// Vignette: a fullscreen multiply pass after bloom. The pixel shader computes a radial falloff
-// factor from the UVs and the frame is darkened multiplicatively (DEST_COLOR x vignette...
 static const char* g_VignetteHLSL = R"(
 cbuffer VignetteConstants : register(b0) {
     float g_intensity;

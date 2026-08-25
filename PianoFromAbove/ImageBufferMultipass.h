@@ -3,8 +3,6 @@
 #include <cstddef>
 #include <vector>
 
-// Shared CPU-side state for incremental image-buffer texture construction. One chunk is allowed
-// to be in progress per Renderer instance. The render thread is the only writer, so no...
 struct ImageBufferMultipassState {
     unsigned long long generation = 0;
     unsigned frame = 0;
@@ -52,8 +50,6 @@ inline int ImageBufferMPDrawableSlot(Renderer* renderer, int cachedSlot, long lo
     return -1;
 }
 
-// A normal-render fallback above this size is more expensive than simply waiting for the image-
-// buffer chunk to become drawable. Keeping this bounded prevents a dense visible chunk from...
 static constexpr size_t ImageBufferMPMaxNormalFallbackNotes = 100000;
 
 // GameState normally rebuilds a complete NoteData vector before every call to
@@ -78,15 +74,11 @@ inline void ImageBufferMPCollectDispatch(Renderer* renderer, std::vector<NoteDat
             return;
         }
 
-        // A second call is GameState asking for visible fallback after the bake returned incomplete. Do
-        // not copy/push millions of notes through the regular renderer; the backend will draw the...
         ++s.collectCalls;
         out.clear();
         return;
     }
 
-    // A second collection of a different chunk in the same frame means its BakeChunk could not claim
-    // the one multipass request. Reuse the vector that is already in `out`, but suppress it...
     if (s.collectChunk == chunk && s.collectCalls > 0) {
         ++s.collectCalls;
         if (out.size() > ImageBufferMPMaxNormalFallbackNotes)

@@ -27,8 +27,6 @@
 #include "MIDIPreRenderPlayer.h"
 #include <d3d9types.h>
 
-// Uploads the (possibly changed) track settings colors into the renderer's GPU-side color
-// buffer. Must run every frame in every screen that renders notes, since the renderer only...
 static void SyncTrackColors(Renderer* pRenderer, const vector<TrackSettings>& vTrackSettings)
 {
     auto* track_colors = pRenderer->GetTrackColors();
@@ -140,8 +138,6 @@ void MainScreen::StartVideoRender()
         return;
     }
 
-    // Defer the actual start to the top of Logic(): the back-buffer resize and device reset must run
-    // with no frame in flight, not from inside the ImGui dialog (which is mid-frame) - resizing...
     m_bRenderPending = true;
     PRE_DbgLog("RENDER: requested");
 }
@@ -177,8 +173,6 @@ void MainScreen::BeginVideoRender()
         m_sFFVideoOut += L"." + sExt;
     }
 
-    // Render natively at the output resolution: resize the main window to the render size and let
-    // the WM_SIZE -> drain -> ResetDevice path (the same one maximize/restore uses) bring the...
     ShowWindow(g_hWnd, SW_HIDE);
     int w = (int)m_pRenderer->GetBufferWidth(), h = (int)m_pRenderer->GetBufferHeight();
     RECT rcWork = {};
@@ -233,8 +227,6 @@ void MainScreen::BeginVideoRender()
     }
     sEnc += "-pix_fmt yuv420p";
 
-    // Spawn ffmpeg: raw BGRA frames over stdin -> video-only intermediate. The Framerate setting is
-    // the video's output fps: each captured frame is one video frame at that rate, so the video...
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hPipeRead = NULL, hPipeWrite = NULL;
     if (!CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0))
@@ -265,8 +257,6 @@ void MainScreen::BeginVideoRender()
     m_hFFProc = pi.hProcess;
     CloseHandle(pi.hThread);
 
-    // Show only the renderer window while rendering: detach the gfx window from the (hidden) player
-    // window and center it on the screen. Closing the renderer window cancels the render and...
     if (viz.bRenderShowPreview)
     {
         SetParent(g_hWndGfx, NULL);
@@ -283,8 +273,6 @@ void MainScreen::BeginVideoRender()
         SetWindowText(g_hWndGfx, L"Render to Video");
     }
 
-    // Restart the prerender with WAV recording (or record the custom audio file instead), rewind the
-    // song, and unpause. The song clock advances one output frame per rendered frame, while the...
     const bool bCustomAudio = m_bUseCustomAudio && !m_sCustomAudioPath.empty();
     if (PRE_MIDIAudio && !bCustomAudio)
         PRE_MIDIAudio->StartWavRecording(m_sFFWav.c_str());
@@ -335,8 +323,6 @@ void MainScreen::FinishVideoRender()
         m_hFFProc = NULL;
     }
 
-    // Bring the player window back. With the preview enabled, the renderer window was detached for
-    // the render and is reattached as a child and refit to the main window's client area; with...
     ShowWindow(g_hWnd, SW_SHOW);
     Config& cfg = Config::GetConfig();
     if (cfg.GetVizSettings().bRenderShowPreview)
@@ -352,8 +338,6 @@ void MainScreen::FinishVideoRender()
         SetFocus(g_hWndGfx);
     }
 
-    // Shrink the main window back to its pre-render size (it was grown to the render resolution for
-    // native capture); the WM_SIZE -> ResetDevice path brings the swapchain back with it, so the...
     RestoreMainWindowAfterRender();
 
     if (PRE_MIDIAudio)
@@ -405,8 +389,6 @@ void MainScreen::RestoreMainWindowAfterRender()
     ShowWindow(g_hWnd, SW_SHOW);
 }
 
-// ---- system stats sampling (CPU / RAM / VRAM / GPU) ------------------------- CPU/RAM/VRAM are
-// sampled at 1 Hz on the game thread (cheap Win32 calls). GPU usage is sampled on a...
 static ULONGLONG s_ullLastKernel = 0, s_ullLastUser = 0, s_ullLastIdle = 0;
 static bool s_bCpuBase = false;
 static double s_dCpuPct = 0.0;
@@ -417,8 +399,6 @@ static LONGLONG s_llLastSysSample = 0;
 static std::atomic<float> s_fGpuPct(0.0f);
 static std::atomic<bool> s_bGpuAvail(false);
 
-// / Transition-mode zoom state (MainScreen::RenderGlobals). File scope so the stop button can
-// reset the zoom back to the base view. The keyboard glides toward 128-key range when...
 static float s_fTransitionPhase = 0.0f;
 static std::chrono::steady_clock::time_point s_LastTransitionFrame = std::chrono::steady_clock::now();
 
@@ -847,8 +827,6 @@ GameState::GameError SplashScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARA
     return Success;
 }
 
-// from the song clock every frame; the classic MIDI-device path is bypassed. BASS is used purely
-// as a decoder (BASS_STREAM_DECODE, no output device - on this machine BASS's device...
 static HSTREAM s_hCustomAudio = 0;      // decode-only stream
 static SDL_AudioDeviceID s_hCustomSdl = 0;
 static float s_fCustomAudioVol = -1.0f;
@@ -879,8 +857,6 @@ static void CustomAudioStop()
     CustomWavStop();
 }
 
-// ---- Custom-audio WAV capture for the video render --------------------------- The custom file
-// replaces the prerender, so the render's audio track is recorded here instead of in...
 static FILE* s_pCustomWav = nullptr;
 static long long s_lCustomWavFrames = 0;   // frames written to the file so far
 static unsigned s_uCustomWavChans = 0;
@@ -920,8 +896,6 @@ static void CustomWavStart(const wchar_t* path)
     PRE_DbgLog("CUSTOMWAV: recording started %ls rate=%.0f chans=%u", s_sCustomWavPath.c_str(), s_dFileRate, (unsigned)s_dFileChans);
 }
 
-// Writes `frames` frames of audio starting at `frameOffset` (in the WAV timeline, frame 0 = song
-// start / 3s before the first note). Forward gaps (the lead-in, or a mid-render forward...
 static void CustomWavWriteFrames(long long frameOffset, const float* data, int frames)
 {
     if (!s_pCustomWav || frames <= 0) return;
@@ -1028,8 +1002,6 @@ static HSTREAM CustomAudioOpen(const wstring &sFile)
     return h;
 }
 
-// Plays the user-provided audio file (wav/mp3/ogg) in place of the prerender. The file's t=0
-// maps to the first note of the song, i.e. the audio begins right after the 3-second lead-in...
 static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long long llFirstNoteUs,
                               bool bPaused, bool bMute, double dVolume)
 {
@@ -1072,8 +1044,6 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
     long long llTargetUs = min(llAudioUs, (long long)dFileEndUs);
     double dPlayedUs = (double)s_llFedUs - dQueuedUs;
 
-    // Hard resync when the queued output has drifted from the song clock, or the decoder is parked
-    // at EOF because the song was stopped/restarted/re-wound after the file ended. The dead zone...
     if ((s_bCustomEof && dQueuedUs <= 0.0) || fabs(dPlayedUs - llTargetUs) > 250000.0)
     {
         // Rewind only when there is still audio before the end to rewind to;
@@ -1103,8 +1073,6 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
         if (bLog) PRE_DbgLog("CUSTOM vol=%.2f", fVol);
     }
 
-    // Keep the device fed ~80ms ahead of the target so it never starves; the queue is drained by the
-    // hardware in real time and the song clock stays the master. Refill only when the queue...
     const long long kKeepAheadUs = 80000;
     const double kRefillBelowUs = 40000.0;
     if (dQueuedUs < kRefillBelowUs)
@@ -1153,8 +1121,6 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
     SDL_PauseAudioDevice(s_hCustomSdl, 0);
 }
 
-// from the song clock every frame; the classic MIDI-device path is bypassed. Prerender self-
-// healing: when the BASS synth dies (stream handle lost, position frozen, silent-after-audio)...
 static const int s_iPreRestartsLimit = 4;
 static int s_iPreRestarts = 0;
 static bool s_bPreFailed = false;
@@ -1245,8 +1211,6 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     {
         SDL_PauseAudio(0);
 
-        // Watchdog: the SDL callback must be producing audio. If it has gone quiet (device stall after a
-        // display/GPU hiccup on this machine), re-open the device so the splash music resumes...
         if (PRE_AudioStalled())
         {
             PRE_DbgLog("UPA: SDL audio callback stalled - restarting device");
@@ -2139,8 +2103,6 @@ GameState::GameError MainScreen::Logic( void )
         m_pRenderer->ImGuiStartFrame();
         return Success;
     }
-    // Deferred render/bookkeeping runs at the top of Logic(), after the previous frame has fully
-    // presented. BeginVideoRender resizes the main window to the render resolution and stays...
     if (m_bRenderPending)
         BeginVideoRender();
     // Start new ImGui frame
@@ -3307,7 +3269,8 @@ void MainScreen::RenderNotes()
         while (hi < eventCount) {
             MIDIChannelEvent pEvent = m_vEvents[hi];
             const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
-            if (eventTime >= stripEnd) break;
+            if (eventTime >= stripEnd)
+                break;
             ++hi;
         }
         for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); --i) {
@@ -3317,9 +3280,10 @@ void MainScreen::RenderNotes()
                 RenderPianoRollStripNote(pEvent);
         }
         for (size_t i = 0; i < 128; ++i) {
-            for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it)
+            for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it) {
                 if (*it >= 0 && (size_t)*it < m_vEvents.size())
                     RenderPianoRollStripNote(m_vEvents[*it]);
+            }
         }
     }
 }
@@ -3356,8 +3320,6 @@ void MainScreen::RenderNote(const MIDIChannelEvent pNote)
     m_pRenderer->PushNoteData(BuildRenderNoteData(pNote));
 }
 
-// Same corruption pass as BuildRenderNoteData, but with the chunk-relative position (chunkStart
-// is the absolute start of the chunk) and the exact corrupted absolute start time...
 NoteData MainScreen::BuildChunkNoteData(const MIDIChannelEvent pNote, long long chunkStart) const
 {
     int iNote = m_MIDI.GetEventParam1(pNote);
@@ -3384,8 +3346,6 @@ NoteData MainScreen::BuildChunkNoteData(const MIDIChannelEvent pNote, long long 
 
 void MainScreen::RenderNotesImageBuffer()
 {
-    // MainScreen can be constructed by the asynchronous MIDI loader before a renderer is attached.
-    // Defer the per-MIDI cache generation bump until the first image-buffer render, where...
     if (m_bImageBufferNeedsInvalidate) {
         m_pRenderer->ImageBufferInvalidate();
         m_bImageBufferNeedsInvalidate = false;
@@ -3420,8 +3380,6 @@ void MainScreen::RenderNotesImageBuffer()
     unsigned lookaheadBakes = 0;
     const unsigned maxLookaheadBakesPerFrame = 8;
 
-    // Notes can begin before a chunk yet overlap into it. The scan window must reach back over the
-    // longest note in the song (plus the corruption margin), otherwise lookahead chunks bake with...
     const long long maxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
     const long long backScan = maxLen + E;
 
@@ -3429,8 +3387,6 @@ void MainScreen::RenderNotesImageBuffer()
     // (per-frame note budget hit); they are drawn through the normal path.
     std::vector<NoteData> fallbackNotes;
 
-    // Scans every note overlapping [chunkStart, chunkStart+T) into chunkNotes (chunk-relative
-    // positions). The window reaches back over the longest note in the song plus the corruption...
     auto CollectChunk = [&](long long k) {
         const long long chunkStart = k * T;
         const long long chunkEnd = chunkStart + T;

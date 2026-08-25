@@ -98,8 +98,6 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
         }
     }
     if (m_pDevice == nullptr) {
-        // No usable hardware device (WARP forced after a failed hardware init, or no suitable adapter at
-        // all): fall back to the WARP software rasterizer so the app can still boot on...
         HeartbeatLog("init(d3d11):nodevice - trying WARP");
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         res = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -460,8 +458,6 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
         ComPtr<IDXGISwapChain1> temp_swapchain;
         res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
         if (FAILED(res)) {
-            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1 path) and fail with
-            // E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions, virtual GPUs, etc. Fall back to the...
             char ebuf[96];
             sprintf_s(ebuf, "swapchain(d3d11):flipfailed hr=0x%08X - trying bitblt", (unsigned)res);
             HeartbeatLog(ebuf);
@@ -491,8 +487,6 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
 
     m_pFactory->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER);
 
-    // Render target views. A flip-model swap chain only exposes its current back buffer until the
-    // first present; the other RTVs are created lazily in PresentBackend once the remaining...
     m_uFrameIndex = m_pSwapChain->GetCurrentBackBufferIndex();
     {
         ComPtr<ID3D11Texture2D> backbuffer;
@@ -1677,15 +1671,15 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
         m_pContext->ClearDepthStencilView(m_pChunkDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
         D3D11RootConstants requestRoot = chunkRoot;
-            if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
-                requestRoot.stripMode = 1.0f;
-                requestRoot.stripTimeSpan = m_RootConstants.timespan;
-                requestRoot.notes_y = 0.0f;
-                requestRoot.notes_cy = (float)W;
-                requestRoot.white_cx = (float)H / 75.0f;
-            }
-            SetPipeline(Pipeline::Note);
-            m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
+        if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+            requestRoot.stripMode = 1.0f;
+            requestRoot.stripTimeSpan = m_RootConstants.timespan;
+            requestRoot.notes_y = 0.0f;
+            requestRoot.notes_cy = (float)W;
+            requestRoot.white_cx = (float)H / 75.0f;
+        }
+        SetPipeline(Pipeline::Note);
+        m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
         m_pContext->UpdateSubresource(m_pChunkFixedBuffer.Get(), 0, nullptr, &chunkFixed, 0, 0);
         m_pContext->VSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());
         m_pContext->PSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());

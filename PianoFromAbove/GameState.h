@@ -54,8 +54,6 @@ public:
 
     virtual GameError Render() = 0;
 
-    // Called by the game thread just before a new song load begins; frees the heavy song data so the
-    // old state stops consuming RAM while the next file is parsed. After this, Logic()/Render()...
     virtual void Discard() { m_bDiscarded = true; }
     bool IsDiscarded() const { return m_bDiscarded; }
 
@@ -457,8 +455,6 @@ void RenderText();
     HANDLE m_hFFPipeWrite = NULL;
     HANDLE m_hFFProc = NULL;
     std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
-    // BeginVideoRender is deferred to the top of Logic() (the click happens inside Logic's ImGui
-    // pass), and the swapchain resize itself goes through the main window's WM_SIZE -> drain ->...
     bool m_bRenderPending = false;
     bool m_bRenderMainRectSaved = false;
     RECT m_rcRenderMainSaved = {};

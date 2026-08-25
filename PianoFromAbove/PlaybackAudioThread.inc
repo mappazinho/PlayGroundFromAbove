@@ -1,5 +1,3 @@
-// Independent live-MIDI scheduler for MainScreen. This file is included by GameState.cpp after
-// GameStateLegacy.inc. Keeping it in the same translation unit lets the scheduler reuse the...
 
 #include <mmsystem.h>
 #include <memory>
@@ -197,8 +195,6 @@ public:
         return true;
     }
 
-    // Pause/mute must silence currently sounding notes without resetting channel/program state. The
-    // scheduler never queues future host events, so All Notes Off + sustain off is sufficient...
     void Silence()
     {
         if (m_mode == Mode::SvmsNative) {
@@ -544,8 +540,6 @@ void MainScreen::PlaybackAudioThreadMain()
             localPaused = paused;
             controlSerial = newControl;
         } else {
-            // These atomics normally change together with controlSerial; loading them here also makes the
-            // thread robust to a partially observed UI frame without ever consulting renderer-owned state...
             localPaused = paused;
             localSpeed = speed;
         }
@@ -697,8 +691,6 @@ void MainScreen::PlaybackAudioThreadMain()
             }
         }
 
-        // Never yield or sleep on the active playback path. A full batch immediately continues into the
-        // next batch, while an idle iteration immediately polls QPC again. This deliberately...
         if (processed >= maxEventsThisPass)
             continue;
     }
@@ -709,8 +701,6 @@ void MainScreen::PlaybackAudioThreadMain()
     timeEndPeriod(1);
 }
 
-// The legacy implementation is compiled under LogicLegacy/MsgProcLegacy/ DiscardLegacy aliases
-// by GameState.cpp. These wrappers are the only bridge between renderer cadence and the...
 GameState::GameError SplashScreen::Logic() { return LogicLegacy(); }
 GameState::GameError SplashScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {

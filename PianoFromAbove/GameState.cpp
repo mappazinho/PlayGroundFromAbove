@@ -25,8 +25,6 @@
 #include "ImageBufferPreparedChunks.h"
 #include "ImageBufferGpuPins.h"
 
-// The immutable full-song prepared source is deliberately a memory-for-speed optimization. Its
-// persistent cost is driven by the number of notes stored in the compact prepared source. The...
 static constexpr size_t ImageBufferFullPreparedMaxEvents = 64000000;
 static constexpr size_t ImageBufferFullPreparedMaxNotes = 32000000;
 
@@ -151,8 +149,6 @@ static void UpdateImageBufferPrewarmGpuProgress(
         return;
     }
 
-    // Full-prime discovers every truly dense center first. Runtime preparation deliberately expands
-    // each center by +/- ImageBufferPreparedPreloadRadius, so pre-play GPU work must use that...
     if (cpu.done < cpu.total)
         return;
 
@@ -199,8 +195,6 @@ static void UpdateImageBufferPrewarmGpuProgress(
         ? CountImageBufferPrewarmCached(renderer, prewarmChunks)
         : 0;
 
-    // Protect the exact set Play waited for from speculative-lookahead LRU eviction. This is what
-    // turns prewarm into lasting residency rather than work that can be thrown away before the...
     if (requireGpu)
         ImageBufferSetPinnedChunks(renderer, prewarmChunks);
     else
@@ -364,8 +358,6 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferExactCollector, (k)); \
 }())
 
-// Prewarm cannot depend on RenderNotesImageBuffer(): while Play is gated the song can sit in its
-// empty pre-roll, where RenderNotes() returns before image buffers are touched. Preserve...
 #define ClearAndBeginScene(...) ClearAndBeginScene(__VA_ARGS__); \
 ([&](auto* imageBufferPrewarmSelf) { \
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
@@ -487,8 +479,6 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
 
 #include "PlaybackAudioThread.inc"
 
-// Frametime is sampled at the same late-render point as the system-stat panel, so it measures
-// real presented-frame cadence without perturbing MainScreen's playback timer. The graph is...
 static void DrawFrameTimeGraphLate(Renderer* renderer)
 {
     using Clock = std::chrono::steady_clock;

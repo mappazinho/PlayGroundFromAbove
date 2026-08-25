@@ -83,8 +83,6 @@ struct FixedSizeConstants {
     float bends[16];
 };
 
-// Image buffer cache key: everything that changes the baked chunk content. Warp fields are
-// deliberately excluded: nonzero warp disables the image buffer, and the warp seeds are...
 struct ChunkCacheKey {
     int width = 0;
     int height = 0;
@@ -219,13 +217,11 @@ public:
         m_fRibbonX = x; m_fRibbonY = y; m_fRibbonCX = cx; m_fRibbonCY = cy;
     }
 
-    // --- Image buffer (pre-rendered note chunks) ----------------------------- Pre-renders fixed-
-    // size chunks of the note roll into offscreen textures and draws them as scrolling textured...
     static constexpr unsigned ChunkPoolSize = 64;
     static constexpr long long ImageBufferInvalidChunk = (std::numeric_limits<long long>::max)();
     static constexpr long long ImageBufferStripChunkBase = (1LL << 60);
     static long long ImageBufferStripChunkKey(long long chunk) { return ImageBufferStripChunkBase + chunk; }
-    static bool ImageBufferIsStripChunkKey(long long key) { return key >= (ImageBufferStripChunkBase >> 1); }
+    static bool ImageBufferIsStripChunkKey(long long key) { return key != ImageBufferInvalidChunk && key >= (ImageBufferStripChunkBase >> 1); }
 
     struct ChunkBuildRequest {
         long long chunk;

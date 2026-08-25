@@ -58,8 +58,6 @@ static bool DirectNoteCullContributes(
     if (!(span > 0.0) || !(noteRows > 0.0) || state.rows <= 0)
         return true;
 
-    // Mirror the vertex shader's vertical rounding. Using the actual raster bounds rather than only
-    // time-domain intervals also accounts for deflate's minimum note height and avoids culling a...
     const double length = (std::max)(0.0, (double)data.length);
     const double y = std::round(noteRows * (1.0 - (double)data.pos / span));
     const double cy = (std::max)(std::round(noteRows * length / span), (double)root.deflate);
@@ -121,8 +119,6 @@ bool Renderer::PushNoteDataFiltered(NoteData data)
                         state.next[base + row] = row;
                 }
 
-                // Re-run the first 100k submissions through the ownership map, preserving their original order
-                // while dropping already-hidden entries. This prevents the threshold itself becoming a fixed...
                 std::vector<NoteData> seed;
                 seed.swap(m_vNotesIntermediate);
                 m_vNotesIntermediate.reserve((std::min)(
@@ -162,8 +158,6 @@ bool Renderer::PushNoteDataFiltered(NoteData data)
     return true;
 }
 
-// Keep the RenderMode UI in the legacy renderer body, but add the dense-prewarm switch
-// immediately below its existing Image Buffer Notes checkbox without duplicating the large...
 namespace ImGui {
 static bool s_PGFAInVizPreferences = false;
 
@@ -189,8 +183,6 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
     const bool wasEnabled = value && *value;
     const bool changed = Checkbox(label, value);
     if (label && strcmp(label, "Image Buffer Notes") == 0) {
-        // Waiting/progress is the safe default whenever image buffering is enabled. Do this on the first
-        // UI observation too, so a config that starts with Image Buffer Notes already enabled...
         static bool initialized = false;
         if ((!initialized && value && *value) || (changed && !wasEnabled && value && *value))
             ImageBufferPreparedSetWaitBeforePlayback(true);
@@ -302,8 +294,6 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
         return false;
 
     if (state.slot < 0) {
-        // Reservation happens earlier than the legacy backend allocation, before this frame's visible
-        // quad list has been populated. Use LRU here rather than the legacy lowest-chunk eviction...
         int slot = -1;
         for (unsigned i = 0; i < ChunkPoolSize; ++i) {
             if (m_ChunkCache[i].generation != m_ullImageBufferGeneration ||
