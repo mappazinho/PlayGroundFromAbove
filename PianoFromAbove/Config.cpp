@@ -16,6 +16,7 @@ using namespace std;
 
 #include "Config.h"
 #include "Misc.h"
+#include "Globals.h"
 // Main Config class
 
 Config &Config::GetConfig()
@@ -82,6 +83,7 @@ void Config::LoadConfigValues()
         return;
 
     m_VizSettings.LoadConfigValues(txRoot);
+    g_bLoggingEnabled.store(m_VizSettings.bEnableLogging, std::memory_order_relaxed);
 }
 
 void Config::LoadConfigValues( TiXmlElement *txRoot )
@@ -251,6 +253,7 @@ void VizSettings::LoadDefaultValues() {
     this->bRibbonCustomColor = false;
     this->dwRibbonBaseColor = 0xFFFFFFFF;
     this->bDumpFrames = false;
+    this->bEnableLogging = false;
     this->iBarColor = 0x00FF0080;
     this->sBackground = L"";
     this->fBGBlur = 0.0f;
@@ -542,8 +545,9 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bRibbonCustomColor = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("RibbonBaseColor", &iAttrVal) == TIXML_SUCCESS)
         dwRibbonBaseColor = (DWORD)iAttrVal;
-    if (txViz->QueryIntAttribute("DumpFrames", &iAttrVal) == TIXML_SUCCESS)
-        bDumpFrames = (iAttrVal != 0);
+    bDumpFrames = false;
+    if (txViz->QueryIntAttribute("EnableLogging", &iAttrVal) == TIXML_SUCCESS)
+        bEnableLogging = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("ColorLoop", &iAttrVal) == TIXML_SUCCESS)
         bColorLoop = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("KDMAPI", &iAttrVal) == TIXML_SUCCESS)
@@ -589,6 +593,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     iBounceNPSThreshold = max(0, min(iBounceNPSThreshold, 100));
     if (txViz->QueryIntAttribute("ImageBufferNotes", &iAttrVal) == TIXML_SUCCESS)
         bImageBufferNotes = (iAttrVal != 0);
+    if (bImageBufferNotes)
+        bDualPianoRoll = false;
     sTempStr = "";
     txViz->QueryStringAttribute("FFmpegDir", &sTempStr);
     sFFmpegDir = Util::StringToWstring(sTempStr);
@@ -790,7 +796,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("ColoredRibbon", bColoredRibbon);
     txViz->SetAttribute("RibbonCustomColor", bRibbonCustomColor);
     txViz->SetAttribute("RibbonBaseColor", (int)dwRibbonBaseColor);
-    txViz->SetAttribute("DumpFrames", bDumpFrames);
+    txViz->SetAttribute("EnableLogging", bEnableLogging);
     txViz->SetAttribute("Background", Util::WstringToString(sBackground));
     txViz->SetDoubleAttribute("BGBlur", fBGBlur);
     txViz->SetDoubleAttribute("BGOpacity", fBGOpacity);

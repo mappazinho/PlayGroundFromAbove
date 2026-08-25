@@ -35,6 +35,7 @@ bool g_bResetPending = false;
 bool g_bSysResize = false;
 bool g_bSkipGPUWait = false;
 bool g_bDisableBlur = false;
+std::atomic<bool> g_bLoggingEnabled{ false };
 bool g_bDisableGates = false; // Keep the size-move/reset gates ON: presenting through window animations stalls the flip queue on NVIDIA (2s+ fence waits -> TDR)
 bool g_bInRecovery = false;
 bool g_bD3D12Available = true;
@@ -163,6 +164,8 @@ static void DestroyRenderProgressWindow()
 }
 
 static void TraceMsg(const char* name, WPARAM wParam, LPARAM lParam) {
+    if (!g_bLoggingEnabled.load(std::memory_order_relaxed))
+        return;
     static bool bInit = false;
     static __int64 nStart = 0;
     if (!bInit) {

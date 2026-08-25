@@ -10,6 +10,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <atomic>
 #include "Misc.h"
 
 extern HINSTANCE g_hInstance;
@@ -29,6 +30,7 @@ extern GameState* g_pGameState; // Current game state; game thread owns it
 #define ID_PRELOAD_DRAIN (WM_APP + 0x102) // Drain the GPU queue before a window transition animates
 extern bool g_bSkipGPUWait; // Experiment: skip WaitForGPU fence waits entirely (default true)
 extern bool g_bDisableBlur; // Experiment: skip the per-frame blur compute passes
+extern std::atomic<bool> g_bLoggingEnabled;
 extern bool g_bDisableGates; // Experiment: render/present through window transitions like the base
 extern bool g_bInRecovery;   // Set while the renderer is being rebuilt after a TDR
 extern bool g_bD3D12Available; // Probed at startup: can this machine create a D3D12 device at all?
