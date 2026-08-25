@@ -237,6 +237,11 @@ inline ImageBufferPreparedResult ImageBufferPreparedBuild(
             ? source.maxEndTick150[block]
             : source.maxEndTime150_100us[block] * 100ULL;
         const uint64_t oldest = oldestUsefulEnd < 0 ? 0ULL : (uint64_t)oldestUsefulEnd;
+        const uint64_t prefixMax = params.tickMode
+            ? source.prefixMaxEndTick150[block]
+            : source.prefixMaxEndTime150_100us[block] * 100ULL;
+        if (prefixMax < oldest)
+            break;
 
         if (blockMax >= oldest) {
             const size_t begin = block * ImageBufferPreparedRawBlockNotes;

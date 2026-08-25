@@ -234,6 +234,7 @@ struct VizSettings : public ISettings {
     bool bRibbonCustomColor;
     DWORD dwRibbonBaseColor;
     bool bDumpFrames;
+    bool bEnableLogging;
     int iBarColor;
     std::wstring sFFmpegDir;
     int iRenderWidth;

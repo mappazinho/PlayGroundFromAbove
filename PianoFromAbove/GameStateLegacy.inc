@@ -400,6 +400,8 @@ static std::atomic<float> s_fGpuPct(0.0f);
 static std::atomic<bool> s_bGpuAvail(false);
 
 static float s_fTransitionPhase = 0.0f;
+static long long s_iTransitionScanPos = -1;
+static bool s_bTransitionOutOfRange = false;
 static std::chrono::steady_clock::time_point s_LastTransitionFrame = std::chrono::steady_clock::now();
 
 static void GpuPdhThreadMain()
@@ -1710,6 +1712,8 @@ void MainScreen::InitState()
     m_llDisplayTime = m_llStartTime;
     m_fKeysTransition = 0.0f;
     s_fTransitionPhase = 0.0f;
+    s_iTransitionScanPos = -1;
+    s_bTransitionOutOfRange = false;
     s_LastTransitionFrame = std::chrono::steady_clock::now();
     m_bTrackPos = m_bTrackZoom = false;
     m_fTempZoomX = 1.0f;
@@ -1914,6 +1918,8 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
                     s_fTransitionPhase = 0.0f;
+                    s_iTransitionScanPos = -1;
+                    s_bTransitionOutOfRange = false;
                     m_fKeysTransition = 0.0f;
                     s_LastTransitionFrame = std::chrono::steady_clock::now();
                     return Success;
@@ -2496,6 +2502,8 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
     {
         m_fKeysTransition = 0.0f;
         s_fTransitionPhase = 0.0f;
+        s_iTransitionScanPos = -1;
+        s_bTransitionOutOfRange = false;
         s_LastTransitionFrame = std::chrono::steady_clock::now();
     }
     long long llEndTime = m_llStartTime + m_llTimeSpan;
@@ -3051,29 +3059,33 @@ void MainScreen::RenderGlobals()
         const int iBaseStart = MIDI::A0;
         const int iBaseEnd = MIDI::C8;
 
-        int iRangeMin = iBaseStart;
-        int iRangeMax = iBaseEnd;
-        for ( size_t i = 0; i < 128; i++ )
-            for ( vector<int>::const_iterator it = m_vState[i].begin(); it != m_vState[i].end(); it++ )
-            {
-                const int iNote = m_MIDI.GetEventParam1(m_vEvents[*it]);
-                iRangeMin = min( iRangeMin, iNote );
-                iRangeMax = max( iRangeMax, iNote );
-            }
-        for ( long long i = m_iStartPos; i <= m_iEndPos; i++ )
-        {
-            const MIDIChannelEvent pEvent = m_vEvents[i];
-            if ( m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn && m_MIDI.GetEventParam2(pEvent) > 0 )
-            {
-                const int iNote = m_MIDI.GetEventParam1(pEvent);
-                iRangeMin = min( iRangeMin, iNote );
-                iRangeMax = max( iRangeMax, iNote );
-            }
+        bool bOutOfRange = s_bTransitionOutOfRange;
+        if (!bOutOfRange) {
+            for (int i = 0; i < iBaseStart && !bOutOfRange; ++i)
+                bOutOfRange = !m_vState[i].empty();
+            for (int i = iBaseEnd + 1; i < 128 && !bOutOfRange; ++i)
+                bOutOfRange = !m_vState[i].empty();
         }
-
-        // Once notes outside the 88-key range are detected, transition to 128 keys and stay there
-        // permanently until the song is stopped/reset. The phase only moves toward 1.0 (never back to
-        const bool bOutOfRange = iRangeMin < iBaseStart || iRangeMax > iBaseEnd;
+        if (!bOutOfRange && m_iEndPos >= m_iStartPos) {
+            long long scan = s_iTransitionScanPos;
+            if (scan < m_iStartPos || scan > m_iEndPos + 1)
+                scan = m_iStartPos;
+            for (; scan <= m_iEndPos; ++scan) {
+                const MIDIChannelEvent event = m_vEvents[scan];
+                if (m_MIDI.GetEventChannelEventType(event) == MIDI::NoteOn &&
+                    m_MIDI.GetEventParam2(event) > 0) {
+                    const int note = m_MIDI.GetEventParam1(event);
+                    if (note < iBaseStart || note > iBaseEnd) {
+                        bOutOfRange = true;
+                        break;
+                    }
+                }
+            }
+            if (!bOutOfRange)
+                s_iTransitionScanPos = m_iEndPos + 1;
+        }
+        if (bOutOfRange)
+            s_bTransitionOutOfRange = true;
 
         auto nowT = std::chrono::steady_clock::now();
         const float fDt = min( 0.25f, ( float )std::chrono::duration<double>( nowT - s_LastTransitionFrame ).count() );

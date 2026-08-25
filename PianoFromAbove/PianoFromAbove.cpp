@@ -48,6 +48,8 @@ bool g_bGfxDestroyed = false;
 GameState* g_pGameState = nullptr;
 
 void HeartbeatLog(const char* tag) {
+    if (!g_bLoggingEnabled.load(std::memory_order_relaxed))
+        return;
     static bool bInit = false;
     static __int64 nStart = 0;
     static int nLoopCount = 0;

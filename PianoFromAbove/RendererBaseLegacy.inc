@@ -127,10 +127,13 @@ void Renderer::UpdateWarpConstants() {
 // gate active) and Present() should not touch the swapchain.
 bool Renderer::PresentPrelude() {
     HeartbeatLog("present:start");
-    const auto& runtimeViz = Config::GetConfig().GetVizSettings();
+    auto& runtimeViz = Config::GetConfig().GetVizSettings();
     g_bDisableBlur = runtimeViz.bDisableBlurs;
-    if (runtimeViz.bImageBufferNotes)
+    g_bLoggingEnabled.store(runtimeViz.bEnableLogging, std::memory_order_relaxed);
+    if (runtimeViz.bImageBufferNotes) {
+        runtimeViz.bDualPianoRoll = false;
         m_bOverclockArtifacts = false;
+    }
     static int s_branch = -1;
     static int s_frames = 0;
     static long long s_fpsStart = 0;
@@ -770,9 +773,11 @@ void Renderer::RenderImGuiFrame() {
             if (ImGui::MenuItem("Default", nullptr, !viz.bDualPianoRoll && !viz.bHorizontalPianoRoll)) {
                 viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = false;
             }
+            ImGui::BeginDisabled(viz.bImageBufferNotes);
             if (ImGui::MenuItem("DualRoll", nullptr, viz.bDualPianoRoll)) {
                 viz.bDualPianoRoll = true; viz.bHorizontalPianoRoll = false;
             }
+            ImGui::EndDisabled();
             if (ImGui::MenuItem("Horizontal", nullptr, viz.bHorizontalPianoRoll)) {
                 viz.bDualPianoRoll = false; viz.bHorizontalPianoRoll = true;
             }
@@ -782,7 +787,8 @@ void Renderer::RenderImGuiFrame() {
             ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
             ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
             ImGui::Checkbox("Disable all blurs", &viz.bDisableBlurs);
-            ImGui::Checkbox("Image Buffer Notes", &viz.bImageBufferNotes);
+            if (ImGui::Checkbox("Image Buffer Notes", &viz.bImageBufferNotes) && viz.bImageBufferNotes)
+                viz.bDualPianoRoll = false;
             if (viz.bImageBufferNotes) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("(%u/64)", ImageBufferGetCachedCount());
@@ -1267,7 +1273,8 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
                         ImGui::Unindent();
                     }
-                    ImGui::Checkbox("Dump Frames", &viz.bDumpFrames);
+                    if (ImGui::Checkbox("Enable logging", &viz.bEnableLogging))
+                        g_bLoggingEnabled.store(viz.bEnableLogging, std::memory_order_relaxed);
                     ImGui::Checkbox("Disable UI (Reenable by pressing CTRL + ALT)", &viz.bDisableUI);
                     ImGui::Separator();
                     std::string splashStr = Util::WstringToString(viz.sSplashMIDI);

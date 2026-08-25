@@ -1,4 +1,5 @@
 #include "MIDIPreRenderPlayer.h"
+#include "Globals.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -30,6 +31,8 @@ static CRITICAL_SECTION s_csLog;
 
 void PRE_DbgLog(const char* format, ...)
 {
+	if (!g_bLoggingEnabled.load(std::memory_order_relaxed))
+		return;
  // Lazy init: PRE_DbgLog may be called before PRE_InitAudio() (e.g. from the UpdatePreRenderAudio init branch). Magic-static guard is thread-safe. Also starts the log file fresh per process: PRE_InitAudio only runs when prerender audio is enabled, so without this the live-mode sessions appended to a stale log from an earlier (possibly different-build) run.
 	static bool bLockInit = [] {
 		InitializeCriticalSection(&s_csLog);

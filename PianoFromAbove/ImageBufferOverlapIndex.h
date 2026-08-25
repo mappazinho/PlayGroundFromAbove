@@ -29,6 +29,8 @@ struct ImageBufferPreparedSource {
     // to 50%. The caller separately subtracts the start-shift margin.
     std::vector<uint64_t> maxEndTime150_100us;
     std::vector<uint64_t> maxEndTick150;
+    std::vector<uint64_t> prefixMaxEndTime150_100us;
+    std::vector<uint64_t> prefixMaxEndTick150;
     bool timeOverflow = false;
     bool tickOverflow = false;
 };
@@ -43,6 +45,8 @@ struct ImageBufferOverlapIndexState {
     long long lastTime = 0;
     std::vector<long long> maxEndTime;
     std::vector<long long> maxEndTick;
+    std::vector<long long> prefixMaxEndTime;
+    std::vector<long long> prefixMaxEndTick;
     std::shared_ptr<const ImageBufferPreparedSource> preparedSource;
     bool preparedAttempted = false;
 };
@@ -115,6 +119,8 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     state.lastTime = lastTime;
     state.maxEndTime.assign(blockCount, (std::numeric_limits<long long>::min)());
     state.maxEndTick.assign(blockCount, (std::numeric_limits<long long>::min)());
+    state.prefixMaxEndTime.resize(blockCount);
+    state.prefixMaxEndTick.resize(blockCount);
     state.preparedSource.reset();
     state.preparedAttempted = false;
 
@@ -209,6 +215,28 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
         }
     }
 
+    long long prefixTime = (std::numeric_limits<long long>::min)();
+    long long prefixTick = (std::numeric_limits<long long>::min)();
+    for (size_t i = 0; i < blockCount; ++i) {
+        prefixTime = (std::max)(prefixTime, state.maxEndTime[i]);
+        prefixTick = (std::max)(prefixTick, state.maxEndTick[i]);
+        state.prefixMaxEndTime[i] = prefixTime;
+        state.prefixMaxEndTick[i] = prefixTick;
+    }
+    if (source) {
+        const size_t rawBlocks = source->maxEndTime150_100us.size();
+        source->prefixMaxEndTime150_100us.resize(rawBlocks);
+        source->prefixMaxEndTick150.resize(rawBlocks);
+        uint64_t prefixRawTime = 0;
+        uint64_t prefixRawTick = 0;
+        for (size_t i = 0; i < rawBlocks; ++i) {
+            prefixRawTime = (std::max)(prefixRawTime, source->maxEndTime150_100us[i]);
+            prefixRawTick = (std::max)(prefixRawTick, source->maxEndTick150[i]);
+            source->prefixMaxEndTime150_100us[i] = prefixRawTime;
+            source->prefixMaxEndTick150[i] = prefixRawTick;
+        }
+    }
+
     state.preparedSource = std::move(source);
     state.preparedAttempted = true;
     return state;
@@ -245,6 +273,9 @@ inline void ImageBufferOverlapVisit(
 
     size_t block = (hi - 1) / ImageBufferOverlapBlockEvents;
     for (;;) {
+        const long long prefixMaxEnd = tickMode ? state.prefixMaxEndTick[block] : state.prefixMaxEndTime[block];
+        if (prefixMaxEnd < oldestUsefulEnd)
+            break;
         const long long blockMaxEnd = tickMode ? state.maxEndTick[block] : state.maxEndTime[block];
         if (blockMaxEnd >= oldestUsefulEnd) {
             const size_t begin = block * ImageBufferOverlapBlockEvents;
