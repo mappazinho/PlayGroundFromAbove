@@ -1657,7 +1657,7 @@ HRESULT D3D12Renderer::PresentBackend() {
 void D3D12Renderer::DrawPianoRollStripBackground() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
-    return;
+        return;
 
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;

@@ -408,9 +408,6 @@ inline void MIDI::PostProcessParallel(
 
     std::vector<Ref>().swap(refs);
 
-    // Legacy behavior restores repeated-note ordering after time conversion:
-    // within every equal-microsecond channel group, folded note-offs (thin rows)
-    // precede pool rows. Partition groups in independent physical-core slices.
     if (newChannelCount > 1)
     {
         std::vector<size_t> boundaries(workers + 1, 0);
@@ -469,9 +466,6 @@ inline void MIDI::PostProcessParallel(
             setProgress(worker, 6000);
     }
 
-    // Sister-index pass A: paired pool rows temporarily store their own final
-    // list position. Thin rows can then resolve the final owner position without
-    // a separate row->position array (which would cost hundreds of MB here).
     std::vector<std::vector<pair<long long, int>>> programLocal(workers);
     RunWorkers(workers, [&](unsigned worker) {
         const size_t begin = newChannelCount * (size_t)worker / workers;

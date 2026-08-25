@@ -1430,7 +1430,7 @@ void D3D11Renderer::ApplyBlur() {
 void D3D11Renderer::DrawPianoRollStripBackground() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
-    return;
+        return;
 
     const float menuBarHeight = 20.0f;
     const float toolbarHeight = 35.0f;
@@ -1763,7 +1763,7 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
         // Restore bindings for any later pass that relies on the defaults
         m_pContext->VSSetConstantBuffers(0, 1, m_pPerFrameConstants.GetAddressOf());
         ID3D11ShaderResourceView* nullChunkSRV = nullptr;
-    m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);
+        m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);
     }
 
     // Chunk quads clip to notes_scissor. Keyboard and border rectangles are
