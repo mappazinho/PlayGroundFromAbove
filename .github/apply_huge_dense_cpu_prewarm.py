@@ -345,15 +345,22 @@ rep('''            s_ImageBufferPrewarmGpu.cached = 0;
 ''',
     'owner reset CPU progress')
 
-rep('''        {
+rep('''VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
+{
+    if (!bPlaying) {
+        {
             std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
             s_ImageBufferPrewarmGpu.playRequested = false;
             ImageBufferClearPinnedChunks(s_ImageBufferPrewarmGpu.renderer);
         }
         ImageBufferPreparedCancelPlaybackGate();
         return;
+    }
 ''',
-    '''        {
+    '''VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
+{
+    if (!bPlaying) {
+        {
             std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
             s_ImageBufferPrewarmGpu.playRequested = false;
             ImageBufferClearPinnedChunks(s_ImageBufferPrewarmGpu.renderer);
@@ -361,6 +368,7 @@ rep('''        {
         ImageBufferHugePreparedClear();
         ImageBufferPreparedCancelPlaybackGate();
         return;
+    }
 ''',
     'stop clears huge CPU cache')
 
