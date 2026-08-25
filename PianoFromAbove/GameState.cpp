@@ -25,11 +25,8 @@
 #include "ImageBufferPreparedChunks.h"
 #include "ImageBufferGpuPins.h"
 
-// The immutable full-song prepared source is deliberately a memory-for-speed
-// optimization. Its persistent cost is driven by the number of notes stored in
-// the compact prepared source. The observed 59.4M-event stress case contains
-// 29.7M notes, so keep enough headroom for it while still bounding the extra
-// prepared-source memory to roughly one GiB of raw-note records.
+// The immutable full-song prepared source is deliberately a memory-for-speed optimization. Its
+// persistent cost is driven by the number of notes stored in the compact prepared source. The...
 static constexpr size_t ImageBufferFullPreparedMaxEvents = 64000000;
 static constexpr size_t ImageBufferFullPreparedMaxNotes = 32000000;
 
@@ -154,10 +151,8 @@ static void UpdateImageBufferPrewarmGpuProgress(
         return;
     }
 
-    // Full-prime discovers every truly dense center first. Runtime preparation
-    // deliberately expands each center by +/- ImageBufferPreparedPreloadRadius,
-    // so pre-play GPU work must use that same expanded set or playback will
-    // gradually discover and bake extra chunks after the gate has opened.
+    // Full-prime discovers every truly dense center first. Runtime preparation deliberately expands
+    // each center by +/- ImageBufferPreparedPreloadRadius, so pre-play GPU work must use that...
     if (cpu.done < cpu.total)
         return;
 
@@ -191,11 +186,8 @@ static void UpdateImageBufferPrewarmGpuProgress(
             prewarmChunks.push_back(chunk);
     }
 
-    // The cache is associative: sparse chunks elsewhere in the song do not
-    // matter. Only the dense/preload working set has to fit in the 64 slots.
-    // Keep a few slots free for visible sparse chunks. Without this
-    // reserve, a fully pinned dense set could leave ordinary playback nowhere
-    // to cache the current screen.
+    // The cache is associative: sparse chunks elsewhere in the song do not matter. Only the
+    // dense/preload working set has to fit in the 64 slots. Keep a few slots free for visible
     static constexpr size_t kImageBufferRuntimeReserveSlots = 8;
     const bool fitsTextureCache =
         prewarmChunks.size() <= (size_t)Renderer::ChunkPoolSize - kImageBufferRuntimeReserveSlots;
@@ -207,9 +199,8 @@ static void UpdateImageBufferPrewarmGpuProgress(
         ? CountImageBufferPrewarmCached(renderer, prewarmChunks)
         : 0;
 
-    // Protect the exact set Play waited for from speculative-lookahead LRU
-    // eviction. This is what turns prewarm into lasting residency rather than
-    // work that can be thrown away before the dense passage is reached.
+    // Protect the exact set Play waited for from speculative-lookahead LRU eviction. This is what
+    // turns prewarm into lasting residency rather than work that can be thrown away before the...
     if (requireGpu)
         ImageBufferSetPinnedChunks(renderer, prewarmChunks);
     else
@@ -329,11 +320,8 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
         (!s_ImageBufferPrewarmGpu.owner || s_ImageBufferPrewarmGpu.owner == owner);
 }
 
-// Dense chunks use a separate CPU preparation path. Sparse chunks keep the
-// exact overlap collector and existing multipass behavior. Prepared chunks are
-// built from an immutable compact note source on worker threads, rasterized to
-// the vertical note resolution, and merged back into a small set of NoteData
-// runs before they ever reach the renderer.
+// Dense chunks use a separate CPU preparation path. Sparse chunks keep the exact overlap
+// collector and existing multipass behavior. Prepared chunks are built from an immutable
 #define CollectChunk(k) ([&]() { \
     const bool imageBufferPreparedAllowed = ImageBufferFullPreparedSupported(m_vEvents, m_MIDI); \
     auto ImageBufferExactCollector = [&](long long imageBufferChunk) { \
@@ -376,11 +364,8 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, ImageBufferExactCollector, (k)); \
 }())
 
-// Prewarm cannot depend on RenderNotesImageBuffer(): while Play is gated the
-// song can sit in its empty pre-roll, where RenderNotes() returns before image
-// buffers are touched. Preserve the renderer member call, then run a
-// MainScreen-only preparation/bake step immediately after the frame begins.
-// This avoids rewriting the token after `->`, which is invalid C++.
+// Prewarm cannot depend on RenderNotesImageBuffer(): while Play is gated the song can sit in its
+// empty pre-roll, where RenderNotes() returns before image buffers are touched. Preserve...
 #define ClearAndBeginScene(...) ClearAndBeginScene(__VA_ARGS__); \
 ([&](auto* imageBufferPrewarmSelf) { \
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
@@ -487,9 +472,8 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
     } \
 }(this))
 #define EndText(...) EndText(__VA_ARGS__); DrawImageBufferPrewarmProgressLate(m_pRenderer); DrawFrameTimeGraphLate(m_pRenderer)
-// Compile the original game-state implementation under private legacy method
-// names. PlaybackAudioThread.inc supplies the public wrappers so visual logic can
-// remain frame-driven without letting the frame loop own live synth ingress.
+// Compile the original game-state implementation under private legacy method names.
+// PlaybackAudioThread.inc supplies the public wrappers so visual logic can remain frame-driven
 #define Logic LogicLegacy
 #define MsgProc MsgProcLegacy
 #define Discard DiscardLegacy
@@ -503,9 +487,8 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
 
 #include "PlaybackAudioThread.inc"
 
-// Frametime is sampled at the same late-render point as the system-stat panel,
-// so it measures real presented-frame cadence without perturbing MainScreen's
-// playback timer. The graph is visually attached immediately below Sys Stats.
+// Frametime is sampled at the same late-render point as the system-stat panel, so it measures
+// real presented-frame cadence without perturbing MainScreen's playback timer. The graph is...
 static void DrawFrameTimeGraphLate(Renderer* renderer)
 {
     using Clock = std::chrono::steady_clock;
@@ -716,9 +699,8 @@ BOOL ImageBufferPrewarmPlaybackHold()
         if (s_ImageBufferPrewarmGpu.owner != screen)
             return FALSE;
 
-        // The explicit frame-start kick is primary. Keep this invalidation as a
-        // one-shot nudge for already-cached renderers, but prewarm no longer
-        // depends on a subsequent visible CollectChunk call.
+        // The explicit frame-start kick is primary. Keep this invalidation as a one-shot nudge for
+        // already-cached renderers, but prewarm no longer depends on a subsequent visible CollectChunk
         if (!s_ImageBufferPrewarmGpu.initialized &&
             !s_ImageBufferPrewarmGpu.wakeIssued &&
             s_ImageBufferPrewarmGpu.renderer) {
@@ -736,9 +718,8 @@ BOOL ImageBufferPrewarmPlaybackHold()
 
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
-        // CPU preparation may have completed between Logic and the previous
-        // render. Hold one more frame until the render path publishes whether a
-        // texture-cache stage is required for this song.
+        // CPU preparation may have completed between Logic and the previous render. Hold one more frame
+        // until the render path publishes whether a texture-cache stage is required for this song.
         if (!s_ImageBufferPrewarmGpu.initialized)
             return TRUE;
         if (s_ImageBufferPrewarmGpu.cacheRequired) {

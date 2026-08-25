@@ -1,9 +1,5 @@
-// Independent live-MIDI scheduler for MainScreen.
-//
-// This file is included by GameState.cpp after GameStateLegacy.inc. Keeping it
-// in the same translation unit lets the scheduler reuse the existing corruption
-// helpers without duplicating their behavior, while the immutable MIDI/event
-// arrays remain safe to read until StopPlaybackAudioThread() joins the worker.
+// Independent live-MIDI scheduler for MainScreen. This file is included by GameState.cpp after
+// GameStateLegacy.inc. Keeping it in the same translation unit lets the scheduler reuse the...
 
 #include <mmsystem.h>
 #include <memory>
@@ -201,9 +197,8 @@ public:
         return true;
     }
 
-    // Pause/mute must silence currently sounding notes without resetting
-    // channel/program state. The scheduler never queues future host events, so
-    // All Notes Off + sustain off is sufficient and avoids expensive synth resets.
+    // Pause/mute must silence currently sounding notes without resetting channel/program state. The
+    // scheduler never queues future host events, so All Notes Off + sustain off is sufficient...
     void Silence()
     {
         if (m_mode == Mode::SvmsNative) {
@@ -388,9 +383,8 @@ void MainScreen::StopPlaybackAudioThread()
     m_bPlaybackAudioLiveEnabled.store(false, std::memory_order_release);
     m_dPlaybackAudioSchedulerHz.store(0.0, std::memory_order_relaxed);
 
-    // A Stop is a real output-session boundary. Clear the UI-side transition
-    // cache as well as the worker so the next Play cannot inherit a stale
-    // provider/live state from the previous run.
+    // A Stop is a real output-session boundary. Clear the UI-side transition cache as well as the
+    // worker so the next Play cannot inherit a stale provider/live state from the previous run.
     m_bPlaybackAudioControlInitialized = false;
     m_bPlaybackAudioLastPaused = true;
     m_bPlaybackAudioLastLive = false;
@@ -550,9 +544,8 @@ void MainScreen::PlaybackAudioThreadMain()
             localPaused = paused;
             controlSerial = newControl;
         } else {
-            // These atomics normally change together with controlSerial; loading
-            // them here also makes the thread robust to a partially observed UI
-            // frame without ever consulting renderer-owned state directly.
+            // These atomics normally change together with controlSerial; loading them here also makes the
+            // thread robust to a partially observed UI frame without ever consulting renderer-owned state...
             localPaused = paused;
             localSpeed = speed;
         }
@@ -598,9 +591,8 @@ void MainScreen::PlaybackAudioThreadMain()
         }
         providerWasLive = output.IsOpen();
 
-        // Pause/mute transitions silence once without resetting the synth.
-        // No future host MIDI is queued, so this cannot leave scheduled notes
-        // behind and it preserves program/controller state across resume.
+        // Pause/mute transitions silence once without resetting the synth. No future host MIDI is
+        // queued, so this cannot leave scheduled notes behind and it preserves program/controller
         if ((localPaused && !lastPanicPaused) || (globalMute && !lastPanicMute))
             output.Silence();
         lastPanicPaused = localPaused;
@@ -615,10 +607,8 @@ void MainScreen::PlaybackAudioThreadMain()
         const float corruptor = m_fPlaybackAudioCorruption.load(std::memory_order_acquire);
         const auto muteSnapshot = std::atomic_load_explicit(&m_pPlaybackAudioMuteMask, std::memory_order_acquire);
 
-        // The scheduler is intentionally uncapped while live playback is
-        // running. It busy-polls the independent QPC clock as fast as this CPU
-        // can execute the loop; dense equal-time events still use one exact-QPC
-        // batch at a time. Paused/inactive states sleep separately below.
+        // The scheduler is intentionally uncapped while live playback is running. It busy-polls the
+        // independent QPC clock as fast as this CPU can execute the loop; dense equal-time events
         const bool exactBatch = output.HasExactQpcBatch();
         const long long lookAheadWallUs = 0LL;
         const long long deadlineSongUs = songUs + (long long)(lookAheadWallUs * localSpeed + 0.5);
@@ -700,19 +690,15 @@ void MainScreen::PlaybackAudioThreadMain()
 
         if (!eventBatch.empty() && output.IsOpen()) {
             if (!output.SendBatch(eventBatch.data(), eventBatch.size())) {
-                // Exact SVMS submits this pass atomically as one batch. Generic
-                // output can only fail on an actual device error; rewinding is
-                // still preferable to silently dropping the remainder.
+                // Exact SVMS submits this pass atomically as one batch. Generic output can only fail on an
+                // actual device error; rewinding is still preferable to silently dropping the remainder.
                 eventPos = startPos;
                 output.Close();
             }
         }
 
-        // Never yield or sleep on the active playback path. A full batch
-        // immediately continues into the next batch, while an idle iteration
-        // immediately polls QPC again. This deliberately consumes one scheduler
-        // thread/core when playing in exchange for the lowest possible ingress
-        // latency and an effectively unlimited audio/MIDI FPS.
+        // Never yield or sleep on the active playback path. A full batch immediately continues into the
+        // next batch, while an idle iteration immediately polls QPC again. This deliberately...
         if (processed >= maxEventsThisPass)
             continue;
     }
@@ -723,9 +709,8 @@ void MainScreen::PlaybackAudioThreadMain()
     timeEndPeriod(1);
 }
 
-// The legacy implementation is compiled under LogicLegacy/MsgProcLegacy/
-// DiscardLegacy aliases by GameState.cpp. These wrappers are the only bridge
-// between renderer cadence and the independent output clock.
+// The legacy implementation is compiled under LogicLegacy/MsgProcLegacy/ DiscardLegacy aliases
+// by GameState.cpp. These wrappers are the only bridge between renderer cadence and the...
 GameState::GameError SplashScreen::Logic() { return LogicLegacy(); }
 GameState::GameError SplashScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -754,10 +739,9 @@ GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
         return result;
     }
 
-    if (!IsFreePlay() && wasPaused && !nowPaused) {
+    if (!IsFreePlay() && wasPaused != nowPaused) {
         StartPlaybackAudioThread();
-        PlaybackAudioSeek(m_llStartTime);
-        SyncPlaybackAudioThread(true);
+        SyncPlaybackAudioThread(false);
     } else if (!IsFreePlay() && m_llStartTime != before) {
         StartPlaybackAudioThread();
         PlaybackAudioSeek(m_llStartTime);
@@ -775,9 +759,8 @@ GameState::GameError MainScreen::Logic(void)
     StartPlaybackAudioThread();
     SyncPlaybackAudioThread(false);
 
-    // For live synth playback the audio QPC clock is authoritative, including
-    // the exact pause position. Resetting the legacy frame timer here prevents
-    // its old FPS-based elapsed step from double-advancing after the snap.
+    // For live synth playback the audio QPC clock is authoritative, including the exact pause
+    // position. Resetting the legacy frame timer here prevents its old FPS-based elapsed step
     if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering) {
         const long long audioClock = PlaybackAudioClockNow();
         if (audioClock >= GetMinTime() && audioClock <= GetMaxTime()) {

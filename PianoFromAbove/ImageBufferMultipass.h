@@ -3,9 +3,8 @@
 #include <cstddef>
 #include <vector>
 
-// Shared CPU-side state for incremental image-buffer texture construction.
-// One chunk is allowed to be in progress per Renderer instance. The render
-// thread is the only writer, so no locking is required.
+// Shared CPU-side state for incremental image-buffer texture construction. One chunk is allowed
+// to be in progress per Renderer instance. The render thread is the only writer, so no...
 struct ImageBufferMultipassState {
     unsigned long long generation = 0;
     unsigned frame = 0;
@@ -40,9 +39,8 @@ inline ImageBufferMultipassState& ImageBufferMPGet(Renderer* renderer)
     return ImageBufferMPMap()[renderer];
 }
 
-// Let the backend sample an in-progress slot after this frame's pass has been
-// recorded. While requestQueued is true this helper deliberately returns -1 so
-// the build loop does not mistake the partial slot for a completed cache entry.
+// Let the backend sample an in-progress slot after this frame's pass has been recorded. While
+// requestQueued is true this helper deliberately returns -1 so the build loop does not
 inline int ImageBufferMPDrawableSlot(Renderer* renderer, int cachedSlot, long long chunk)
 {
     if (cachedSlot >= 0)
@@ -54,19 +52,12 @@ inline int ImageBufferMPDrawableSlot(Renderer* renderer, int cachedSlot, long lo
     return -1;
 }
 
-// A normal-render fallback above this size is more expensive than simply
-// waiting for the image-buffer chunk to become drawable. Keeping this bounded
-// prevents a dense visible chunk from rendering millions of notes normally
-// while also spending a multipass GPU slice on the same frame.
+// A normal-render fallback above this size is more expensive than simply waiting for the image-
+// buffer chunk to become drawable. Keeping this bounded prevents a dense visible chunk from...
 static constexpr size_t ImageBufferMPMaxNormalFallbackNotes = 100000;
 
 // GameState normally rebuilds a complete NoteData vector before every call to
-// ImageBufferRenderChunk. Once a multipass chunk has its CPU staging copy, the
-// first collection on later frames can be skipped entirely. Visible in-progress
-// chunks are drawn from their partial texture, so they never need the full
-// normal-note fallback. If another visible chunk could not start because this
-// frame's one multipass request is already occupied, keep the ordinary fallback
-// only when that chunk is small enough to be cheap.
+// ImageBufferRenderChunk. Once a multipass chunk has its CPU staging copy, the first collection
 template <typename Collector>
 inline void ImageBufferMPCollectDispatch(Renderer* renderer, std::vector<NoteData>& out,
                                          Collector& collector, long long chunk)
@@ -87,18 +78,15 @@ inline void ImageBufferMPCollectDispatch(Renderer* renderer, std::vector<NoteDat
             return;
         }
 
-        // A second call is GameState asking for visible fallback after the bake
-        // returned incomplete. Do not copy/push millions of notes through the
-        // regular renderer; the backend will draw the accumulated partial slot.
+        // A second call is GameState asking for visible fallback after the bake returned incomplete. Do
+        // not copy/push millions of notes through the regular renderer; the backend will draw the...
         ++s.collectCalls;
         out.clear();
         return;
     }
 
-    // A second collection of a different chunk in the same frame means its
-    // BakeChunk could not claim the one multipass request. Reuse the vector that
-    // is already in `out`, but suppress it when it would be an expensive normal
-    // fallback. It can begin its own multipass on a following frame.
+    // A second collection of a different chunk in the same frame means its BakeChunk could not claim
+    // the one multipass request. Reuse the vector that is already in `out`, but suppress it...
     if (s.collectChunk == chunk && s.collectCalls > 0) {
         ++s.collectCalls;
         if (out.size() > ImageBufferMPMaxNormalFallbackNotes)
@@ -140,9 +128,8 @@ inline bool ImageBufferMPRequestFinalize(Renderer* renderer)
     return s.backendActive && s.requestFinalize;
 }
 
-// Called only after the backend has actually recorded the pass. Cursor progress
-// is committed here instead of when it is queued, so a failed/aborted backend
-// does not silently skip a slice on the next frame.
+// Called only after the backend has actually recorded the pass. Cursor progress is committed
+// here instead of when it is queued, so a failed/aborted backend does not silently skip a
 inline void ImageBufferMPEndBackend(Renderer* renderer)
 {
     auto& s = ImageBufferMPGet(renderer);

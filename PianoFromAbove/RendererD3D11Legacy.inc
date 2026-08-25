@@ -98,10 +98,8 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
         }
     }
     if (m_pDevice == nullptr) {
-        // No usable hardware device (WARP forced after a failed hardware init, or
-        // no suitable adapter at all): fall back to the WARP software rasterizer
-        // so the app can still boot on legacy/RDP/virtual machines with broken or
-        // missing WDDM support.
+        // No usable hardware device (WARP forced after a failed hardware init, or no suitable adapter at
+        // all): fall back to the WARP software rasterizer so the app can still boot on...
         HeartbeatLog("init(d3d11):nodevice - trying WARP");
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         res = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -395,9 +393,8 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     if (FAILED(std::get<0>(res2)))
         return res2;
 
-    // Initialize ImGui. Backend init must precede UpdateImGuiSettings: the
-    // latter calls ImGuiBackendCreateDeviceObjects via ImGui_ImplDX11, which
-    // dereferences the backend data set by ImGui_ImplDX11_Init.
+    // Initialize ImGui. Backend init must precede UpdateImGuiSettings: the latter calls
+    // ImGuiBackendCreateDeviceObjects via ImGui_ImplDX11, which dereferences the backend data set
     ImGui::CreateContext();
     ImGui_ImplWin32_Init(hWnd);
     ImGui_ImplDX11_Init(m_pDevice.Get(), m_pContext.Get());
@@ -463,10 +460,8 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
         ComPtr<IDXGISwapChain1> temp_swapchain;
         res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
         if (FAILED(res)) {
-            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1
-            // path) and fail with E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions,
-            // virtual GPUs, etc. Fall back to the bitblt model, which works everywhere.
-            // (DXGI_SCALING_NONE is flip-model-only, so switch to STRETCH too.)
+            // Flip-model swapchains (FLIP_DISCARD) require a WDDM 1.2+ driver (FL 11.1 path) and fail with
+            // E_ACCESSDENIED on WDDM 1.x drivers, RDP sessions, virtual GPUs, etc. Fall back to the...
             char ebuf[96];
             sprintf_s(ebuf, "swapchain(d3d11):flipfailed hr=0x%08X - trying bitblt", (unsigned)res);
             HeartbeatLog(ebuf);
@@ -496,9 +491,8 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
 
     m_pFactory->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER);
 
-    // Render target views. A flip-model swap chain only exposes its current
-    // back buffer until the first present; the other RTVs are created lazily
-    // in PresentBackend once the remaining buffers are allocated.
+    // Render target views. A flip-model swap chain only exposes its current back buffer until the
+    // first present; the other RTVs are created lazily in PresentBackend once the remaining...
     m_uFrameIndex = m_pSwapChain->GetCurrentBackBufferIndex();
     {
         ComPtr<ID3D11Texture2D> backbuffer;
@@ -817,9 +811,8 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     if (!g_bDisableBlur) {
         ApplyBlur();
     } else if (bloomViz.bBloom && m_pSceneCopy) {
-        // Bloom shares the scene-copy texture with the normal blur pipeline.
-        // Capture it even when UI/background blur is disabled so bloom always
-        // extracts from the current frame rather than stale texture contents.
+        // Bloom shares the scene-copy texture with the normal blur pipeline. Capture it even when
+        // UI/background blur is disabled so bloom always extracts from the current frame rather than
         ID3D11Resource* backbuffer = nullptr;
         m_pRTVs[m_uFrameIndex]->GetResource(&backbuffer);
         if (backbuffer) {
@@ -986,9 +979,8 @@ HRESULT D3D11Renderer::PresentBackend() {
 
     m_uFrameIndex = m_pSwapChain->GetCurrentBackBufferIndex();
 
-    // A flip-model swap chain only guarantees the current back buffer right
-    // after creation/resize; fill in the remaining RTVs now that the other
-    // buffers are allocated.
+    // A flip-model swap chain only guarantees the current back buffer right after creation/resize;
+    // fill in the remaining RTVs now that the other buffers are allocated.
     for (uint32_t i = 0; i < FrameCount; i++) {
         if (!m_pRTVs[i]) {
             ComPtr<ID3D11Texture2D> backbuffer;
@@ -1506,10 +1498,12 @@ void D3D11Renderer::DrawPianoRollStrip() {
     if (!stripViz.bDualPianoRoll && !horizontal)
         return;
 
-    const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
-        ? m_vPianoRollStripNotesIntermediate
-        : m_vNotesIntermediate;
-    if (stripNotes.empty())
+    if (stripViz.bImageBufferNotes && m_vPianoRollStripNotesIntermediate.empty())
+            return;
+        const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+            ? m_vPianoRollStripNotesIntermediate
+            : m_vNotesIntermediate;
+        if (stripNotes.empty())
         return;
 
     const size_t stripCount = m_bUnlimitedNotes
@@ -1556,8 +1550,8 @@ void D3D11Renderer::DrawPianoRollStrip() {
 
     SetPipeline(Pipeline::Note);
     // The strip SRV starts at PianoRollStripNoteOffset
-    ID3D11ShaderResourceView* bindSRVs[] = { m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get() };
-    m_pContext->VSSetShaderResources(0, 3, bindSRVs);
+    ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get() };
+    m_pContext->VSSetShaderResources(0, 4, bindSRVs);
     m_pContext->DrawIndexed((UINT)(sampledCount * 6), 0, 0);
 
     m_RootConstants = savedRoot;
@@ -1682,8 +1676,16 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
         m_pContext->ClearRenderTargetView(m_pChunkRTVs[slot].Get(), clear_color);
         m_pContext->ClearDepthStencilView(m_pChunkDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-        SetPipeline(Pipeline::Note);
-        m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &chunkRoot, 0, 0);
+        D3D11RootConstants requestRoot = chunkRoot;
+            if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                requestRoot.stripMode = 1.0f;
+                requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                requestRoot.notes_y = 0.0f;
+                requestRoot.notes_cy = (float)W;
+                requestRoot.white_cx = (float)H / 75.0f;
+            }
+            SetPipeline(Pipeline::Note);
+            m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
         m_pContext->UpdateSubresource(m_pChunkFixedBuffer.Get(), 0, nullptr, &chunkFixed, 0, 0);
         m_pContext->VSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());
         m_pContext->PSSetConstantBuffers(0, 1, m_pChunkConstants.GetAddressOf());
@@ -1742,13 +1744,29 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
 
         for (const auto& quad : m_vChunkQuads) {
             const int slot = ImageBufferGetChunkSlot(quad.chunk);
-            if (slot < 0)
-                continue; // not baked this frame (shouldn't happen)
-            quadConstants.quadPos[0] = notesX;
-            quadConstants.quadPos[1] = quad.yTop;
-            quadConstants.quadSize[0] = notesCX;
-            quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
-            m_pContext->RSSetScissorRects(1, &notes_scissor);
+            if (slot < 0) continue;
+            D3D11_RECT scissor = notes_scissor;
+            if (Renderer::ImageBufferIsStripChunkKey(quad.chunk)) {
+                const auto& viz = Config::GetConfig().GetVizSettings();
+                const float top = viz.bHorizontalPianoRoll ? 0.0f : 55.0f;
+                const float height = viz.bHorizontalPianoRoll ? (float)m_iBufferHeight
+                    : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+                quadConstants.quadPos[0] = quad.yTop;
+                quadConstants.quadPos[1] = top;
+                quadConstants.quadSize[0] = max(0.0f, quad.yBottom - quad.yTop);
+                quadConstants.quadSize[1] = height;
+                scissor.left = (LONG)max(0.0f, floorf(quad.yTop));
+                scissor.right = (LONG)min((float)m_iBufferWidth, ceilf(quad.yBottom));
+                scissor.top = (LONG)max(0.0f, floorf(top));
+                scissor.bottom = (LONG)min((float)m_iBufferHeight, ceilf(top + height));
+                if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) continue;
+            } else {
+                quadConstants.quadPos[0] = notesX;
+                quadConstants.quadPos[1] = quad.yTop;
+                quadConstants.quadSize[0] = notesCX;
+                quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+            }
+            m_pContext->RSSetScissorRects(1, &scissor);
             m_pContext->UpdateSubresource(m_pChunkQuadConstants.Get(), 0, nullptr, &quadConstants, 0, 0);
             m_pContext->PSSetShaderResources(0, 1, m_pChunkSRVs[slot].GetAddressOf());
             m_pContext->DrawIndexed(6, 0, 0);
