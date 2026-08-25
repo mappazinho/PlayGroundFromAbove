@@ -1,0 +1,167 @@
+name: Validate huge image buffer index fix
+
+on:
+  push:
+    branches: [fix/huge-image-buffer-index]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/huge-image-buffer-index
+          fetch-depth: 0
+
+      - name: Apply source fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def rep(path, old, new, label):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: {n} matches')
+              p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+          # Per-screen coarse overlap metadata: four int64 arrays per 4096 events.
+          rep('PianoFromAbove/GameState.h',
+              '''    long long m_llMaxNoteLen = 0;       // longest note, microseconds\n    long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)\n    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached''',
+              '''    long long m_llMaxNoteLen = 0;       // longest note, microseconds\n    long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)\n    vector<long long> m_vImageBufferMaxEndTime;\n    vector<long long> m_vImageBufferMaxEndTick;\n    vector<long long> m_vImageBufferPrefixEndTime;\n    vector<long long> m_vImageBufferPrefixEndTick;\n    bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached''',
+              'GameState huge index members')
+
+          # Replace the global-max-note lookback collector with block-pruned traversal.
+          p = Path('PianoFromAbove/GameState.cpp')
+          s = p.read_text(encoding='utf-8')
+          a = s.index('template <typename BuildFn>\nstatic void ImageBufferCollectHugeLocal(')
+          b = s.index('\nstatic size_t CountImageBufferPrewarmCached(', a)
+          new_helper = r'''static constexpr size_t ImageBufferHugeBlockEvents = 4096;
+
+template <typename BuildFn>
+static void ImageBufferCollectHugeIndexed(
+    const std::vector<MIDIChannelEvent>& events,
+    MIDI& midi,
+    std::vector<NoteData>& out,
+    long long chunk,
+    long long timeSpan,
+    long long corruptionMargin,
+    bool tickMode,
+    const std::vector<long long>& maxEndTime,
+    const std::vector<long long>& maxEndTick,
+    const std::vector<long long>& prefixEndTime,
+    const std::vector<long long>& prefixEndTick,
+    BuildFn&& buildNote)
+{
+    out.clear();
+    if (events.empty() || timeSpan <= 0)
+        return;
+
+    const long long chunkStart = chunk * timeSpan;
+    const long long chunkEnd = ImageBufferOverlapSaturatingAdd(chunkStart, timeSpan);
+    const long long hi = ImageBufferOverlapSaturatingAdd(chunkEnd, corruptionMargin);
+    const long long oldestUsefulEnd = ImageBufferOverlapSaturatingAdd(
+        chunkStart, -corruptionMargin);
+
+    auto eventLessTime = [&](MIDIChannelEvent event, long long value) {
+        return (tickMode ? (long long)midi.GetEventAbsT(event) : midi.GetEventTime(event)) < value;
+    };
+    const auto itHi = std::lower_bound(events.begin(), events.end(), hi, eventLessTime);
+    const size_t hiIndex = (size_t)(itHi - events.begin());
+    if (hiIndex == 0)
+        return;
+
+    const auto& blockMax = tickMode ? maxEndTick : maxEndTime;
+    const auto& prefixMax = tickMode ? prefixEndTick : prefixEndTime;
+    if (blockMax.empty() || prefixMax.size() != blockMax.size())
+        return;
+
+    size_t block = (hiIndex - 1) / ImageBufferHugeBlockEvents;
+    if (block >= blockMax.size())
+        block = blockMax.size() - 1;
+
+    for (;;) {
+        if (prefixMax[block] < oldestUsefulEnd)
+            break;
+        if (blockMax[block] >= oldestUsefulEnd) {
+            const size_t begin = block * ImageBufferHugeBlockEvents;
+            const size_t end = (std::min)(hiIndex, begin + ImageBufferHugeBlockEvents);
+            for (size_t i = end; i != begin; ) {
+                --i;
+                const MIDIChannelEvent event = events[i];
+                if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                    midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
+                    continue;
+                NoteData data = buildNote(event, chunkStart);
+                if (data.pos < (float)timeSpan &&
+                    data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
+                    out.push_back(data);
+            }
+        }
+        if (block == 0)
+            break;
+        --block;
+    }
+}
+'''
+          p.write_text(s[:a] + new_helper + s[b:], encoding='utf-8')
+
+          # Route the prepared-path exact fallback through the per-screen huge index.
+          rep('PianoFromAbove/GameState.cpp',
+              '''            const long long imageBufferMaxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen; \\\n            ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, \\\n                imageBufferMaxLen, bTickMode, \\\n                [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \\\n                    return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \\\n                }); \\\n''',
+              '''            ImageBufferCollectHugeIndexed(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, bTickMode, \\\n                m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick, \\\n                m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick, \\\n                [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \\\n                    return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \\\n                }); \\\n''',
+              'macro huge collector')
+
+          # Build the coarse index during the loader's existing NPS/max-note pass.
+          rep('PianoFromAbove/GameStateLegacy.inc',
+              '''            m_llMaxNPS = 1;\n            vector<long long> noteTimes;\n            noteTimes.reserve(m_vEvents.size());\n            // Longest note (start -> sister start), both time domains; used by the image buffer to catch\n            // notes that begin before a chunk but overlap into it.\n            m_llMaxNoteLen = 0;\n            m_llMaxNoteLenTicks = 0;\n            for (size_t i = 0; i < m_vEvents.size(); i++)\n            {\n                if (m_MIDI.GetEventChannelEventType(m_vEvents[i]) == MIDI::NoteOn &&\n                    m_MIDI.GetEventParam2(m_vEvents[i]) > 0)\n                {\n                    noteTimes.push_back(m_MIDI.GetEventTime(m_vEvents[i]));\n                    if (m_MIDI.EventHasSister(m_vEvents[i]))\n                    {\n                        long long len = m_MIDI.GetEventLength(m_vEvents[i]);\n                        if (len > m_llMaxNoteLen)\n                            m_llMaxNoteLen = len;\n                        len = m_MIDI.GetEventAbsT(m_vEvents[m_MIDI.GetEventSisterIdx(m_vEvents[i])]) -\n                              m_MIDI.GetEventAbsT(m_vEvents[i]);\n                        if (len > m_llMaxNoteLenTicks)\n                            m_llMaxNoteLenTicks = len;\n                    }\n                }\n            }\n            if (!noteTimes.empty())\n            {\n                size_t left = 0;\n                for (size_t right = 0; right < noteTimes.size(); right++)\n                {\n                    while (noteTimes[right] - noteTimes[left] > 1000000)\n                        left++;\n                    long long curWindowNPS = (long long)(right - left + 1);\n                    if (curWindowNPS > m_llMaxNPS)\n                        m_llMaxNPS = curWindowNPS;\n                }\n            }''',
+              '''            m_llMaxNPS = 1;\n            deque<long long> npsWindow;\n            const size_t imageBufferBlocks =\n                (m_vEvents.size() + ImageBufferHugeBlockEvents - 1) / ImageBufferHugeBlockEvents;\n            const long long imageBufferMinEnd = (std::numeric_limits<long long>::min)();\n            m_vImageBufferMaxEndTime.assign(imageBufferBlocks, imageBufferMinEnd);\n            m_vImageBufferMaxEndTick.assign(imageBufferBlocks, imageBufferMinEnd);\n            m_vImageBufferPrefixEndTime.resize(imageBufferBlocks);\n            m_vImageBufferPrefixEndTick.resize(imageBufferBlocks);\n            m_llMaxNoteLen = 0;\n            m_llMaxNoteLenTicks = 0;\n            for (size_t i = 0; i < m_vEvents.size(); i++)\n            {\n                const MIDIChannelEvent event = m_vEvents[i];\n                if (m_MIDI.GetEventChannelEventType(event) != MIDI::NoteOn ||\n                    m_MIDI.GetEventParam2(event) <= 0)\n                    continue;\n\n                const long long noteTime = m_MIDI.GetEventTime(event);\n                npsWindow.push_back(noteTime);\n                while (!npsWindow.empty() && noteTime - npsWindow.front() > 1000000)\n                    npsWindow.pop_front();\n                m_llMaxNPS = (std::max)(m_llMaxNPS, (long long)npsWindow.size());\n\n                if (!m_MIDI.EventHasSister(event))\n                    continue;\n                const MIDIChannelEvent sister =\n                    m_vEvents[m_MIDI.GetEventSisterIdx(event)];\n                const long long lengthTime = (std::max)(0LL, (long long)m_MIDI.GetEventLength(event));\n                const long long startTick = m_MIDI.GetEventAbsT(event);\n                const long long lengthTick = (std::max)(0LL,\n                    (long long)m_MIDI.GetEventAbsT(sister) - startTick);\n                m_llMaxNoteLen = (std::max)(m_llMaxNoteLen, lengthTime);\n                m_llMaxNoteLenTicks = (std::max)(m_llMaxNoteLenTicks, lengthTick);\n\n                const size_t block = i / ImageBufferHugeBlockEvents;\n                const long long endTime = ImageBufferOverlapWorstEnd(noteTime, lengthTime);\n                const long long endTick = ImageBufferOverlapWorstEnd(startTick, lengthTick);\n                m_vImageBufferMaxEndTime[block] =\n                    (std::max)(m_vImageBufferMaxEndTime[block], endTime);\n                m_vImageBufferMaxEndTick[block] =\n                    (std::max)(m_vImageBufferMaxEndTick[block], endTick);\n            }\n\n            long long prefixTime = imageBufferMinEnd;\n            long long prefixTick = imageBufferMinEnd;\n            for (size_t block = 0; block < imageBufferBlocks; ++block) {\n                prefixTime = (std::max)(prefixTime, m_vImageBufferMaxEndTime[block]);\n                prefixTick = (std::max)(prefixTick, m_vImageBufferMaxEndTick[block]);\n                m_vImageBufferPrefixEndTime[block] = prefixTime;\n                m_vImageBufferPrefixEndTick[block] = prefixTick;\n            }''',
+              'loader NPS/index pass')
+
+          # Horizontal image-buffer fallback uses the same indexed collector.
+          rep('PianoFromAbove/GameStateLegacy.inc',
+              '''                ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, maxLen, tickMode,\n                    [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });''',
+              '''                ImageBufferCollectHugeIndexed(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,\n                    m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick,\n                    m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick,\n                    [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });''',
+              'strip huge collector')
+
+          # The old maxLen local is no longer needed in the strip path.
+          rep('PianoFromAbove/GameStateLegacy.inc',
+              '''    const long long maxLen = tickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;\n    std::vector<NoteData> chunkNotes;''',
+              '''    std::vector<NoteData> chunkNotes;''',
+              'strip maxLen cleanup')
+
+          Path('.github/workflows/apply-huge-image-buffer-index.yml').unlink()
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'ImageBufferCollectHugeIndexed' PianoFromAbove/GameState.cpp
+          grep -F 'm_vImageBufferPrefixEndTime' PianoFromAbove/GameState.h
+          grep -F 'deque<long long> npsWindow' PianoFromAbove/GameStateLegacy.inc
+          ! grep -F 'ImageBufferCollectHugeLocal' PianoFromAbove/GameState.cpp PianoFromAbove/GameStateLegacy.inc
+          ! grep -F 'vector<long long> noteTimes' PianoFromAbove/GameStateLegacy.inc
+
+      - name: Compile Release x64 source
+        shell: powershell
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild PianoFromAbove.sln /m /p:Configuration=Release /p:Platform=x64 /t:"FxCompile;ClCompile" /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Index huge image buffer overlap blocks"
+          git push origin HEAD:fix/huge-image-buffer-index
