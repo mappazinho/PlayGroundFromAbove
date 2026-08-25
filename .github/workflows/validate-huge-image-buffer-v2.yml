@@ -19,7 +19,9 @@ jobs:
 
       - name: Apply source patch
         shell: pwsh
-        run: python .github/patch_huge_v2.py
+        run: |
+          python -c "from pathlib import Path; p=Path(r'.github/patch_huge_v2.py'); s=p.read_text(encoding='utf-8'); p.write_text(s.replace(chr(92)+chr(39)*3, chr(92)+chr(10)+chr(39)*3), encoding='utf-8')"
+          python .github/patch_huge_v2.py
 
       - name: Validate source
         shell: bash
