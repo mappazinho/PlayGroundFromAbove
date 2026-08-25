@@ -1,0 +1,509 @@
+name: Apply playback and strip regressions
+
+on:
+  push:
+    branches: [ fix/playpause-customaudio-dual-imgbuf-d3d11 ]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/playpause-customaudio-dual-imgbuf-d3d11
+          fetch-depth: 0
+
+      - name: Apply fixes
+        shell: python
+        run: |
+          from pathlib import Path
+          import textwrap
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              n = text.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {n}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          def insert_before(path, anchor, addition, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              n = text.count(anchor)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected 1 anchor, got {n}')
+              p.write_text(text.replace(anchor, addition + anchor, 1), encoding='utf-8')
+
+          # Pause/resume freezes the existing scheduler cursor; only real seeks panic/reseek.
+          replace_once('PianoFromAbove/PlaybackAudioThread.inc',
+          '''    if (!IsFreePlay() && wasPaused && !nowPaused) {
+              StartPlaybackAudioThread();
+              PlaybackAudioSeek(m_llStartTime);
+              SyncPlaybackAudioThread(true);
+          } else if (!IsFreePlay() && m_llStartTime != before) {
+              StartPlaybackAudioThread();
+              PlaybackAudioSeek(m_llStartTime);
+          }
+          ''',
+          '''    if (!IsFreePlay() && wasPaused != nowPaused) {
+              StartPlaybackAudioThread();
+              SyncPlaybackAudioThread(false);
+          } else if (!IsFreePlay() && m_llStartTime != before) {
+              StartPlaybackAudioThread();
+              PlaybackAudioSeek(m_llStartTime);
+          }
+          ''', 'pause resume scheduler')
+
+          # Decoder-only custom audio must initialize BASS and pass wide paths as Unicode.
+          replace_once('PianoFromAbove/GameStateLegacy.inc',
+          '''static HSTREAM CustomAudioOpen(const wstring &sFile)
+          {
+              HSTREAM h = BASS_StreamCreateFile(FALSE, sFile.c_str(), 0, 0, BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
+          ''',
+          '''static HSTREAM CustomAudioOpen(const wstring &sFile)
+          {
+              if (!BASS_Init(0, 48000, BASS_DEVICE_NOSPEAKER, NULL, NULL))
+              {
+                  const int err = BASS_ErrorGetCode();
+                  if (err != BASS_ERROR_ALREADY)
+                  {
+                      PRE_DbgLog("CustomAudio: BASS init failed (err %d)", err);
+                      return 0;
+                  }
+              }
+              HSTREAM h = BASS_StreamCreateFile(FALSE, sFile.c_str(), 0, 0,
+                  BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT | BASS_UNICODE);
+          ''', 'custom audio bass init unicode')
+
+          # Reserve a remote cache-key range for horizontal image-buffer chunks.
+          replace_once('PianoFromAbove/RendererLegacy.h',
+          '''    static constexpr unsigned ChunkPoolSize = 64;
+              static constexpr long long ImageBufferInvalidChunk = (std::numeric_limits<long long>::max)();
+          ''',
+          '''    static constexpr unsigned ChunkPoolSize = 64;
+              static constexpr long long ImageBufferInvalidChunk = (std::numeric_limits<long long>::max)();
+              static constexpr long long ImageBufferStripChunkBase = (1LL << 60);
+              static long long ImageBufferStripChunkKey(long long chunk) { return ImageBufferStripChunkBase + chunk; }
+              static bool ImageBufferIsStripChunkKey(long long key) { return key >= (ImageBufferStripChunkBase >> 1); }
+          ''', 'strip cache key helpers')
+
+          replace_once('PianoFromAbove/GameState.h',
+          '''    void RenderNotesImageBuffer();
+              NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
+          ''',
+          '''    void RenderNotesImageBuffer();
+              void RenderPianoRollStripImageBuffer();
+              NoteData BuildChunkNoteData(MIDIChannelEvent pNote, long long chunkStart) const;
+          ''', 'strip image buffer declaration')
+
+          # Use image-buffer chunks for the strip when DualRoll/Horizontal is active.
+          old_strip = '''    if (hasStrip) {
+              const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan(
+                  (float)m_llTimeSpan, m_fNotesCY);
+              const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
+
+
+              {
+                  int64_t hi = max<int64_t>(m_iStartPos, 0);
+                  while (hi < eventCount) {
+                      MIDIChannelEvent pEvent = m_vEvents[hi];
+                      const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
+                      if (eventTime >= stripEnd)
+                          break;
+                      hi++;
+                  }
+                  for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); i--) {
+                      MIDIChannelEvent pEvent = m_vEvents[i];
+                      if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                          m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent)) {
+                          RenderPianoRollStripNote(pEvent);
+                      }
+                  }
+              }
+
+              for (size_t i = 0; i < 128; i++) {
+                  for (vector< int >::reverse_iterator it = (m_vState[i]).rbegin(); it != (m_vState[i]).rend(); it++) {
+                      if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                          RenderPianoRollStripNote(m_vEvents[*it]);
+                  }
+              }
+          }
+          '''
+          new_strip = '''    if (hasStrip) {
+              if (bImageBuffer) {
+                  RenderPianoRollStripImageBuffer();
+              } else {
+                  const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan(
+                      (float)m_llTimeSpan, m_fNotesCY);
+                  const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
+
+                  int64_t hi = max<int64_t>(m_iStartPos, 0);
+                  while (hi < eventCount) {
+                      MIDIChannelEvent pEvent = m_vEvents[hi];
+                      const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
+                      if (eventTime >= stripEnd)
+                          break;
+                      hi++;
+                  }
+                  for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); i--) {
+                      MIDIChannelEvent pEvent = m_vEvents[i];
+                      if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                          m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
+                          RenderPianoRollStripNote(pEvent);
+                  }
+
+                  for (size_t i = 0; i < 128; i++) {
+                      for (vector<int>::reverse_iterator it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it) {
+                          if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                              RenderPianoRollStripNote(m_vEvents[*it]);
+                      }
+                  }
+              }
+          }
+          '''
+          replace_once('PianoFromAbove/GameStateLegacy.inc', old_strip, new_strip, 'strip render selection')
+
+          strip_fn = r'''void MainScreen::RenderPianoRollStripImageBuffer()
+          {
+              if (m_bImageBufferNeedsInvalidate) {
+                  m_pRenderer->ImageBufferInvalidate();
+                  m_bImageBufferNeedsInvalidate = false;
+              }
+              m_pRenderer->ImageBufferSetEventCount((unsigned long long)m_vEvents.size());
+
+              const long long T = m_llTimeSpan;
+              if (T <= 0 || m_vEvents.empty())
+                  return;
+
+              const long long tStart = m_llRndStartTime;
+              const float fCorrupt = GetCorruptorAmount();
+              const long long E = 1 + (long long)ceil((double)T * 0.10 * (double)fCorrupt);
+              const bool bTickMode = m_bTickMode;
+              const long long stripSpan = (long long)ceilf(m_pRenderer->GetDualRollTimeSpan((float)T, m_fNotesCY));
+              if (stripSpan <= 0)
+                  return;
+
+              const long long kFirst = (long long)floor((double)tStart / (double)T);
+              const long long kLast = (long long)floor((double)(tStart + stripSpan) / (double)T);
+              const long long tMax = bTickMode ? m_MIDI.GetEventAbsT(m_vEvents.back()) : m_MIDI.GetEventTime(m_vEvents.back());
+              const long long kSongEnd = (long long)ceil((double)tMax / (double)T);
+              const long long kMax = min(kLast + 4, max(kLast, kSongEnd));
+              const long long maxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
+
+              std::vector<NoteData> chunkNotes;
+              std::vector<NoteData> fallbackNotes;
+              unsigned lookaheadBakes = 0;
+
+              auto CollectStripChunk = [&](long long k) {
+                  const long long cacheKey = Renderer::ImageBufferStripChunkKey(k);
+                  auto exactCollector = [&](long long) {
+                      if (ImageBufferFullPreparedSupported(m_vEvents, m_MIDI)) {
+                          ImageBufferOverlapCollect(this, m_vEvents, m_MIDI, chunkNotes, k, T, E, bTickMode,
+                              [&](MIDIChannelEvent note, long long chunkStart) {
+                                  return BuildChunkNoteData(note, chunkStart);
+                              });
+                      } else {
+                          ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, k, T, E, maxLen, bTickMode,
+                              [&](MIDIChannelEvent note, long long chunkStart) {
+                                  return BuildChunkNoteData(note, chunkStart);
+                              });
+                      }
+                  };
+                  ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, exactCollector, cacheKey);
+              };
+
+              auto BakeStripChunk = [&](long long k) -> bool {
+                  const long long cacheKey = Renderer::ImageBufferStripChunkKey(k);
+                  if (m_pRenderer->ImageBufferChunkCached(cacheKey))
+                      return true;
+                  CollectStripChunk(k);
+                  return m_pRenderer->ImageBufferRenderChunk(cacheKey, chunkNotes.data(), (unsigned)chunkNotes.size());
+              };
+
+              for (long long k = kFirst; k <= kLast; ++k) {
+                  if (!BakeStripChunk(k)) {
+                      CollectStripChunk(k);
+                      for (NoteData data : chunkNotes) {
+                          data.pos += (float)(k * T - tStart);
+                          fallbackNotes.push_back(data);
+                      }
+                  }
+              }
+              for (const NoteData& data : fallbackNotes)
+                  m_pRenderer->PushPianoRollStripNoteData(data);
+
+              for (long long k = kLast + 1; k <= kMax && lookaheadBakes < 2; ++k) {
+                  const long long cacheKey = Renderer::ImageBufferStripChunkKey(k);
+                  if (!m_pRenderer->ImageBufferChunkCached(cacheKey)) {
+                      BakeStripChunk(k);
+                      ++lookaheadBakes;
+                  }
+              }
+
+              const float bufferW = (float)m_pRenderer->GetBufferWidth();
+              for (long long k = kFirst; k <= kLast; ++k) {
+                  const double x0 = (double)(k * T - tStart) / (double)stripSpan;
+                  const double x1 = (double)((k + 1) * T - tStart) / (double)stripSpan;
+                  m_pRenderer->ImageBufferDrawChunk(Renderer::ImageBufferStripChunkKey(k),
+                      (float)(bufferW * x0), (float)(bufferW * x1));
+              }
+          }
+
+          '''
+          insert_before('PianoFromAbove/GameStateLegacy.inc',
+              'void MainScreen::RenderPianoRollStripNote(const MIDIChannelEvent pNote)\n',
+              strip_fn, 'strip image buffer implementation')
+
+          # Do not fall back to vertical note staging when the strip itself is image-buffered.
+          for path in ['PianoFromAbove/RendererD3D11Legacy.inc', 'PianoFromAbove/RendererD3D12Legacy.inc']:
+              replace_once(path,
+              '''    const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+                  ? m_vPianoRollStripNotesIntermediate
+                  : m_vNotesIntermediate;
+              ''',
+              '''    if (stripViz.bImageBufferNotes && m_vPianoRollStripNotesIntermediate.empty())
+                  return;
+              const std::vector<NoteData>& stripNotes = !m_vPianoRollStripNotesIntermediate.empty()
+                  ? m_vPianoRollStripNotesIntermediate
+                  : m_vNotesIntermediate;
+              ''', f'{path} strip image-buffer guard')
+
+          # D3D11 note shader uses t1/t2/t3, not t0/t1/t2.
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc',
+          '''    ID3D11ShaderResourceView* bindSRVs[] = { m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get() };
+              m_pContext->VSSetShaderResources(0, 3, bindSRVs);
+          ''',
+          '''    ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get() };
+              m_pContext->VSSetShaderResources(0, 4, bindSRVs);
+          ''', 'd3d11 strip srv slots')
+
+          # Bake encoded strip chunks with strip-mode root constants.
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc',
+          '''        SetPipeline(Pipeline::Note);
+                  m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &chunkRoot, 0, 0);
+                  m_pContext->UpdateSubresource(m_pChunkFixedBuffer.Get(), 0, nullptr, &chunkFixed, 0, 0);
+          ''',
+          '''        D3D11RootConstants requestRoot = chunkRoot;
+                  if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                      requestRoot.stripMode = 1.0f;
+                      requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                      requestRoot.notes_y = 0.0f;
+                      requestRoot.notes_cy = (float)W;
+                      requestRoot.white_cx = (float)H / 75.0f;
+                  }
+                  SetPipeline(Pipeline::Note);
+                  m_pContext->UpdateSubresource(m_pChunkConstants.Get(), 0, nullptr, &requestRoot, 0, 0);
+                  m_pContext->UpdateSubresource(m_pChunkFixedBuffer.Get(), 0, nullptr, &chunkFixed, 0, 0);
+          ''', 'd3d11 strip chunk constants')
+
+          replace_once('PianoFromAbove/RendererD3D12Legacy.inc',
+          '''        if (req.noteCount > 0) {
+                      SetPipeline(Pipeline::Note);
+                      m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(chunkRoot) / 4, &chunkRoot, 0);
+          ''',
+          '''        if (req.noteCount > 0) {
+                      RootConstants requestRoot = chunkRoot;
+                      if (Renderer::ImageBufferIsStripChunkKey(req.chunk)) {
+                          requestRoot.stripMode = 1.0f;
+                          requestRoot.stripTimeSpan = m_RootConstants.timespan;
+                          requestRoot.notes_y = 0.0f;
+                          requestRoot.notes_cy = (float)W;
+                          requestRoot.white_cx = (float)H / 75.0f;
+                      }
+                      SetPipeline(Pipeline::Note);
+                      m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(requestRoot) / 4, &requestRoot, 0);
+          ''', 'd3d12 strip chunk constants')
+
+          # Encoded strip quads scroll horizontally; ordinary chunks retain vertical placement.
+          old_quad11 = '''        for (const auto& quad : m_vChunkQuads) {
+                      const int slot = ImageBufferGetChunkSlot(quad.chunk);
+                      if (slot < 0)
+                          continue; // not baked this frame (shouldn't happen)
+                      quadConstants.quadPos[0] = notesX;
+                      quadConstants.quadPos[1] = quad.yTop;
+                      quadConstants.quadSize[0] = notesCX;
+                      quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+                      m_pContext->RSSetScissorRects(1, &notes_scissor);
+                      m_pContext->UpdateSubresource(m_pChunkQuadConstants.Get(), 0, nullptr, &quadConstants, 0, 0);
+                      m_pContext->PSSetShaderResources(0, 1, m_pChunkSRVs[slot].GetAddressOf());
+                      m_pContext->DrawIndexed(6, 0, 0);
+                  }
+          '''
+          new_quad11 = '''        for (const auto& quad : m_vChunkQuads) {
+                      const int slot = ImageBufferGetChunkSlot(quad.chunk);
+                      if (slot < 0)
+                          continue;
+                      D3D11_RECT scissor = notes_scissor;
+                      if (Renderer::ImageBufferIsStripChunkKey(quad.chunk)) {
+                          const auto& viz = Config::GetConfig().GetVizSettings();
+                          const float stripTop = viz.bHorizontalPianoRoll ? 0.0f : 55.0f;
+                          const float stripH = viz.bHorizontalPianoRoll ? (float)m_iBufferHeight
+                              : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+                          const float x0 = quad.yTop;
+                          const float x1 = quad.yBottom;
+                          quadConstants.quadPos[0] = x0;
+                          quadConstants.quadPos[1] = stripTop;
+                          quadConstants.quadSize[0] = max(0.0f, x1 - x0);
+                          quadConstants.quadSize[1] = stripH;
+                          scissor.left = (LONG)max(0.0f, floorf(x0));
+                          scissor.right = (LONG)min((float)m_iBufferWidth, ceilf(x1));
+                          scissor.top = (LONG)max(0.0f, floorf(stripTop));
+                          scissor.bottom = (LONG)min((float)m_iBufferHeight, ceilf(stripTop + stripH));
+                          if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
+                              continue;
+                      } else {
+                          quadConstants.quadPos[0] = notesX;
+                          quadConstants.quadPos[1] = quad.yTop;
+                          quadConstants.quadSize[0] = notesCX;
+                          quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+                      }
+                      m_pContext->RSSetScissorRects(1, &scissor);
+                      m_pContext->UpdateSubresource(m_pChunkQuadConstants.Get(), 0, nullptr, &quadConstants, 0, 0);
+                      m_pContext->PSSetShaderResources(0, 1, m_pChunkSRVs[slot].GetAddressOf());
+                      m_pContext->DrawIndexed(6, 0, 0);
+                  }
+          '''
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc', old_quad11, new_quad11, 'd3d11 strip chunk quads')
+
+          old_quad12 = '''        for (const auto& quad : m_vChunkQuads) {
+                      const int slot = ImageBufferGetChunkSlot(quad.chunk);
+                      if (slot < 0)
+                          continue; // not baked this frame (shouldn't happen)
+                      m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
+                      quadConstants.quadPos[0] = notesX;
+                      quadConstants.quadPos[1] = quad.yTop;
+                      quadConstants.quadSize[0] = notesCX;
+                      quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+                      m_pCommandList->RSSetScissorRects(1, &notes_scissor);
+                      m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(quadConstants) / 4, &quadConstants, 0);
+                      m_pCommandList->SetGraphicsRootDescriptorTable(1, m_ChunkSRVGPU[slot]);
+                      m_pCommandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                  }
+          '''
+          new_quad12 = '''        for (const auto& quad : m_vChunkQuads) {
+                      const int slot = ImageBufferGetChunkSlot(quad.chunk);
+                      if (slot < 0)
+                          continue;
+                      m_ChunkCache[slot].lastUsed = m_uImageBufferFrame;
+                      D3D12_RECT scissor = notes_scissor;
+                      if (Renderer::ImageBufferIsStripChunkKey(quad.chunk)) {
+                          const auto& viz = Config::GetConfig().GetVizSettings();
+                          const float stripTop = viz.bHorizontalPianoRoll ? 0.0f : 55.0f;
+                          const float stripH = viz.bHorizontalPianoRoll ? (float)m_iBufferHeight
+                              : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+                          const float x0 = quad.yTop;
+                          const float x1 = quad.yBottom;
+                          quadConstants.quadPos[0] = x0;
+                          quadConstants.quadPos[1] = stripTop;
+                          quadConstants.quadSize[0] = max(0.0f, x1 - x0);
+                          quadConstants.quadSize[1] = stripH;
+                          scissor.left = (LONG)max(0.0f, floorf(x0));
+                          scissor.right = (LONG)min((float)m_iBufferWidth, ceilf(x1));
+                          scissor.top = (LONG)max(0.0f, floorf(stripTop));
+                          scissor.bottom = (LONG)min((float)m_iBufferHeight, ceilf(stripTop + stripH));
+                          if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
+                              continue;
+                      } else {
+                          quadConstants.quadPos[0] = notesX;
+                          quadConstants.quadPos[1] = quad.yTop;
+                          quadConstants.quadSize[0] = notesCX;
+                          quadConstants.quadSize[1] = max(0.0f, quad.yBottom - quad.yTop);
+                      }
+                      m_pCommandList->RSSetScissorRects(1, &scissor);
+                      m_pCommandList->SetGraphicsRoot32BitConstants(0, sizeof(quadConstants) / 4, &quadConstants, 0);
+                      m_pCommandList->SetGraphicsRootDescriptorTable(1, m_ChunkSRVGPU[slot]);
+                      m_pCommandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                  }
+          '''
+          replace_once('PianoFromAbove/RendererD3D12Legacy.inc', old_quad12, new_quad12, 'd3d12 strip chunk quads')
+
+          # Compact patch-era line-comment runs in the source touched by these systems.
+          def compact_line_comments(path):
+              p = Path(path)
+              lines = p.read_text(encoding='utf-8').splitlines()
+              out = []
+              i = 0
+              while i < len(lines):
+                  if lines[i].lstrip().startswith('//'):
+                      j = i
+                      while j < len(lines) and lines[j].lstrip().startswith('//'):
+                          j += 1
+                      run = lines[i:j]
+                      if len(run) > 2:
+                          indent = run[0][:len(run[0]) - len(run[0].lstrip())]
+                          parts = []
+                          for line in run:
+                              body = line.lstrip()[2:].strip()
+                              if body and not set(body) <= {'-', '=', '*'}:
+                                  parts.append(body)
+                          text = ' '.join(parts)
+                          if text:
+                              if len(text) > 190:
+                                  cut = text.rfind(' ', 0, 187)
+                                  if cut < 80: cut = 187
+                                  text = text[:cut].rstrip() + '...'
+                              wrapped = textwrap.wrap(text, width=94)[:2]
+                              out.extend(indent + '// ' + part for part in wrapped)
+                      else:
+                          out.extend(run)
+                      i = j
+                  else:
+                      out.append(lines[i])
+                      i += 1
+              p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+          for source in [
+              'PianoFromAbove/PlaybackAudioThread.inc',
+              'PianoFromAbove/GameStateLegacy.inc',
+              'PianoFromAbove/GameState.h',
+              'PianoFromAbove/RendererLegacy.h',
+              'PianoFromAbove/RendererBase.cpp',
+              'PianoFromAbove/ImageBufferMultipass.h',
+              'PianoFromAbove/RendererD3D11Legacy.inc',
+              'PianoFromAbove/RendererD3D12Legacy.inc',
+              'PianoFromAbove/RendererD3D11.cpp',
+              'PianoFromAbove/Renderer.cpp',
+              'PianoFromAbove/GameState.cpp',
+          ]:
+              compact_line_comments(source)
+
+          Path('.github/workflows/apply-playback-strip-regressions.yml').unlink(missing_ok=True)
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'wasPaused != nowPaused' PianoFromAbove/PlaybackAudioThread.inc
+          ! grep -A5 -F 'wasPaused != nowPaused' PianoFromAbove/PlaybackAudioThread.inc | grep -F 'SyncPlaybackAudioThread(true)'
+          grep -F 'BASS_ERROR_ALREADY' PianoFromAbove/GameStateLegacy.inc
+          grep -F 'BASS_UNICODE' PianoFromAbove/GameStateLegacy.inc
+          grep -F 'RenderPianoRollStripImageBuffer' PianoFromAbove/GameStateLegacy.inc
+          grep -F 'ImageBufferStripChunkKey' PianoFromAbove/RendererLegacy.h
+          grep -F 'nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pStripNoteSRV.Get()' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'ImageBufferIsStripChunkKey(req.chunk)' PianoFromAbove/RendererD3D11Legacy.inc
+          grep -F 'ImageBufferIsStripChunkKey(req.chunk)' PianoFromAbove/RendererD3D12Legacy.inc
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild.exe not found via vswhere' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix playback, custom audio and strip image buffering'
+          git push origin HEAD:fix/playpause-customaudio-dual-imgbuf-d3d11
