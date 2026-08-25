@@ -1592,41 +1592,56 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
 
             // Precompute maximum Notes-Per-Second for the song
             m_llMaxNPS = 1;
-            vector<long long> noteTimes;
-            noteTimes.reserve(m_vEvents.size());
-            // Longest note (start -> sister start), both time domains; used by the image buffer to catch
-            // notes that begin before a chunk but overlap into it.
+            deque<long long> npsWindow;
+            const size_t imageBufferBlocks =
+                (m_vEvents.size() + ImageBufferHugeBlockEvents - 1) / ImageBufferHugeBlockEvents;
+            const long long imageBufferMinEnd = (std::numeric_limits<long long>::min)();
+            m_vImageBufferMaxEndTime.assign(imageBufferBlocks, imageBufferMinEnd);
+            m_vImageBufferMaxEndTick.assign(imageBufferBlocks, imageBufferMinEnd);
+            m_vImageBufferPrefixEndTime.resize(imageBufferBlocks);
+            m_vImageBufferPrefixEndTick.resize(imageBufferBlocks);
             m_llMaxNoteLen = 0;
             m_llMaxNoteLenTicks = 0;
             for (size_t i = 0; i < m_vEvents.size(); i++)
             {
-                if (m_MIDI.GetEventChannelEventType(m_vEvents[i]) == MIDI::NoteOn &&
-                    m_MIDI.GetEventParam2(m_vEvents[i]) > 0)
-                {
-                    noteTimes.push_back(m_MIDI.GetEventTime(m_vEvents[i]));
-                    if (m_MIDI.EventHasSister(m_vEvents[i]))
-                    {
-                        long long len = m_MIDI.GetEventLength(m_vEvents[i]);
-                        if (len > m_llMaxNoteLen)
-                            m_llMaxNoteLen = len;
-                        len = m_MIDI.GetEventAbsT(m_vEvents[m_MIDI.GetEventSisterIdx(m_vEvents[i])]) -
-                              m_MIDI.GetEventAbsT(m_vEvents[i]);
-                        if (len > m_llMaxNoteLenTicks)
-                            m_llMaxNoteLenTicks = len;
-                    }
-                }
+                const MIDIChannelEvent event = m_vEvents[i];
+                if (m_MIDI.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                    m_MIDI.GetEventParam2(event) <= 0)
+                    continue;
+
+                const long long noteTime = m_MIDI.GetEventTime(event);
+                npsWindow.push_back(noteTime);
+                while (!npsWindow.empty() && noteTime - npsWindow.front() > 1000000)
+                    npsWindow.pop_front();
+                m_llMaxNPS = (std::max)(m_llMaxNPS, (long long)npsWindow.size());
+
+                if (!m_MIDI.EventHasSister(event))
+                    continue;
+                const MIDIChannelEvent sister =
+                    m_vEvents[m_MIDI.GetEventSisterIdx(event)];
+                const long long lengthTime = (std::max)(0LL, (long long)m_MIDI.GetEventLength(event));
+                const long long startTick = m_MIDI.GetEventAbsT(event);
+                const long long lengthTick = (std::max)(0LL,
+                    (long long)m_MIDI.GetEventAbsT(sister) - startTick);
+                m_llMaxNoteLen = (std::max)(m_llMaxNoteLen, lengthTime);
+                m_llMaxNoteLenTicks = (std::max)(m_llMaxNoteLenTicks, lengthTick);
+
+                const size_t block = i / ImageBufferHugeBlockEvents;
+                const long long endTime = ImageBufferOverlapWorstEnd(noteTime, lengthTime);
+                const long long endTick = ImageBufferOverlapWorstEnd(startTick, lengthTick);
+                m_vImageBufferMaxEndTime[block] =
+                    (std::max)(m_vImageBufferMaxEndTime[block], endTime);
+                m_vImageBufferMaxEndTick[block] =
+                    (std::max)(m_vImageBufferMaxEndTick[block], endTick);
             }
-            if (!noteTimes.empty())
-            {
-                size_t left = 0;
-                for (size_t right = 0; right < noteTimes.size(); right++)
-                {
-                    while (noteTimes[right] - noteTimes[left] > 1000000)
-                        left++;
-                    long long curWindowNPS = (long long)(right - left + 1);
-                    if (curWindowNPS > m_llMaxNPS)
-                        m_llMaxNPS = curWindowNPS;
-                }
+
+            long long prefixTime = imageBufferMinEnd;
+            long long prefixTick = imageBufferMinEnd;
+            for (size_t block = 0; block < imageBufferBlocks; ++block) {
+                prefixTime = (std::max)(prefixTime, m_vImageBufferMaxEndTime[block]);
+                prefixTick = (std::max)(prefixTick, m_vImageBufferMaxEndTick[block]);
+                m_vImageBufferPrefixEndTime[block] = prefixTime;
+                m_vImageBufferPrefixEndTick[block] = prefixTick;
             }
         }
     }
@@ -3485,7 +3500,6 @@ void MainScreen::RenderPianoRollStripImageBuffer()
 
     const long long first = (long long)floor((double)tStart / T);
     const long long last = (long long)floor((double)(tStart + stripSpan) / T);
-    const long long maxLen = tickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
     std::vector<NoteData> chunkNotes;
     std::vector<NoteData> fallback;
 
@@ -3496,7 +3510,9 @@ void MainScreen::RenderPianoRollStripImageBuffer()
                 ImageBufferOverlapCollect(this, m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
             } else {
-                ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, maxLen, tickMode,
+                ImageBufferCollectHugeIndexed(m_vEvents, m_MIDI, chunkNotes, chunk, T, margin, tickMode,
+                    m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick,
+                    m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick,
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
             }
         };

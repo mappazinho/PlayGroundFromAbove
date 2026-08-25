@@ -425,6 +425,10 @@ void RenderText();
     long long m_llMaxNPS = 1;
     long long m_llMaxNoteLen = 0;       // longest note, microseconds
     long long m_llMaxNoteLenTicks = 0;  // longest note, ticks (tick mode)
+    vector<long long> m_vImageBufferMaxEndTime;
+    vector<long long> m_vImageBufferMaxEndTick;
+    vector<long long> m_vImageBufferPrefixEndTime;
+    vector<long long> m_vImageBufferPrefixEndTick;
     bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;

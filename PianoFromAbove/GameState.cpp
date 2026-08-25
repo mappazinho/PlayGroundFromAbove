@@ -67,16 +67,21 @@ static void ImageBufferLogFullPrewarmSkip(
     HeartbeatLog(log);
 }
 
+static constexpr size_t ImageBufferHugeBlockEvents = 4096;
+
 template <typename BuildFn>
-static void ImageBufferCollectHugeLocal(
+static void ImageBufferCollectHugeIndexed(
     const std::vector<MIDIChannelEvent>& events,
     MIDI& midi,
     std::vector<NoteData>& out,
     long long chunk,
     long long timeSpan,
     long long corruptionMargin,
-    long long maxNoteLength,
     bool tickMode,
+    const std::vector<long long>& maxEndTime,
+    const std::vector<long long>& maxEndTick,
+    const std::vector<long long>& prefixEndTime,
+    const std::vector<long long>& prefixEndTick,
     BuildFn&& buildNote)
 {
     out.clear();
@@ -85,28 +90,48 @@ static void ImageBufferCollectHugeLocal(
 
     const long long chunkStart = chunk * timeSpan;
     const long long chunkEnd = ImageBufferOverlapSaturatingAdd(chunkStart, timeSpan);
-    const long long lookBack = ImageBufferOverlapSaturatingAdd(
-        (std::max)(maxNoteLength, 0LL), corruptionMargin);
-    const long long lo = ImageBufferOverlapSaturatingAdd(chunkStart, -lookBack);
     const long long hi = ImageBufferOverlapSaturatingAdd(chunkEnd, corruptionMargin);
+    const long long oldestUsefulEnd = ImageBufferOverlapSaturatingAdd(
+        chunkStart, -corruptionMargin);
 
     auto eventLessTime = [&](MIDIChannelEvent event, long long value) {
         return (tickMode ? (long long)midi.GetEventAbsT(event) : midi.GetEventTime(event)) < value;
     };
-    auto itLo = std::lower_bound(events.begin(), events.end(), lo, eventLessTime);
-    auto itHi = std::lower_bound(events.begin(), events.end(), hi, eventLessTime);
+    const auto itHi = std::lower_bound(events.begin(), events.end(), hi, eventLessTime);
+    const size_t hiIndex = (size_t)(itHi - events.begin());
+    if (hiIndex == 0)
+        return;
 
-    for (auto it = itHi; it != itLo; ) {
-        --it;
-        const MIDIChannelEvent event = *it;
-        if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
-            midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
-            continue;
+    const auto& blockMax = tickMode ? maxEndTick : maxEndTime;
+    const auto& prefixMax = tickMode ? prefixEndTick : prefixEndTime;
+    if (blockMax.empty() || prefixMax.size() != blockMax.size())
+        return;
 
-        NoteData data = buildNote(event, chunkStart);
-        if (data.pos < (float)timeSpan &&
-            data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
-            out.push_back(data);
+    size_t block = (hiIndex - 1) / ImageBufferHugeBlockEvents;
+    if (block >= blockMax.size())
+        block = blockMax.size() - 1;
+
+    for (;;) {
+        if (prefixMax[block] < oldestUsefulEnd)
+            break;
+        if (blockMax[block] >= oldestUsefulEnd) {
+            const size_t begin = block * ImageBufferHugeBlockEvents;
+            const size_t end = (std::min)(hiIndex, begin + ImageBufferHugeBlockEvents);
+            for (size_t i = end; i != begin; ) {
+                --i;
+                const MIDIChannelEvent event = events[i];
+                if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                    midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
+                    continue;
+                NoteData data = buildNote(event, chunkStart);
+                if (data.pos < (float)timeSpan &&
+                    data.pos + (std::max)(data.length, 0.0f) >= 0.0f)
+                    out.push_back(data);
+            }
+        }
+        if (block == 0)
+            break;
+        --block;
     }
 }
 
@@ -325,9 +350,9 @@ static bool ImageBufferPrewarmPlayRequestedFor(const void* owner)
                     return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \
                 }); \
         } else { \
-            const long long imageBufferMaxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen; \
-            ImageBufferCollectHugeLocal(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, \
-                imageBufferMaxLen, bTickMode, \
+            ImageBufferCollectHugeIndexed(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, bTickMode, \
+                m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick, \
+                m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick, \
                 [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \
                     return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \
                 }); \
