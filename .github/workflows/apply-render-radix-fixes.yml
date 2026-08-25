@@ -1,0 +1,243 @@
+name: Apply renderer and radix loading fixes
+
+on:
+  push:
+    branches:
+      - fix/render-overlays-d3d11-radix-sort
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/render-overlays-d3d11-radix-sort
+          fetch-depth: 0
+
+      - name: Apply source fixes
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {count}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          def replace_regex(path, pattern, replacement, label):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, got {count}')
+              p.write_text(updated, encoding='utf-8')
+
+          for path in ['PianoFromAbove/RendererD3D11Legacy.inc', 'PianoFromAbove/RendererD3D12Legacy.inc']:
+              replace_once(path,
+                  '    ImGui::Render();\n    ImGui::GetDrawData()->AddDrawList(m_pDrawList);\n',
+                  '''    ImGui::Render();
+              ImDrawData* drawData = ImGui::GetDrawData();
+              drawData->AddDrawList(m_pDrawList);
+              for (int i = drawData->CmdListsCount - 1; i > 0; --i)
+                  drawData->CmdLists[i] = drawData->CmdLists[i - 1];
+              if (drawData->CmdListsCount > 0)
+                  drawData->CmdLists[0] = m_pDrawList;
+          ''', f'{path} UI draw order')
+
+              replace_regex(path,
+                  r'''    if \(g_bDisableBlur \|\| \(!stripViz\.bDualPianoRoll && !stripViz\.bHorizontalPianoRoll\) \|\| !m_pBlurOutput\)\n        return;\n\n    if \(stripViz\.bHorizontalPianoRoll\) \{.*?\n    \}\n    const float menuBarHeight''',
+                  '''    if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
+              return;
+
+              const float menuBarHeight''', f'{path} horizontal blur')
+
+          replace_once('PianoFromAbove/RendererD3D11Legacy.inc',
+              '        m_pContext->PSSetShaderResources(0, 1, nullptr);\n',
+              '''        ID3D11ShaderResourceView* nullChunkSRV = nullptr;
+              m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);
+          ''', 'D3D11 null SRV unbind')
+
+          p = Path('PianoFromAbove/ParallelPostProcess.h')
+          text = p.read_text(encoding='utf-8')
+          text = re.sub(
+              r'''// Multicore implementation of the expensive part of MIDI::PostProcess\.\n(?:\/\/.*\n){6}''',
+              '// Multicore MIDI post-process. Sorting uses stable parallel radix passes.\n',
+              text, count=1)
+          text = text.replace('    static constexpr size_t SortBlock = 1u << 18;\n', '')
+          text = re.sub(
+              r'''\n    template <typename Fn>\n    static inline void RunTaskPool\(unsigned workers, size_t taskCount, Fn&& fn\)\n    \{.*?\n    \}\n\n    struct TempoAnchor''',
+              '\n    struct TempoAnchor', text, count=1, flags=re.S)
+
+          sort_start = text.find('    auto isMeta =')
+          sort_end = text.find('    // Build tempo anchors once.', sort_start)
+          if sort_start < 0 or sort_end < 0:
+              raise RuntimeError('parallel radix sort markers not found')
+          radix = r'''    auto isMeta = [&](Ref ref) { return (ref & MetaFlag) != 0; };
+              auto metaIndex = [&](Ref ref) { return (size_t)(ref & ~MetaFlag); };
+              auto meta = [&](Ref ref) -> MIDIEvent* { return metaRefs[metaIndex(ref)]; };
+              auto isThinRef = [&](Ref ref) { return !isMeta(ref) && ref >= m_iFullRows; };
+              auto eventTickOf = [&](Ref ref) -> int {
+                  if (isMeta(ref)) return meta(ref)->GetAbsT();
+                  if (isThinRef(ref)) return (int)m_vThinTicks[(size_t)ref - m_iFullRows];
+                  return (int)m_vTicks[ref];
+              };
+              auto eventTrackOf = [&](Ref ref) -> uint32_t {
+                  if (isMeta(ref)) return (uint32_t)meta(ref)->GetTrack();
+                  if (isThinRef(ref)) {
+                      const size_t thin = (size_t)ref - m_iFullRows;
+                      const Ref owner = m_vThinOwners[thin] & ~THIN_OWNER_NOTEON_FLAG;
+                      return (uint32_t)m_vEventTrack[owner];
+                  }
+                  return (uint32_t)m_vEventTrack[ref];
+              };
+              auto eventKind = [&](Ref ref) -> uint32_t {
+                  if (isMeta(ref)) return 0u;
+                  return isThinRef(ref) ? 2u : 1u;
+              };
+
+              static constexpr unsigned RadixBits = 11;
+              static constexpr size_t RadixBuckets = 1u << RadixBits;
+              static constexpr uint32_t RadixMask = (uint32_t)RadixBuckets - 1u;
+              static constexpr unsigned RadixPasses = 6;
+              std::vector<Ref> scratch(totalEvents);
+              std::vector<size_t> radixOffsets((size_t)workers * RadixBuckets);
+              bool sourceIsRefs = true;
+              unsigned radixDone = 0;
+
+              auto radixPass = [&](auto&& keyOf, unsigned shift) {
+                  const std::vector<Ref>& src = sourceIsRefs ? refs : scratch;
+                  std::vector<Ref>& dst = sourceIsRefs ? scratch : refs;
+                  std::fill(radixOffsets.begin(), radixOffsets.end(), 0);
+
+                  RunWorkers(workers, [&](unsigned worker) {
+                      size_t* local = radixOffsets.data() + (size_t)worker * RadixBuckets;
+                      const size_t begin = totalEvents * (size_t)worker / workers;
+                      const size_t end = totalEvents * (size_t)(worker + 1) / workers;
+                      for (size_t i = begin; i < end; ++i)
+                          ++local[(keyOf(src[i]) >> shift) & RadixMask];
+                  });
+
+                  size_t prefix = 0;
+                  for (size_t bucket = 0; bucket < RadixBuckets; ++bucket) {
+                      size_t offset = prefix;
+                      for (unsigned worker = 0; worker < workers; ++worker) {
+                          const size_t index = (size_t)worker * RadixBuckets + bucket;
+                          const size_t count = radixOffsets[index];
+                          radixOffsets[index] = offset;
+                          offset += count;
+                      }
+                      prefix = offset;
+                  }
+
+                  const uint64_t progressTarget = (uint64_t)(radixDone + 1) * 2000 / RadixPasses;
+                  RunWorkers(workers, [&](unsigned worker) {
+                      size_t* write = radixOffsets.data() + (size_t)worker * RadixBuckets;
+                      const size_t begin = totalEvents * (size_t)worker / workers;
+                      const size_t end = totalEvents * (size_t)(worker + 1) / workers;
+                      for (size_t i = begin; i < end; ++i) {
+                          const Ref ref = src[i];
+                          const size_t bucket = (keyOf(ref) >> shift) & RadixMask;
+                          dst[write[bucket]++] = ref;
+                      }
+                      setProgress(worker, progressTarget);
+                  });
+                  ++radixDone;
+                  sourceIsRefs = !sourceIsRefs;
+              };
+
+              auto kindKey = [&](Ref ref) -> uint32_t { return eventKind(ref); };
+              auto trackKey = [&](Ref ref) -> uint32_t { return eventTrackOf(ref); };
+              auto tickKey = [&](Ref ref) -> uint32_t { return (uint32_t)eventTickOf(ref) ^ 0x80000000u; };
+
+              radixPass(kindKey, 0);
+              radixPass(trackKey, 0);
+              radixPass(trackKey, 11);
+              radixPass(tickKey, 0);
+              radixPass(tickKey, 11);
+              radixPass(tickKey, 22);
+
+              if (!sourceIsRefs)
+                  refs.swap(scratch);
+              std::vector<Ref>().swap(scratch);
+              std::vector<size_t>().swap(radixOffsets);
+
+          '''
+          text = text[:sort_start] + radix + text[sort_end:]
+
+          thin_start = text.find('    // Pass 2: folded note-offs')
+          thin_end = text.find('    std::vector<size_t> channelBase', thin_start)
+          if thin_start < 0 or thin_end < 0:
+              raise RuntimeError('thin timestamp pass markers not found')
+          thin_pass = r'''    const size_t thinCount = m_vThinTicks.size();
+              RunWorkers(workers, [&](unsigned worker) {
+                  const size_t begin = thinCount * (size_t)worker / workers;
+                  const size_t end = thinCount * (size_t)(worker + 1) / workers;
+                  const size_t span = (std::max)((size_t)1, end - begin);
+                  for (size_t thin = begin; thin < end; ++thin) {
+                      const int eventTick = (int)m_vThinTicks[thin];
+                      const size_t ai = anchorForTick(eventTick);
+                      const long long eventTime = timeFromAnchor(eventTick, anchors[ai]);
+                      const MIDIChannelEvent owner = (MIDIChannelEvent)(m_vThinOwners[thin] & ~THIN_OWNER_NOTEON_FLAG);
+                      if (m_vThinTicks[thin] == m_vTicks[owner])
+                          m_vThinLengths[thin] = 0;
+                      else
+                          m_vThinLengths[thin] = (uint32_t)(std::max)(0LL, eventTime - m_vTimes[owner]);
+                      if (((thin - begin) & 0xFFFFu) == 0)
+                          setProgress(worker, 3000 + (uint64_t)((thin - begin) * 1000 / span));
+                  }
+                  setProgress(worker, 4000);
+              });
+
+          '''
+          text = text[:thin_start] + thin_pass + text[thin_end:]
+          p.write_text(text, encoding='utf-8')
+
+          Path('.github/workflows/apply-render-radix-fixes.yml').unlink(missing_ok=True)
+
+      - name: Validate source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Get-Content PianoFromAbove\ParallelPostProcess.h -Raw
+          if ($p -notmatch 'RadixPasses = 6') { throw 'parallel radix sort missing' }
+          if ($p -match 'std::inplace_merge') { throw 'old lane merge still present' }
+          if ($p -match 'struct MergeTask') { throw 'old global merge still present' }
+          if ($p -notmatch 'const size_t thinCount = m_vThinTicks.size') { throw 'thin-only timestamp pass missing' }
+          $d11 = Get-Content PianoFromAbove\RendererD3D11Legacy.inc -Raw
+          if ($d11 -match 'PSSetShaderResources\(0, 1, nullptr\)') { throw 'invalid D3D11 null SRV call remains' }
+          if ($d11 -notmatch 'nullChunkSRV') { throw 'D3D11 safe SRV unbind missing' }
+          foreach ($f in @('PianoFromAbove\RendererD3D11Legacy.inc','PianoFromAbove\RendererD3D12Legacy.inc')) {
+            $s = Get-Content $f -Raw
+            if ($s -notmatch 'stripViz.bHorizontalPianoRoll \|\| !stripViz.bDualPianoRoll') { throw "horizontal blur guard missing in $f" }
+            if ($s -notmatch 'drawData->CmdLists\[0\] = m_pDrawList') { throw "UI z-order fix missing in $f" }
+          }
+          if (Test-Path .github\workflows\apply-render-radix-fixes.yml) { throw 'temporary workflow not removed' }
+
+      - name: Compile Release x64 source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Fix rendering overlays and accelerate event sorting"
+            git push origin HEAD:fix/render-overlays-d3d11-radix-sort
+          }
