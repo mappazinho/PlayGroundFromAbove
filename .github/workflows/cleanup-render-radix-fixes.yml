@@ -1,0 +1,94 @@
+name: Clean renderer and radix fixes
+
+on:
+  push:
+    branches:
+      - fix/render-overlays-d3d11-radix-sort
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/render-overlays-d3d11-radix-sort
+          fetch-depth: 0
+
+      - name: Clean source
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          for path in ['PianoFromAbove/RendererD3D11Legacy.inc', 'PianoFromAbove/RendererD3D12Legacy.inc']:
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              s = s.replace('    if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)\n    return;\n',
+                            '    if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)\n        return;\n')
+              p.write_text(s, encoding='utf-8')
+
+          p = Path('PianoFromAbove/RendererD3D11Legacy.inc')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('        ID3D11ShaderResourceView* nullChunkSRV = nullptr;\n    m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);\n',
+                        '        ID3D11ShaderResourceView* nullChunkSRV = nullptr;\n        m_pContext->PSSetShaderResources(0, 1, &nullChunkSRV);\n')
+          p.write_text(s, encoding='utf-8')
+
+          p = Path('PianoFromAbove/ParallelPostProcess.h')
+          lines = p.read_text(encoding='utf-8').splitlines()
+          out = []
+          i = 0
+          while i < len(lines):
+              if lines[i].lstrip().startswith('//'):
+                  j = i + 1
+                  while j < len(lines) and lines[j].lstrip().startswith('//'):
+                      j += 1
+                  run = lines[i:j]
+                  if len(run) <= 2:
+                      out.extend(run)
+                  elif i < 20:
+                      out.append('//' + lines[i].lstrip()[2:])
+                  i = j
+              else:
+                  out.append(lines[i])
+                  i += 1
+          p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+          Path('.github/workflows/cleanup-render-radix-fixes.yml').unlink(missing_ok=True)
+
+      - name: Validate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Get-Content PianoFromAbove\ParallelPostProcess.h
+          $run = 0
+          foreach ($line in $p) {
+            if ($line.TrimStart().StartsWith('//')) { $run++ } else { if ($run -gt 2) { throw "long comment run: $run" }; $run = 0 }
+          }
+          if ($run -gt 2) { throw "long comment run: $run" }
+          $d11 = Get-Content PianoFromAbove\RendererD3D11Legacy.inc -Raw
+          if ($d11 -notmatch '        m_pContext->PSSetShaderResources\(0, 1, &nullChunkSRV\);') { throw 'D3D11 unbind indentation/fix missing' }
+          if (Test-Path .github\workflows\cleanup-render-radix-fixes.yml) { throw 'temporary workflow remains' }
+
+      - name: Compile Release x64 source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          & $msbuild PianoFromAbove\PianoFromAbove.vcxproj /m '/t:FxCompile;ClCompile' /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit cleanup
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Clean renderer and loading optimization source"
+            git push origin HEAD:fix/render-overlays-d3d11-radix-sort
+          }
