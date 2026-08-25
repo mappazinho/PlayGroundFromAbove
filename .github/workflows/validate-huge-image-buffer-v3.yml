@@ -1,0 +1,57 @@
+name: Validate huge image buffer v3
+
+on:
+  push:
+    branches: [fix/huge-image-buffer-index]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/huge-image-buffer-index
+          fetch-depth: 0
+
+      - name: Apply source patch
+        shell: pwsh
+        run: python .github/patch_huge_v3.py
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -F 'remainingByKey[sourceKey] == 0' PianoFromAbove/GameState.cpp
+          grep -F 'ImageBufferSetPinnedChunks(renderer, pinnedChunks);' PianoFromAbove/GameState.cpp
+          grep -F 'imghuge:compact chunk=' PianoFromAbove/GameState.cpp
+          grep -F 'imghuge:enabled events=' PianoFromAbove/GameState.cpp
+          grep -F 'imageBufferHugeRows, fCorrupt <= 0.0f' PianoFromAbove/GameState.cpp
+          grep -F 'imageBufferPrewarmAnyHidden && ImageBufferFullPreparedSupported' PianoFromAbove/GameState.cpp
+
+      - name: Compile Release x64 source
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild not found' }
+          & $msbuild PianoFromAbove.sln /m /p:Configuration=Release /p:Platform=x64 '/t:FxCompile;ClCompile'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit validated source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -f .github/patch_huge_v3.py .github/workflows/validate-huge-image-buffer-v3.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Polish huge image buffer prewarm'
+          git push origin HEAD:fix/huge-image-buffer-index
