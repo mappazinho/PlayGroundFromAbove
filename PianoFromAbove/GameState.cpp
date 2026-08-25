@@ -65,7 +65,7 @@ static void ImageBufferLogFullPrewarmSkip(
     lastEvents = events;
     lastNotes = notes;
     char log[160];
-    sprintf_s(log, "imgprep:skip-full events=%zu notes=%zu fallback=local", events, notes);
+    sprintf_s(log, "imghuge:enabled events=%zu notes=%zu", events, notes);
     HeartbeatLog(log);
 }
 
@@ -196,6 +196,7 @@ static void ImageBufferCollectHugeIndexedCompact(
     long long corruptionMargin,
     bool tickMode,
     int rows,
+    bool stablePitch,
     const std::vector<long long>& maxEndTime,
     const std::vector<long long>& maxEndTick,
     const std::vector<long long>& prefixEndTime,
@@ -245,7 +246,17 @@ static void ImageBufferCollectHugeIndexedCompact(
     if (blockMax.empty() || prefixMax.size() != blockMax.size())
         return;
 
-    size_t remaining = (size_t)128 * (size_t)rows;
+    int firstKey = 0;
+    int lastKey = 127;
+    if (stablePitch && midi.GetInfo().iMinNote >= 0 &&
+        midi.GetInfo().iMaxNote >= midi.GetInfo().iMinNote) {
+        firstKey = (std::min)((std::max)((int)midi.GetInfo().iMinNote, 0), 127);
+        lastKey = (std::min)((std::max)((int)midi.GetInfo().iMaxNote, firstKey), 127);
+    }
+    int remainingByKey[128] = {};
+    for (int key = firstKey; key <= lastKey; ++key)
+        remainingByKey[key] = rows;
+    size_t remaining = (size_t)(lastKey - firstKey + 1) * (size_t)rows;
     size_t block = (std::min)((hi - 1) / ImageBufferHugeBlockEvents, blockMax.size() - 1);
     for (;;) {
         if (prefixMax[block] < oldestUsefulEnd)
@@ -259,9 +270,16 @@ static void ImageBufferCollectHugeIndexedCompact(
                 if (midi.GetEventChannelEventType(event) != MIDI::NoteOn ||
                     midi.GetEventParam2(event) <= 0 || !midi.EventHasSister(event))
                     continue;
+                if (stablePitch) {
+                    const int sourceKey = midi.GetEventParam1(event);
+                    if (sourceKey < firstKey || sourceKey > lastKey ||
+                        remainingByKey[sourceKey] == 0)
+                        continue;
+                }
 
                 NoteData data = buildNote(event, chunkStart);
-                if (data.key >= 128 || isHidden(data.track, data.channel))
+                if (data.key >= 128 || data.key < firstKey || data.key > lastKey ||
+                    remainingByKey[data.key] == 0 || isHidden(data.track, data.channel))
                     continue;
                 const double relStart = (double)data.pos;
                 const double relEnd = relStart + (std::max)(0.0, (double)data.length);
@@ -285,6 +303,7 @@ static void ImageBufferCollectHugeIndexedCompact(
                         const int following = findNext((int)data.key, current + 1);
                         next[base + current] = following;
                         --remaining;
+                        --remainingByKey[data.key];
                         runEnd = current + 1;
                         row = following;
                         if (row >= row1 || row != current + 1)
@@ -315,6 +334,7 @@ static void ImageBufferCollectHugeAdaptive(
     long long corruptionMargin,
     bool tickMode,
     int rows,
+    bool stablePitch,
     const std::vector<long long>& maxEndTime,
     const std::vector<long long>& maxEndTick,
     const std::vector<long long>& prefixEndTime,
@@ -332,10 +352,28 @@ static void ImageBufferCollectHugeAdaptive(
             std::forward<BuildFn>(buildNote));
         return;
     }
+    const bool logDense = g_bLoggingEnabled.load(std::memory_order_relaxed);
+    const auto compactStart = logDense ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     ImageBufferCollectHugeIndexedCompact(
-        events, midi, out, chunk, timeSpan, corruptionMargin, tickMode, rows,
+        events, midi, out, chunk, timeSpan, corruptionMargin, tickMode, rows, stablePitch,
         maxEndTime, maxEndTick, prefixEndTime, prefixEndTick,
         std::forward<BuildFn>(buildNote), std::forward<HiddenFn>(isHidden));
+    if (logDense) {
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - compactStart).count();
+        static std::atomic<unsigned long long> lastHugeCompactLog{ 0 };
+        const unsigned long long nowMs = GetTickCount64();
+        unsigned long long lastMs = lastHugeCompactLog.load(std::memory_order_relaxed);
+        if (nowMs - lastMs >= 1000 &&
+            lastHugeCompactLog.compare_exchange_strong(lastMs, nowMs,
+                std::memory_order_relaxed)) {
+            char log[192];
+            sprintf_s(log, "imghuge:compact chunk=%lld candidates=%zu compact=%zu ms=%.1f",
+                chunk, estimate, out.size(), ms);
+            HeartbeatLog(log);
+        }
+    }
 }
 
 static std::vector<long long> ImageBufferSelectHugePrewarmChunks(
@@ -707,6 +745,13 @@ static void ImageBufferDriveHugePrewarm(
         s_ImageBufferPrewarmGpu.playRequested = keepPlay;
     }
 
+    std::vector<long long> pinnedChunks;
+    {
+        std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
+        pinnedChunks = s_ImageBufferPrewarmGpu.chunks;
+    }
+    ImageBufferSetPinnedChunks(renderer, pinnedChunks);
+
     long long bakeChunk = Renderer::ImageBufferInvalidChunk;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
@@ -726,7 +771,7 @@ static void ImageBufferDriveHugePrewarm(
     auto collector = [&](long long chunk) {
         ImageBufferCollectHugeAdaptive(
             events, midi, notes, chunk, timeSpan, corruptionMargin, tickMode, rows,
-            maxEndTime, maxEndTick, prefixEndTime, prefixEndTick,
+            corruption <= 0.0f, maxEndTime, maxEndTick, prefixEndTime, prefixEndTick,
             buildNote, isHidden);
     };
     ImageBufferMPCollectDispatch(renderer, notes, collector, bakeChunk);
@@ -751,7 +796,7 @@ static void ImageBufferDriveHugePrewarm(
         } else { \
             const int imageBufferHugeRows = (int)std::ceil(std::fabs(notesCY)); \
             ImageBufferCollectHugeAdaptive(m_vEvents, m_MIDI, chunkNotes, imageBufferChunk, T, E, bTickMode, \
-                imageBufferHugeRows, m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick, \
+                imageBufferHugeRows, fCorrupt <= 0.0f, m_vImageBufferMaxEndTime, m_vImageBufferMaxEndTick, \
                 m_vImageBufferPrefixEndTime, m_vImageBufferPrefixEndTick, \
                 [&](MIDIChannelEvent imageBufferNote, long long imageBufferChunkStart) { \
                     return BuildChunkNoteData(imageBufferNote, imageBufferChunkStart); \
@@ -818,7 +863,8 @@ static void ImageBufferDriveHugePrewarm(
                     } \
                     if (imageBufferPrewarmAnyHidden) break; \
                 } \
-                if (imageBufferPrewarmAnyHidden) { \
+                if (imageBufferPrewarmAnyHidden && ImageBufferFullPreparedSupported( \
+                    imageBufferPrewarmSelf->m_vEvents, imageBufferPrewarmSelf->m_MIDI)) { \
                     ImageBufferPreparedMarkPrewarmUnavailable(imageBufferPrewarmSelf); \
                 } else { \
                     const long long imageBufferPrewarmT = imageBufferPrewarmSelf->m_llTimeSpan; \

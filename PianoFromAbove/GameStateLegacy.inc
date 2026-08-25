@@ -1137,6 +1137,7 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     {
         if (PRE_MIDIAudio)
             SDL_PauseAudio(1);
+        PRE_TouchAudio();
         return;
     }
 
@@ -1144,6 +1145,7 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     {
         if (PRE_MIDIAudio)
             SDL_PauseAudio(1);
+        PRE_TouchAudio();
         return;
     }
 
@@ -1242,6 +1244,9 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
     else
     {
         SDL_PauseAudio(1);
+        // Pausing intentionally stops callbacks; keep the watchdog baseline fresh
+        // so resume cannot be mistaken for a multi-second device stall.
+        PRE_TouchAudio();
     }
 }
 
