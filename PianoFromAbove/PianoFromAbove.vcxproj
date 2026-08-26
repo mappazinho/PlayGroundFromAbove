@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -127,14 +127,8 @@
     <LibraryPath>$(ProjectDir)lzma\lib;$(ProjectDir)freetype\lib;$(ProjectDir)bassmidi\lib;$(ProjectDir)sdl2;$(LibraryPath)</LibraryPath>
     <OutDir>$(SolutionDir)\$(Configuration)\</OutDir>
     <IntDir>$(Configuration)\$(Platform)\</IntDir>
-<TargetName>PGFA-Beta-AVX2</TargetName>
+    <TargetName>PGFA-Beta-AVX2</TargetName>
   </PropertyGroup>
-  <ItemGroup>
-    <PostBuildEvent Include="deploy">
-      <Message>Deploying soundfont.</Message>
-      <Command>if not exist "$(OutDir)Soundfonts" mkdir "$(OutDir)Soundfonts" &amp; if exist "$(ProjectDir)Soundfonts" xcopy /y /d /q "$(ProjectDir)Soundfonts\*" "$(OutDir)Soundfonts\." &amp; exit 0</Command>
-    </PostBuildEvent>
-  </ItemGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
@@ -620,4 +614,12 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <Target Name="ArchivePdb" AfterTargets="Build">
+    <PropertyGroup>
+      <PdbStamp>$([System.DateTime]::Now.ToString('yyyyMMdd_HHmmss'))</PdbStamp>
+      <PdbArchDir>$(OutDir)pdb_archive\$(TargetName)_$(PdbStamp)</PdbArchDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(PdbArchDir)" Condition="Exists('$(OutDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(OutDir)$(TargetName).pdb" DestinationFolder="$(PdbArchDir)" Condition="Exists('$(OutDir)$(TargetName).pdb')" />
+  </Target>
 </Project>

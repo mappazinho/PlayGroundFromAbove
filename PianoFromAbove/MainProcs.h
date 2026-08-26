@@ -49,6 +49,8 @@ VOID CheckActivity( BOOL bIsActive, POINT *ptNew = NULL, BOOL bToggleEnable = fa
 // the MIDI/image-buffer lifetime.
 VOID ImageBufferPrewarmPlaybackRequested( BOOL bPlaying );
 BOOL ImageBufferPrewarmPlaybackHold();
+VOID ImageBufferPrewarmRestartAfterSeek( BOOL bInvalidateData );
+VOID ImageBufferPrewarmNotesSpeedChanged( void );
 VOID ImageBufferPrewarmRendererSeen( Renderer *pRenderer );
 
 // Test hook (crash repro driver): -repro "<midiA>" "<audio>" "<midiB>" [delaySecs]

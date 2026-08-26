@@ -43,6 +43,7 @@ struct ImageBufferPrewarmGpuState {
     size_t cpuPrepared = 0;
     size_t cpuTotal = 0;
     std::vector<long long> chunks;
+    bool restartKeepReady = false; // seek-restart: reuse already-prepared chunk data
 };
 
 struct ImageBufferHugePreparedState {
@@ -59,15 +60,25 @@ static std::mutex s_ImageBufferHugePreparedMutex;
 static ImageBufferHugePreparedState s_ImageBufferHugePrepared;
 
 static void ImageBufferHugePreparedReset(
-    const void* owner, uint64_t signature, std::vector<long long> chunks)
+    const void* owner, uint64_t signature, std::vector<long long> chunks, bool preserveReady = false)
 {
     std::lock_guard<std::mutex> lock(s_ImageBufferHugePreparedMutex);
+    // Preserve freshly-valid prepared chunks across a seek-restart so playback
+    // resumes as soon as anything actually missing has been rebuilt.
+    std::unordered_map<long long, std::shared_ptr<const std::vector<NoteData>>> keep;
+    if (preserveReady && s_ImageBufferHugePrepared.signature == signature)
+        keep = std::move(s_ImageBufferHugePrepared.ready);
     s_ImageBufferHugePrepared.owner = owner;
     s_ImageBufferHugePrepared.signature = signature;
     s_ImageBufferHugePrepared.chunks = std::move(chunks);
     s_ImageBufferHugePrepared.next = 0;
     s_ImageBufferHugePrepared.ready.clear();
     s_ImageBufferHugePrepared.ready.reserve(s_ImageBufferHugePrepared.chunks.size());
+    for (const auto& it : keep) {
+        if (std::binary_search(s_ImageBufferHugePrepared.chunks.begin(),
+                s_ImageBufferHugePrepared.chunks.end(), it.first))
+            s_ImageBufferHugePrepared.ready[it.first] = it.second;
+    }
 }
 
 static void ImageBufferHugePreparedClear(const void* owner = nullptr)
@@ -744,14 +755,26 @@ static void DrawImageBufferPrewarmProgress(
 
     char text[128];
     if (initializing) {
-        sprintf_s(text, "Initializing dense image buffers...");
+        // Fold whatever startup work is still running into this bar so there is
+        // continuous feedback from the moment the song screen appears.
+        const MIDILoadingProgress& ld = g_LoadingProgress;
+        static const char* stageNames[] = { "reading", "decompressing", "parsing",
+            "connecting notes", "sorting events", "finalizing" };
+        if (ld.stage != MIDILoadingProgress::Stage::Done && ld.max > 0 &&
+            ld.stage <= MIDILoadingProgress::Stage::Finalize) {
+            unsigned long long prog = ld.progress.load(std::memory_order_relaxed);
+            sprintf_s(text, "Preparing dense visual buffers - %s  %llu / %llu",
+                stageNames[(int)ld.stage], prog, (unsigned long long)ld.max);
+        } else {
+            sprintf_s(text, "Initializing dense visual buffers...");
+        }
     } else if (gpuStage) {
-        sprintf_s(text, "Prewarming dense image buffers  %zu / %zu", done, total);
+            sprintf_s(text, "Prewarming dense visual buffers  %zu / %zu", done, total);
     } else if (failed > 0) {
-        sprintf_s(text, "Preparing dense image buffers  %zu / %zu  (%zu fallback)",
+        sprintf_s(text, "Preparing dense visual buffers  %zu / %zu  (%zu fallback)",
             done, total, failed);
     } else {
-        sprintf_s(text, "Preparing dense image buffers  %zu / %zu", done, total);
+        sprintf_s(text, "Preparing dense visual buffers  %zu / %zu", done, total);
     }
     const ImVec2 textSize = ImGui::CalcTextSize(text);
     const float tx = x0 + ((x1 - x0) - textSize.x) * 0.5f;
@@ -811,12 +834,17 @@ static void ImageBufferDriveHugePrewarm(
     signature ^= tickMode ? 0x9e3779b97f4a7c15ull : 0x6a09e667f3bcc909ull;
 
     bool initialize = false;
+    bool keepReady = false;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         initialize = s_ImageBufferPrewarmGpu.owner != owner ||
             !s_ImageBufferPrewarmGpu.initialized ||
             !s_ImageBufferPrewarmGpu.hugeMode ||
             s_ImageBufferPrewarmGpu.hugeSignature != signature;
+        // A seek-restart keeps the signature; reuse whatever was already prepared.
+        keepReady = s_ImageBufferPrewarmGpu.restartKeepReady &&
+            s_ImageBufferPrewarmGpu.hugeSignature == signature;
+        s_ImageBufferPrewarmGpu.restartKeepReady = false;
     }
 
     if (initialize) {
@@ -831,7 +859,7 @@ static void ImageBufferDriveHugePrewarm(
             events, midi, timeSpan, corruptionMargin, tickMode,
             maxEndTime, maxEndTick, gpuLimit);
 
-        ImageBufferHugePreparedReset(owner, signature, std::move(cpuChunks));
+        ImageBufferHugePreparedReset(owner, signature, std::move(cpuChunks), keepReady);
         ImageBufferSetPinnedChunks(renderer, gpuChunks);
         const size_t cached = CountImageBufferPrewarmCached(renderer, gpuChunks);
 
@@ -854,6 +882,12 @@ static void ImageBufferDriveHugePrewarm(
         s_ImageBufferPrewarmGpu.cpuTotal = cpuTotal;
         s_ImageBufferPrewarmGpu.chunks = std::move(gpuChunks);
         s_ImageBufferPrewarmGpu.playRequested = keepPlay;
+        {
+            char b[96];
+            sprintf_s(b, "prewarm:huge-init cpuChunks=%zu gpuChunks=%zu",
+                cpuTotal, gpuChunks.size());
+            HeartbeatLog(b);
+        }
     }
 
     // Do one dense CPU chunk per held frame so the wait UI stays responsive.
@@ -1247,6 +1281,21 @@ VOID ImageBufferPrewarmRendererSeen(Renderer* pRenderer)
     s_ImageBufferPrewarmGpu.renderer = pRenderer;
 }
 
+void PFASetWaitDenseBuffers(bool enabled)
+{
+    ImageBufferPreparedSetWaitBeforePlayback(enabled);
+}
+
+// Gate-state transition logging: fires once per state CHANGE so the heartbeat
+// log shows exactly why playback was held or released without flooding it.
+static void TrackGateState(int code, const char* msg)
+{
+    static std::atomic<int> s_lastGateState{ -1 };
+    if (s_lastGateState.exchange(code, std::memory_order_relaxed) == code)
+        return;
+    HeartbeatLog(msg);
+}
+
 VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
 {
     if (!bPlaying) {
@@ -1257,6 +1306,7 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
         }
         ImageBufferHugePreparedClear();
         ImageBufferPreparedCancelPlaybackGate();
+        TrackGateState(11, "prewarm:canceled(stop)");
         return;
     }
 
@@ -1268,6 +1318,7 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
             ImageBufferClearPinnedChunks(s_ImageBufferPrewarmGpu.renderer);
         }
         ImageBufferPreparedCancelPlaybackGate();
+        TrackGateState(1, "prewarm:off(settings)");
         return;
     }
 
@@ -1296,7 +1347,57 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
             s_ImageBufferPrewarmGpu.wakeIssued = false;
         s_ImageBufferPrewarmGpu.playRequested = true;
     }
+    {
+        char b[128];
+        sprintf_s(b, "prewarm:armed owner=%p cpuInit=%d unsup=%d",
+            owner, (int)cpu.initialized, (int)cpu.unsupported);
+        TrackGateState(10, b);
+    }
     ImageBufferPreparedArmPlaybackGate(owner);
+}
+
+// Re-runs dense generation after a seek/skip (bInvalidateData=FALSE: prepared
+// chunks stay valid and are reused) or after a note-speed change
+// (bInvalidateData=TRUE: visible time span changed -> everything regenerates).
+// Playback holds via GetPaused() until the rebuild finishes, with the usual
+// progress bar.
+VOID ImageBufferPrewarmRestartAfterSeek(BOOL bInvalidateData)
+{
+    const auto& viz = Config::GetConfig().GetVizSettings();
+    if (!viz.bImageBufferNotes || !ImageBufferPreparedGetWaitBeforePlayback() || g_bVideoRendering)
+        return;
+    MainScreen* screen = dynamic_cast<MainScreen*>(g_pGameState);
+    if (!screen || screen->IsFreePlay() || !screen->IsValid() || screen->IsDiscarded())
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
+        s_ImageBufferPrewarmGpu.owner = screen;
+        s_ImageBufferPrewarmGpu.initialized = false;
+        s_ImageBufferPrewarmGpu.cacheRequired = false;
+        s_ImageBufferPrewarmGpu.hugeMode = false;
+        s_ImageBufferPrewarmGpu.cached = 0;
+        s_ImageBufferPrewarmGpu.total = 0;
+        s_ImageBufferPrewarmGpu.cpuPrepared = 0;
+        s_ImageBufferPrewarmGpu.cpuTotal = 0;
+        s_ImageBufferPrewarmGpu.chunks.clear();
+        s_ImageBufferPrewarmGpu.wakeIssued = false;
+        s_ImageBufferPrewarmGpu.restartKeepReady = !bInvalidateData;
+        s_ImageBufferPrewarmGpu.playRequested = true;
+    }
+    if (bInvalidateData)
+        screen->RequestDenseRegeneration();
+    ImageBufferPreparedArmPlaybackGate(screen);
+    TrackGateState(12, bInvalidateData ? "prewarm:rearmed(regenerate)" : "prewarm:rearmed(seek)");
+}
+
+VOID ImageBufferPrewarmNotesSpeedChanged()
+{
+    // Note speed changes the visible time span, so every prepared signature is
+    // invalid. Skipped while paused: scrubbing must not thrash preparation, and
+    // the next Play re-arms fresh regardless.
+    if (!Config::GetConfig().GetPlaybackSettings().GetPausedRaw())
+        ImageBufferPrewarmRestartAfterSeek(TRUE);
 }
 
 BOOL ImageBufferPrewarmPlaybackHold()
@@ -1307,6 +1408,7 @@ BOOL ImageBufferPrewarmPlaybackHold()
             s_ImageBufferPrewarmGpu.playRequested = false;
         }
         ImageBufferPreparedCancelPlaybackGate();
+        TrackGateState(1, "prewarm:off(setting)");
         return FALSE;
     }
 
@@ -1317,22 +1419,44 @@ BOOL ImageBufferPrewarmPlaybackHold()
             s_ImageBufferPrewarmGpu.playRequested = false;
         }
         ImageBufferPreparedCancelPlaybackGate();
+        TrackGateState(1, "prewarm:off(viz)");
         return FALSE;
     }
 
     const MainScreen* screen = dynamic_cast<const MainScreen*>(g_pGameState);
-    if (!screen || screen->IsFreePlay() || !screen->IsValid() || screen->IsDiscarded())
+    if (!screen || screen->IsFreePlay() || !screen->IsValid() || screen->IsDiscarded()) {
+        TrackGateState(2, "prewarm:idle(no active screen)");
         return FALSE;
+    }
 
     Renderer* wakeRenderer = nullptr;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
-        if (!s_ImageBufferPrewarmGpu.playRequested)
+        if (!s_ImageBufferPrewarmGpu.playRequested) {
+            TrackGateState(0, "prewarm:idle(not requested)");
             return FALSE;
-        if (!s_ImageBufferPrewarmGpu.owner)
+        }
+        if (!s_ImageBufferPrewarmGpu.owner) {
             s_ImageBufferPrewarmGpu.owner = screen;
-        if (s_ImageBufferPrewarmGpu.owner != screen)
-            return FALSE;
+        } else if (s_ImageBufferPrewarmGpu.owner != screen) {
+            // Stale ownership (previous song's screen): adopt the new one and
+            // start the preparation from scratch instead of dead-gating here.
+            char b[96];
+            sprintf_s(b, "prewarm:stale-owner-adopted %p->%p",
+                s_ImageBufferPrewarmGpu.owner, (const void*)screen);
+            s_ImageBufferPrewarmGpu.owner = screen;
+            s_ImageBufferPrewarmGpu.initialized = false;
+            s_ImageBufferPrewarmGpu.cacheRequired = false;
+            s_ImageBufferPrewarmGpu.hugeMode = false;
+            s_ImageBufferPrewarmGpu.hugeSignature = 0;
+            s_ImageBufferPrewarmGpu.cached = 0;
+            s_ImageBufferPrewarmGpu.total = 0;
+            s_ImageBufferPrewarmGpu.cpuPrepared = 0;
+            s_ImageBufferPrewarmGpu.cpuTotal = 0;
+            s_ImageBufferPrewarmGpu.chunks.clear();
+            s_ImageBufferPrewarmGpu.wakeIssued = false;
+            TrackGateState(9, b);
+        }
 
         // The explicit frame-start kick is primary. Keep this invalidation as a one-shot nudge for
         // already-cached renderers, but prewarm no longer depends on a subsequent visible CollectChunk
@@ -1345,28 +1469,44 @@ BOOL ImageBufferPrewarmPlaybackHold()
     }
     if (wakeRenderer) {
         wakeRenderer->ImageBufferInvalidate();
+        TrackGateState(3, "prewarm:hold(wake-nudge)");
         return TRUE;
     }
 
-    if (ImageBufferPreparedShouldHoldPlayback(screen))
+    if (ImageBufferPreparedShouldHoldPlayback(screen)) {
+        TrackGateState(4, "prewarm:hold(cpu-prime)");
         return TRUE;
+    }
 
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         // CPU preparation may have completed between Logic and the previous render. Hold one more frame
         // until the render path publishes whether a texture-cache stage is required for this song.
-        if (!s_ImageBufferPrewarmGpu.initialized)
+        if (!s_ImageBufferPrewarmGpu.initialized) {
+            TrackGateState(5, "prewarm:hold(uninitialized)");
             return TRUE;
+        }
         if (s_ImageBufferPrewarmGpu.hugeMode &&
-            s_ImageBufferPrewarmGpu.cpuPrepared < s_ImageBufferPrewarmGpu.cpuTotal)
+            s_ImageBufferPrewarmGpu.cpuPrepared < s_ImageBufferPrewarmGpu.cpuTotal) {
+            char b[96];
+            sprintf_s(b, "prewarm:hold(huge-cpu %zu/%zu)",
+                s_ImageBufferPrewarmGpu.cpuPrepared, s_ImageBufferPrewarmGpu.cpuTotal);
+            TrackGateState(6, b);
             return TRUE;
+        }
         if (s_ImageBufferPrewarmGpu.cacheRequired) {
             s_ImageBufferPrewarmGpu.cached = CountImageBufferPrewarmCached(
                 s_ImageBufferPrewarmGpu.renderer, s_ImageBufferPrewarmGpu.chunks);
-            if (s_ImageBufferPrewarmGpu.cached < s_ImageBufferPrewarmGpu.total)
+            if (s_ImageBufferPrewarmGpu.cached < s_ImageBufferPrewarmGpu.total) {
+                char b[96];
+                sprintf_s(b, "prewarm:hold(gpu-cache %zu/%zu)",
+                    s_ImageBufferPrewarmGpu.cached, s_ImageBufferPrewarmGpu.total);
+                TrackGateState(7, b);
                 return TRUE;
+            }
         }
         s_ImageBufferPrewarmGpu.playRequested = false;
     }
+    TrackGateState(8, "prewarm:released");
     return FALSE;
 }

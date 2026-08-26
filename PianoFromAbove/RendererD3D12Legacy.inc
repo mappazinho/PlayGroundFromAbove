@@ -20,6 +20,10 @@
 #include "BackgroundVertexShader.h"
 #include "ChunkQuadPixelShader.h"
 #include "ChunkQuadVertexShader.h"
+#include "BlurShader12.h"
+#include "BloomExtractShader12.h"
+#include "BloomPixelShader12.h"
+#include "VignettePixelShader12.h"
 #include "Globals.h"
 #include "Renderer.h"
 
@@ -93,6 +97,8 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
     // std::vector<ComPtr<IDXGIAdapter1>> adapters;
     for (UINT i = 0; m_pFactory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
         res = adapter->QueryInterface(IID_PPV_ARGS(&m_pAdapter));
+        adapter->Release();
+        adapter = nullptr;
         if (FAILED(res))
             continue;
 
@@ -112,11 +118,9 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
     }
     if (m_pDevice == nullptr) {
         HeartbeatLog("init:nodevice");
-        // During a TDR the driver can be unavailable for a few seconds; the
-        if (!g_bInRecovery) {
-            MessageBoxW(NULL, L"Couldn't find a suitable D3D12 device.", L"DirectX Error", MB_ICONERROR);
-            exit(1);
-        }
+        // Return instead of exiting: machines without any D3D12-capable GPU
+        // (old drivers, WDDM 1.x, RDP, VMs) must fall back to D3D11 in
+        // GameThread rather than have the whole process die here.
         return std::make_tuple(E_FAIL, "D3D12CreateDevice");
     }
     {
@@ -829,8 +833,11 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
     }
     m_pDrawList = new ImDrawList(ImGui::GetDrawListSharedData());
 
-    if (FAILED(CreateBlurResources()))
-        return std::make_tuple(E_FAIL, "CreateBlurResources");
+    {
+        HRESULT blur_hr = CreateBlurResources();
+        if (FAILED(blur_hr))
+            return std::make_tuple(blur_hr, "CreateBlurResources");
+    }
 
     return std::make_tuple(S_OK, "");
 }
@@ -2378,170 +2385,13 @@ static HRESULT CompileBackgroundPS(ID3DBlob** ppBlob) {
     return D3DCompile(g_BackgroundPSHLSL, strlen(g_BackgroundPSHLSL), nullptr, nullptr, nullptr, "main", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
 }
 
-static const char* g_BlurHLSL = R"(
-RWTexture2D<float4> g_output : register(u0);
-Texture2D<float4> g_input : register(t0);
-
-cbuffer cb : register(b0) {
-    int g_blurDirection;
-    int g_sigma;
-    int2 g_padding;
-};
-
-[numthreads(256, 1, 1)]
-void CSMain(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, uint3 dispatchThreadId : SV_DispatchThreadID) {
-    uint w, h;
-    g_input.GetDimensions(w, h);
-    int sigma = max(g_sigma, 1);
-    int radius = min(sigma * 3, 63);
-    float sigma2 = (float)(sigma * sigma);
-    int2 coord;
-    if (g_blurDirection == 0) {
-        coord = int2((int)dispatchThreadId.x, (int)groupId.y);
-    } else {
-        coord = int2((int)groupId.x, (int)(groupId.y * 256 + groupThreadId.x));
-    }
-    if (coord.x >= (int)w || coord.y >= (int)h) return;
-    float4 result = 0;
-    float totalW = 0;
-    [loop] for (int i = -radius; i <= radius; i++) {
-        float d = (float)i;
-        float wgt = exp(-(d * d) / (2.0f * sigma2));
-        int2 sc = coord;
-        if (g_blurDirection == 0) sc.x = clamp(coord.x + i, 0, (int)w - 1);
-        else sc.y = clamp(coord.y + i, 0, (int)h - 1);
-        result += g_input[sc] * wgt;
-        totalW += wgt;
-    }
-    float4 blurred = result / totalW;
-    blurred.a = 1.0; // Force opaque so the blur is always visible
-    g_output[coord] = blurred;
-}
-)";
-
-static HRESULT CompileBlurShader(ID3DBlob** ppBlob) {
-    return D3DCompile(g_BlurHLSL, strlen(g_BlurHLSL), nullptr, nullptr, nullptr, "CSMain", "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
-}
-
-static const char* g_BloomExtractHLSL = R"(
-Texture2D<float4> g_input : register(t0);
-RWTexture2D<float4> g_output : register(u0);
-
-cbuffer cb : register(b0) {
-    float g_threshold;
-    float g_knee;
-    float g_pregain;
-    float g_padding;
-};
-
-[numthreads(16, 16, 1)]
-void CSMain(uint3 dtid : SV_DispatchThreadID) {
-    uint ow, oh;
-    g_output.GetDimensions(ow, oh);
-    if (dtid.x >= ow || dtid.y >= oh) return;
-
-    uint iw, ih;
-    g_input.GetDimensions(iw, ih);
-    int2 base = int2(dtid.xy) * 2;
-    float4 s00 = g_input[min(base + int2(0,0), int2(iw-1, ih-1))];
-    float4 s10 = g_input[min(base + int2(1,0), int2(iw-1, ih-1))];
-    float4 s01 = g_input[min(base + int2(0,1), int2(iw-1, ih-1))];
-    float4 s11 = g_input[min(base + int2(1,1), int2(iw-1, ih-1))];
-    float3 color = (s00.rgb + s10.rgb + s01.rgb + s11.rgb) * 0.25;
-
-    float maxc = max(color.r, max(color.g, color.b));
-    float knee2 = g_knee * 2.0;
-    float soft = clamp(maxc - g_threshold + g_knee, 0.0, knee2);
-    soft = (knee2 > 0.00001) ? (soft * soft / (4.0 * g_knee + 0.00001)) : 0.0;
-    float contribution = max(soft, maxc - g_threshold) / max(maxc, 0.00001);
-    contribution = max(contribution, 0.0);
-
-    float3 extracted = color * contribution * g_pregain;
-    g_output[dtid.xy] = float4(extracted, 1.0);
-}
-)";
-
-static HRESULT CompileBloomExtractShader(ID3DBlob** ppBlob) {
-    return D3DCompile(g_BloomExtractHLSL, strlen(g_BloomExtractHLSL), nullptr, nullptr, nullptr, "CSMain", "cs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
-}
-
-static const char* g_BloomHLSL = R"(
-Texture2D<float4> g_bloom : register(t0);
-SamplerState g_sampler : register(s0);
-
-cbuffer BloomConstants : register(b0) {
-    float saturation;
-    float brightness;
-    float3 tint;
-};
-
-struct PSInput {
-    float4 position : SV_POSITION;
-    float2 uv : TEXCOORD0;
-};
-
-float4 main(PSInput input) : SV_TARGET {
-    float3 bloom = g_bloom.Sample(g_sampler, input.uv).rgb;
-
-    float maxC = max(bloom.r, max(bloom.g, bloom.b));
-    if (maxC > 0.0001) {
-        float3 normalized = bloom / maxC;
-
-        float gray = dot(normalized, float3(0.2126, 0.7152, 0.0722));
-        float effectiveSat = saturation * (1.0 + 0.35 * max(0.0, brightness - 1.0));
-        normalized = lerp(float3(gray, gray, gray), normalized, effectiveSat);
-        normalized = max(normalized, 0.0);
-
-        float scaledMax = maxC * brightness;
-        float compressedMax = scaledMax / (1.0 + 0.25 * scaledMax);
-
-        bloom = normalized * compressedMax;
-    }
-
-    return float4(bloom * tint, 0.0);
-}
-)";
-
-static HRESULT CompileBloomShader(ID3DBlob** ppBlob) {
-    return D3DCompile(g_BloomHLSL, strlen(g_BloomHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
-}
-
-static const char* g_VignetteHLSL = R"(
-cbuffer VignetteConstants : register(b0) {
-    float g_intensity;
-    float g_aspect;
-    float g_innerRadius;
-    float g_smoothness;
-};
-
-struct PSInput {
-    float4 position : SV_POSITION;
-    float2 uv : TEXCOORD0;
-};
-
-float4 main(PSInput input) : SV_TARGET {
-    float2 c = input.uv - 0.5;
-    c.x *= g_aspect;
-    float d = length(c) * 2.0;
-    float v = 1.0 - g_intensity * smoothstep(g_innerRadius, g_innerRadius + g_smoothness, d);
-    return float4(v, v, v, 1.0);
-}
-)";
-
-static HRESULT CompileVignetteShader(ID3DBlob** ppBlob) {
-    return D3DCompile(g_VignetteHLSL, strlen(g_VignetteHLSL), nullptr, nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, ppBlob, nullptr);
-}
-
 HRESULT D3D12Renderer::CreateBlurResources() {
     if (m_pBlurPipelineState)
         DestroyBlurResources();
 
     HRESULT res;
 
-    ComPtr<ID3DBlob> cs_blob;
     HeartbeatLog("blur:compile");
-    res = CompileBlurShader(&cs_blob);
-    if (FAILED(res)) return res;
     HeartbeatLog("blur:rootsig");
 
     D3D12_DESCRIPTOR_RANGE srv_range = {
@@ -2588,7 +2438,7 @@ HRESULT D3D12Renderer::CreateBlurResources() {
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC ps_desc = {
         .pRootSignature = m_pBlurRootSignature.Get(),
-        .CS = { .pShaderBytecode = cs_blob->GetBufferPointer(), .BytecodeLength = cs_blob->GetBufferSize() },
+        .CS = { .pShaderBytecode = g_pBlurShader12, .BytecodeLength = sizeof(g_pBlurShader12) },
         .NodeMask = 0,
     };
     res = m_pDevice->CreateComputePipelineState(&ps_desc, IID_PPV_ARGS(&m_pBlurPipelineState));
@@ -2624,10 +2474,6 @@ HRESULT D3D12Renderer::CreateBlurResources() {
     }
 
     {
-        ComPtr<ID3DBlob> extract_cs_blob;
-        res = CompileBloomExtractShader(&extract_cs_blob);
-        if (FAILED(res)) return res;
-
         D3D12_DESCRIPTOR_RANGE extract_srv_range = {
             .RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             .NumDescriptors = 1,
@@ -2672,7 +2518,7 @@ HRESULT D3D12Renderer::CreateBlurResources() {
 
         D3D12_COMPUTE_PIPELINE_STATE_DESC extract_ps_desc = {
             .pRootSignature = m_pBloomExtractRootSignature.Get(),
-            .CS = { .pShaderBytecode = extract_cs_blob->GetBufferPointer(), .BytecodeLength = extract_cs_blob->GetBufferSize() },
+            .CS = { .pShaderBytecode = g_pBloomExtractShader12, .BytecodeLength = sizeof(g_pBloomExtractShader12) },
             .NodeMask = 0,
         };
         res = m_pDevice->CreateComputePipelineState(&extract_ps_desc, IID_PPV_ARGS(&m_pBloomExtractPipelineState));
@@ -2729,14 +2575,10 @@ HRESULT D3D12Renderer::CreateBlurResources() {
         res = m_pDevice->CreateRootSignature(0, bloom_rs_blob->GetBufferPointer(), bloom_rs_blob->GetBufferSize(), IID_PPV_ARGS(&m_pBloomRootSignature));
         if (FAILED(res)) return res;
 
-        ComPtr<ID3DBlob> bloom_ps_blob;
-        res = CompileBloomShader(&bloom_ps_blob);
-        if (FAILED(res)) return res;
-
         D3D12_GRAPHICS_PIPELINE_STATE_DESC bloom_desc = {};
         bloom_desc.pRootSignature = m_pBloomRootSignature.Get();
         bloom_desc.VS = { .pShaderBytecode = g_pBackgroundVertexShader, .BytecodeLength = sizeof(g_pBackgroundVertexShader) };
-        bloom_desc.PS = { .pShaderBytecode = bloom_ps_blob->GetBufferPointer(), .BytecodeLength = bloom_ps_blob->GetBufferSize() };
+        bloom_desc.PS = { .pShaderBytecode = g_pBloomPixelShader12, .BytecodeLength = sizeof(g_pBloomPixelShader12) };
         bloom_desc.BlendState.RenderTarget[0] = {
             .BlendEnable = TRUE,
             .LogicOpEnable = FALSE,
@@ -2781,14 +2623,10 @@ HRESULT D3D12Renderer::CreateBlurResources() {
         res = m_pDevice->CreateRootSignature(0, vignette_rs_blob->GetBufferPointer(), vignette_rs_blob->GetBufferSize(), IID_PPV_ARGS(&m_pVignetteRootSignature));
         if (FAILED(res)) return res;
 
-        ComPtr<ID3DBlob> vignette_ps_blob;
-        res = CompileVignetteShader(&vignette_ps_blob);
-        if (FAILED(res)) return res;
-
         D3D12_GRAPHICS_PIPELINE_STATE_DESC vignette_desc = {};
         vignette_desc.pRootSignature = m_pVignetteRootSignature.Get();
         vignette_desc.VS = { .pShaderBytecode = g_pBackgroundVertexShader, .BytecodeLength = sizeof(g_pBackgroundVertexShader) };
-        vignette_desc.PS = { .pShaderBytecode = vignette_ps_blob->GetBufferPointer(), .BytecodeLength = vignette_ps_blob->GetBufferSize() };
+        vignette_desc.PS = { .pShaderBytecode = g_pVignettePixelShader12, .BytecodeLength = sizeof(g_pVignettePixelShader12) };
         // Multiplicative: output = backbuffer * vignette factor
         vignette_desc.BlendState.RenderTarget[0] = {
             .BlendEnable = TRUE,

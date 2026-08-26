@@ -1,5 +1,6 @@
 #include "Globals.h"
 #include "Renderer.h"
+#include "Config.h"
 #include "ImageBufferMultipass.h"
 #include "ImageBufferPreparedChunks.h"
 #include "ImageBufferGpuPins.h"
@@ -182,10 +183,13 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
 
     const bool wasEnabled = value && *value;
     const bool changed = Checkbox(label, value);
-    if (label && strcmp(label, "Image Buffer Notes") == 0) {
+    if (label && strcmp(label, "Visual Buffer Notes") == 0) {
         static bool initialized = false;
-        if ((!initialized && value && *value) || (changed && !wasEnabled && value && *value))
+        VizSettings& viz = Config::GetConfig().GetVizSettings();
+        if ((!initialized && value && *value) || (changed && !wasEnabled && value && *value)) {
             ImageBufferPreparedSetWaitBeforePlayback(true);
+            viz.bWaitDenseBuffers = true;
+        }
         initialized = true;
 
         ImGui::Indent();
@@ -193,11 +197,12 @@ static bool PGFAImageBufferCheckbox(const char* label, bool* value)
         bool waitForDense = ImageBufferPreparedGetWaitBeforePlayback();
         if (Checkbox("Wait for dense buffers before playback", &waitForDense)) {
             ImageBufferPreparedSetWaitBeforePlayback(waitForDense);
+            viz.bWaitDenseBuffers = waitForDense;
             if (!waitForDense)
                 ImageBufferPreparedCancelPlaybackGate();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Prepares dense image-buffer chunks before a requested playback start.");
+            ImGui::SetTooltip("Prepares dense visual-buffer chunks before a requested playback start.");
         ImGui::EndDisabled();
         ImGui::Unindent();
     }

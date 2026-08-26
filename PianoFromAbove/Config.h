@@ -116,7 +116,7 @@ public:
     void SetPaused( bool bPaused, bool bUpdateGUI = false ) { if ( !bPaused ) ImageBufferPrewarmPlaybackRequested( TRUE ); if ( bUpdateGUI ) ::SetPlayPauseStop( !bPaused, bPaused, false ); m_bPaused = bPaused; }
     void SetStopped( bool bUpdateGUI = false ) { ImageBufferPrewarmPlaybackRequested( FALSE ); if ( bUpdateGUI ) ::SetPlayPauseStop( false, false, true ); m_bPaused = true; }
     void SetSpeed( double dSpeed, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetSpeed( dSpeed ); m_dSpeed = dSpeed; }
-    void SetNSpeed( double dNSpeed, bool bUpdateGUI = false ) { dNSpeed = max(min(dNSpeed, 10.0), 0.005); if ( bUpdateGUI ) ::SetNSpeed( dNSpeed ); m_dNSpeed = dNSpeed; }
+    void SetNSpeed( double dNSpeed, bool bUpdateGUI = false ) { dNSpeed = max(min(dNSpeed, 10.0), 0.005); if ( bUpdateGUI ) ::SetNSpeed( dNSpeed ); if ( m_dNSpeed != dNSpeed ) ImageBufferPrewarmNotesSpeedChanged(); m_dNSpeed = dNSpeed; }
     void SetVolume( double dVolume, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetVolume( dVolume ); m_dVolume = dVolume; }
     void SetMute( bool bMute, bool bUpdateGUI = false ) { if ( bUpdateGUI ) ::SetMute( bMute ); m_bMute = bMute; }
 
@@ -124,6 +124,7 @@ public:
     GameState::State GetPlayMode() const { return m_ePlayMode; }
     bool GetPlayable() const { return m_bPlayable; }
     bool GetPaused() const { return m_bPaused || ImageBufferPrewarmPlaybackHold(); }
+    bool GetPausedRaw() const { return m_bPaused; } // gate state excluded - for "was the user paused" checks
     bool GetMute() const { return m_bMute; }
     double GetSpeed() const { return m_dSpeed; }
     double GetNSpeed() const { return m_dNSpeed; }
@@ -265,6 +266,7 @@ struct VizSettings : public ISettings {
     bool bBounceStats;
     int iBounceNPSThreshold;
     bool bImageBufferNotes;
+    bool bWaitDenseBuffers; // Persisted: "wait for dense buffers before playback" (runtime mirror lives in the image-buffer prepared store)
 };
 
 class Config : public ISettings

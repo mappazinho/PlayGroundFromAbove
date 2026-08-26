@@ -39,8 +39,11 @@ public:
     void AddManualTime(long long time);
     void SetFrameRate(unsigned rate);
     void IncrementFrame();
-    bool m_bManualTimer;
-    double m_dFramerate;
+    // Default true: an un-Init'ed Timer must not call timeEndPeriod in its
+    // destructor (that would drop the process-wide timer resolution to the
+    // 15.6 ms floor and quantize every timed wait to ~64 Hz).
+    bool m_bManualTimer = true;
+    double m_dFramerate = 0.0;
 
 private:
     static const long long m_llPrecisionLimit = 1000000000ll;

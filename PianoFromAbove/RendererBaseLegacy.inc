@@ -787,7 +787,7 @@ void Renderer::RenderImGuiFrame() {
             ImGui::Checkbox("Tick-based Mode", &viz.bTickBased);
             ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
             ImGui::Checkbox("Disable all blurs", &viz.bDisableBlurs);
-            if (ImGui::Checkbox("Image Buffer Notes", &viz.bImageBufferNotes) && viz.bImageBufferNotes)
+            if (ImGui::Checkbox("Visual Buffer Notes", &viz.bImageBufferNotes) && viz.bImageBufferNotes)
                 viz.bDualPianoRoll = false;
             if (viz.bImageBufferNotes) {
                 ImGui::SameLine();

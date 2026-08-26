@@ -270,6 +270,7 @@ void VizSettings::LoadDefaultValues() {
     this->bBounceStats = false;
     this->iBounceNPSThreshold = 90;
     this->bImageBufferNotes = false;
+    this->bWaitDenseBuffers = true;
     this->sFFmpegDir = L"";
     this->iRenderWidth = 1920;
     this->iRenderHeight = 1080;
@@ -595,6 +596,13 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bImageBufferNotes = (iAttrVal != 0);
     if (bImageBufferNotes)
         bDualPianoRoll = false;
+    // Legacy configs predate the persisted flag: inherit the Image Buffer Notes
+    // state, which matches what the preferences UI used to auto-enable.
+    if (txViz->QueryIntAttribute("WaitDenseBuffers", &iAttrVal) == TIXML_SUCCESS)
+        bWaitDenseBuffers = (iAttrVal != 0);
+    else
+        bWaitDenseBuffers = bImageBufferNotes;
+    PFASetWaitDenseBuffers(bWaitDenseBuffers);
     sTempStr = "";
     txViz->QueryStringAttribute("FFmpegDir", &sTempStr);
     sFFmpegDir = Util::StringToWstring(sTempStr);
@@ -823,6 +831,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("BounceStats", bBounceStats);
     txViz->SetAttribute("BounceNPSThreshold", iBounceNPSThreshold);
     txViz->SetAttribute("ImageBufferNotes", bImageBufferNotes);
+    txViz->SetAttribute("WaitDenseBuffers", bWaitDenseBuffers);
     if (sFFmpegDir.length() > 0)
         txViz->SetAttribute("FFmpegDir", Util::WstringToString(sFFmpegDir));
     txViz->SetAttribute("RenderWidth", iRenderWidth);

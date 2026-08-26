@@ -49,6 +49,10 @@ bool VideoRenderSongLoaded(); // True when the current state is a loaded song sc
 
 void HeartbeatLog(const char* tag); // Temporary debug diagnostics (game thread only)
 
+// Mirrors the persisted "wait for dense buffers" setting into the runtime gate
+// (which lives in the image-buffer prepared store, not in Config).
+void PFASetWaitDenseBuffers(bool enabled);
+
 // Sets the main window title with the active renderer indicator appended.
 inline void SetMainTitle(const wchar_t* title) {
     wchar_t buf[1280];

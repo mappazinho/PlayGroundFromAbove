@@ -1941,6 +1941,7 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     m_pNextState = reinterpret_cast< GameState* >( lParam );
                     return Success;
                 case ID_PLAY_STOP:
+                    HeartbeatLog("seek:writer(stop-command)");
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
                     s_fTransitionPhase = 0.0f;
@@ -2020,6 +2021,7 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     cPlayback.TogglePaused( true );
                     return Success;
                 case VK_OEM_PERIOD:
+                    HeartbeatLog("seek:writer(period-key stop)");
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
                     return Success;
@@ -2182,6 +2184,13 @@ GameState::GameError MainScreen::Logic( void )
     long long llTimeSpan = static_cast< long long >( 3.0 * dNSpeed * 1000000 );
     bool bPausedChanged = ( bPaused != m_bPaused );
     bool bMuteChanged = ( bMute != m_bMute );
+
+    if ( bPausedChanged && bPaused && !m_bTrackZoom && !m_bTrackPos ) {
+        char b[96];
+        sprintf_s( b, "pause:engaged start=%.3fs disp=%.3fs",
+            (double)m_llStartTime / 1e6, (double)m_llDisplayTime / 1e6 );
+        HeartbeatLog( b );
+    }
     
     // Set the state
     m_bTickMode = cViz.bTickBased;
@@ -2290,6 +2299,12 @@ GameState::GameError MainScreen::Logic( void )
                 }
                 else if ( llAhead < -kDeadZone )
                 {
+                    if ( llAhead < -200000LL ) {
+                        char b[128];
+                        sprintf_s( b, "clockjump:prerender %.3fs -> %.3fs (player reset?)",
+                            (double)llNextStartTime / 1e6, (double)( llAudioTime + kDeadZone ) / 1e6 );
+                        HeartbeatLog( b );
+                    }
                     llNextStartTime = min( llNextStartTime, llAudioTime + kDeadZone );
                 }
                 m_llStartTime = llNextStartTime;
@@ -2509,6 +2524,13 @@ void MainScreen::UpdateState(int key, const thread_work_t& work)
 
 void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
 {
+    {
+        char b[128];
+        sprintf_s(b, "seek:jumpto %.3fs (from %.3fs) gui=%d",
+            (double)(min(max(llStartTime, GetMinTime()), GetMaxTime())) / 1e6,
+            (double)m_llStartTime / 1e6, (int)bUpdateGUI);
+        HeartbeatLog(b);
+    }
     m_dNPSNotes.clear();
     m_dNPSHistory.clear();
 
@@ -2562,7 +2584,10 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
 
         unsigned iFound = 0;
 
-        auto itClusterEnd = itMiddle;
+        // Seeking past the last note-on leaves itMiddle at itEnd; clamp the
+        // cluster scan to the last valid event or the dereference below reads
+        // one-past-the-end (crash when seeking around the song's duration).
+        auto itClusterEnd = (itMiddle == itEnd) ? itEnd - 1 : itMiddle;
         long long llClusterTime = m_MIDI.GetEventTime(*itClusterEnd);
         while (itClusterEnd + 1 != itEnd && m_MIDI.GetEventTime(*(itClusterEnd + 1)) == llClusterTime)
             itClusterEnd++;
@@ -2608,6 +2633,12 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
         long long llNewPos = ((m_llStartTime - llFirstTime) * 1000) / (llLastTime - llFirstTime);
         cPlayback.SetPosition(static_cast<int>(llNewPos));
     }
+
+    // Any seek/skip restarts dense-buffer preparation around the new position.
+    // Skipped while paused so scrubbing does not thrash preparation; the next
+    // Play re-arms fresh regardless.
+    if (!Config::GetConfig().GetPlaybackSettings().GetPausedRaw())
+        ImageBufferPrewarmRestartAfterSeek(FALSE);
 }
 
 void MainScreen::PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange)
@@ -3419,7 +3450,12 @@ void MainScreen::RenderNotesImageBuffer()
     const unsigned maxLookaheadBakesPerFrame = 8;
 
     const long long maxLen = bTickMode ? m_llMaxNoteLenTicks : m_llMaxNoteLen;
-    const long long backScan = maxLen + E;
+    // Tail scan is capped at one chunk: a single very long note elsewhere in the
+    // song used to inflate this to minutes, pulling entire previous chunks into
+    // every bake (presented as random previous/next chunk corruption). Tails
+    // longer than one full chunk span the whole view regardless, so nothing
+    // visible changes.
+    const long long backScan = min(maxLen + E, T);
 
     // Collects notes for visible chunks that could not be queued for baking
     // (per-frame note budget hit); they are drawn through the normal path.
@@ -3459,6 +3495,27 @@ void MainScreen::RenderNotesImageBuffer()
         CollectChunk(k);
         return m_pRenderer->ImageBufferRenderChunk(k, chunkNotes.data(), (unsigned)chunkNotes.size());
     };
+
+    // Interactive move/zoom drags change the cache key every frame, so baking
+    // into a cache that is invalidated per frame destroys finished work faster
+    // than it can be rebuilt - the baked region visibly lags behind playback.
+    // Draw everything through the direct path while dragging; the caches stay
+    // warm and a single rebuild happens when the drag commits.
+    // The 88<->127 key-range transition does the same thing (white_cx /
+    // notes_cy / note_x animate every frame), so bypass during it too.
+    const bool bKeysTransitionActive =
+        (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
+        (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
+    if (m_bTrackZoom || m_bTrackPos || bKeysTransitionActive) {
+        for (long long k = kFirst; k <= kLast; k++) {
+            CollectChunk(k);
+            for (NoteData data : chunkNotes) {
+                data.pos += static_cast<float>(k * T - tStart);
+                m_pRenderer->PushNoteData(data);
+            }
+        }
+        return;
+    }
 
     // 1. Ensure all visible chunks are baked; on budget failure queue their
     //    notes through the regular note path so nothing disappears.
@@ -3536,6 +3593,24 @@ void MainScreen::RenderPianoRollStripImageBuffer()
         collect(chunk);
         return m_pRenderer->ImageBufferRenderChunk(key, chunkNotes.data(), (unsigned)chunkNotes.size());
     };
+
+    // Same interactive-drag bypass as the main view above; the key-range
+    // transition also churns the cache key per frame.
+    const bool bKeysTransitionActive =
+        (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
+        (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
+    if (m_bTrackZoom || m_bTrackPos || bKeysTransitionActive) {
+        for (long long chunk = first; chunk <= last; ++chunk) {
+            collect(chunk);
+            for (NoteData data : chunkNotes) {
+                data.pos += (float)(chunk * T - tStart);
+                fallback.push_back(data);
+            }
+        }
+        for (const NoteData& data : fallback)
+            m_pRenderer->PushPianoRollStripNoteData(data);
+        return;
+    }
 
     for (long long chunk = first; chunk <= last; ++chunk) {
         if (!bake(chunk)) {
@@ -4191,7 +4266,7 @@ void MainScreen::RenderStatus(int lines)
     }
 
     if (viz.bImageBufferNotes)
-        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Image buffer:", "%u/64", m_pRenderer->ImageBufferGetCachedCount());
+        RenderStatusLine(cur_line++, width, toolbarBottom, statusRight, "Visual buffer:", "%u/64", m_pRenderer->ImageBufferGetCachedCount());
 
     if (auto drawList = m_pRenderer->GetDrawList())
     {
@@ -4456,6 +4531,11 @@ FreePlayScreen::FreePlayScreen(HWND hWnd, Renderer* pRenderer)
     m_csKBRed.SetColor(config.GetVizSettings().iBarColor, 0.5f);
 }
 
+FreePlayScreen::~FreePlayScreen()
+{
+    StopFreePlayAudioThread();
+}
+
 GameState::GameError FreePlayScreen::Init()
 {
     static Config& config = Config::GetConfig();
@@ -4466,6 +4546,7 @@ GameState::GameError FreePlayScreen::Init()
         m_OutDevice.OpenKDMAPI();
     else
         m_OutDevice.Open(cAudio.iOutDevice);
+    StartFreePlayAudioThread();
 
     m_Timer.Init(false);
     m_RealTimer.Init(false);
@@ -4552,9 +4633,8 @@ void FreePlayScreen::NoteOn(int note, int velocity, long long llStamp)
 
 void FreePlayScreen::NoteOnSingle(int note, int velocity, long long llStamp)
 {
-    m_OutDevice.PlayEvent(0x90, (unsigned char)note, (unsigned char)velocity);
-
     const long long ts = llStamp >= 0 ? llStamp : m_llFreePlayTime;
+    QueueFreePlayEventAt(ts, 0x90, (unsigned char)note, (unsigned char)velocity);
 
     int slot;
     if (m_vFreeSlots.empty()) {
@@ -4689,7 +4769,7 @@ void FreePlayScreen::NoteOffSingle(int note, bool bStretch, long long llStamp, i
             return;
         }
         if (!state.empty() && state.back() == iSpecificIdx)
-            m_OutDevice.PlayEvent(0x80, (unsigned char)note, 0);
+            QueueFreePlayEventAt(llRel, 0x80, (unsigned char)note, 0);
 
         int idx = iSpecificIdx;
         MIDIChannelEvent pEvent = m_vEvents[idx];
@@ -4715,7 +4795,7 @@ void FreePlayScreen::NoteOffSingle(int note, bool bStretch, long long llStamp, i
         return;
     }
 
-    m_OutDevice.PlayEvent(0x80, (unsigned char)note, 0);
+    QueueFreePlayEventAt(llRel, 0x80, (unsigned char)note, 0);
 
     if (!m_vState[note].empty()) {
         int idx = m_vState[note].back();
@@ -4827,27 +4907,35 @@ void FreePlayScreen::TickLooper()
 
         int guard = 0;
         while (L.playhead >= L.duration && guard++ < 100000) {
+            // Absolute freeplay time of this loop boundary, so held notes are
+            // released at the exact audible moment instead of "whenever this
+            // frame ran".
+            const long long llBoundary = tick - L.playhead + L.duration;
             L.playhead -= L.duration;
             for (int n = 0; n < 128; n++) {
                 if (L.held[n] >= 0) {
-                    NoteOffSingle(n, false, -1, L.held[n]);
+                    NoteOffSingle(n, false, llBoundary, L.held[n]);
                     L.held[n] = -1;
                 }
             }
             L.nextEvent = 0;
         }
+        // Events due in this cycle map back to absolute freeplay time so their
+        // synth sends are scheduled precisely, independent of frame timing.
+        const long long llCycleStart = tick - L.playhead;
         while (L.nextEvent < (int)L.events.size() && L.events[L.nextEvent].time <= L.playhead) {
             const LoopEvent& e = L.events[L.nextEvent++];
+            const long long llDue = llCycleStart + e.time;
             if (e.isOn) {
                 m_bPlaybackColorPinned = true;
                 m_uPlaybackColor = L.bColorOverride ? L.uColorOverride : e.color;
                 int v = max(1, min(127, (int)(e.velocity * L.velocity)));
                 int iIdx = (int)m_vEvents.size(); // the event NoteOnSingle is about to push
-                NoteOnSingle(e.note, v, -1);
+                NoteOnSingle(e.note, v, llDue);
                 m_bPlaybackColorPinned = false;
                 L.held[e.note] = iIdx;
             } else {
-                NoteOffSingle(e.note, false, -1, L.held[e.note]);
+                NoteOffSingle(e.note, false, llDue, L.held[e.note]);
                 L.held[e.note] = -1;
             }
         }
@@ -4935,11 +5023,15 @@ GameState::GameError FreePlayScreen::Logic()
     m_bShowFPS = cVideo.bShowFPS;
 
     if (cViz.bKDMAPI != m_OutDevice.IsKDMAPI()) {
+        // Reconfiguring the device while the dispatch thread is sending can race
+        // midiOutClose/KDMAPI unload - pause the thread around the swap.
+        StopFreePlayAudioThread();
         if (cViz.bKDMAPI)
             m_OutDevice.OpenKDMAPI();
         else if (cAudio.iOutDevice >= 0)
             m_OutDevice.Open(cAudio.iOutDevice);
         m_OutDevice.Reset();
+        StartFreePlayAudioThread();
     }
 
     long long llElapsed = m_RealTimer.GetMicroSecs();

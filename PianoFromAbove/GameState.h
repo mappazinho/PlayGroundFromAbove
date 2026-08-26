@@ -18,9 +18,12 @@
 #include <tuple>
 #include <unordered_map>
 #include <cstdint>
+#include <queue>
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 using namespace std;
 
 //#include "ProtoBuf\MetaData.pb.h"
@@ -257,6 +260,10 @@ public:
     float GetStatsBounceScaleForOverlay() const { return GetStatsBounceScale(); }
     double GetAudioSchedulerFPSForOverlay() const { return m_dPlaybackAudioSchedulerHz.load(std::memory_order_relaxed); }
 
+    // Marks prepared dense-chunk data stale so the next active frame clears the
+    // huge store and invalidates GPU caches; used after note-speed changes.
+    void RequestDenseRegeneration() { m_bImageBufferNeedsInvalidate = true; }
+
     void ToggleMuted( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bMuted =
                                                   !m_vTrackSettings[iTrack].aChannels[iChannel].bMuted; }
     void ToggleHidden( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bHidden =
@@ -471,6 +478,7 @@ class FreePlayScreen : public MainScreen
 {
 public:
     FreePlayScreen(HWND hWnd, Renderer* pRenderer);
+    ~FreePlayScreen() override;
 
     GameError Init() override;
     GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
@@ -490,6 +498,29 @@ private:
     void SlideTo(int note);   // legato: move the chord, only strike/release the edge keys
     void ChordRelease(bool bStretch = false, long long llStamp = -1); // release this chord's own notes
     int m_iChordEvent[128] = {}; // per key: event this key was struck with by the current chord, or -1
+
+    // Dedicated MIDI-out dispatch thread: keeps synth sends (winmm/KDMAPI) off the
+    // input and render threads. Sends are scheduled at their exact musical stamp
+    // (QPC domain), so repeater/loop timing does not depend on frame rate,
+    // mirroring normal play's PlaybackAudioThread.
+    void StartFreePlayAudioThread();
+    void StopFreePlayAudioThread();
+    void FreePlayAudioThreadMain();
+    void QueueFreePlayEvent(unsigned char status, unsigned char p1, unsigned char p2);
+    void QueueFreePlayEventAt(long long llStampFpUs, unsigned char status, unsigned char p1, unsigned char p2);
+    long long FpStampToQpcUs(long long fpUs) const;
+    struct ScheduledSend {
+        unsigned long long dueQpcUs;
+        unsigned long msg;
+        bool operator>(const ScheduledSend& o) const { return dueQpcUs > o.dueQpcUs; }
+    };
+    std::thread m_FreePlayAudioThread;
+    std::mutex m_FreePlayAudioMutex;
+    std::condition_variable m_FreePlayAudioCv;
+    std::priority_queue<ScheduledSend, std::vector<ScheduledSend>, std::greater<ScheduledSend>> m_qFreePlayAudio;
+    std::atomic<long long> m_llFreePlayAudioClockFpUs{ 0 };  // freeplay-us <-> QPC-us mapping, refreshed by the audio thread
+    std::atomic<long long> m_llFreePlayAudioClockQpcUs{ 0 };
+    std::atomic<bool> m_bFreePlayAudioExit{ false };
 
     NoteData BuildRenderNoteData(MIDIChannelEvent pNote) const override;
     void RenderNoteIdx(int idx);

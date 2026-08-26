@@ -265,6 +265,29 @@ static DWORD WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
 
 static DWORD g_dwGameThreadId = 0;
 
+// Last-resort backstop: some fatal traps (breakpoints from corrupted indirect
+// calls, illegal instructions raised inside static CRT helpers) were slipping
+// past the unhandled-exception filter because other components re-register or
+// clear it. A second-chance VEH registered LAST runs before any of that and
+// guarantees we capture registers + stack to crash_log.txt.
+static LONG WINAPI FinalCrashBackstop(EXCEPTION_POINTERS* ep) {
+    switch (ep->ExceptionRecord->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case STATUS_BREAKPOINT:            // 0x80000003: int3 traps from corrupted calls
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH; // C++ exceptions (0xE06D7363) etc. pass through
+    }
+    WriteCrashLog(ep);
+    TerminateProcess(GetCurrentProcess(), 1);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
         ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
@@ -390,6 +413,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
         return 1;
 
     AddVectoredExceptionHandler(1, VectoredCrashHandler);
+    AddVectoredExceptionHandler(0, FinalCrashBackstop); // registered last: runs when nothing else handled
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         WriteCrashLog(ep);
         return EXCEPTION_EXECUTE_HANDLER;

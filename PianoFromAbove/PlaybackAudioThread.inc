@@ -389,11 +389,184 @@ void MainScreen::StopPlaybackAudioThread()
     m_dPlaybackAudioLastSpeed = 1.0;
 }
 
+void FreePlayScreen::StartFreePlayAudioThread()
+{
+    if (m_FreePlayAudioThread.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
+        m_bFreePlayAudioExit = false;
+    }
+    // Anchor the freeplay-time <-> QPC mapping so stamps produced by the frame
+    // loop line up with the audio thread's clock from the first tick.
+    m_llFreePlayAudioClockFpUs.store(m_llFreePlayTime, std::memory_order_relaxed);
+    m_llFreePlayAudioClockQpcUs.store((long long)PGFAQpcNow(), std::memory_order_relaxed);
+    m_FreePlayAudioThread = std::thread(&FreePlayScreen::FreePlayAudioThreadMain, this);
+}
+
+void FreePlayScreen::StopFreePlayAudioThread()
+{
+    if (m_FreePlayAudioThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
+            m_bFreePlayAudioExit = true;
+        }
+        m_FreePlayAudioCv.notify_all();
+        m_FreePlayAudioThread.join();
+    }
+    m_bFreePlayAudioExit = false;
+    m_dPlaybackAudioSchedulerHz.store(0.0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
+    m_qFreePlayAudio = decltype(m_qFreePlayAudio)();
+}
+
+long long FreePlayScreen::FpStampToQpcUs(long long fpUs) const
+{
+    const long long qpc = m_llFreePlayAudioClockQpcUs.load(std::memory_order_relaxed);
+    const long long fp = m_llFreePlayAudioClockFpUs.load(std::memory_order_relaxed);
+    return qpc + (fpUs - fp);
+}
+
+void FreePlayScreen::QueueFreePlayEvent(unsigned char status, unsigned char p1, unsigned char p2)
+{
+    QueueFreePlayEventAt(-1, status, p1, p2);
+}
+
+void FreePlayScreen::QueueFreePlayEventAt(long long llStampFpUs, unsigned char status, unsigned char p1, unsigned char p2)
+{
+    // Stamps in the past (or "now") go out immediately; future stamps are fired
+    // by the dispatch thread at their exact musical time.
+    unsigned long long due;
+    if (llStampFpUs < 0)
+        due = PGFAQpcNow();
+    else
+        due = (unsigned long long)(std::max)(FpStampToQpcUs(llStampFpUs), (long long)PGFAQpcNow());
+    {
+        std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
+        // Insane-burst guard: drop the soonest events rather than grow unbounded.
+        while (m_qFreePlayAudio.size() >= 16384)
+            m_qFreePlayAudio.pop();
+        m_qFreePlayAudio.push(ScheduledSend{ due,
+            (unsigned long)status | ((unsigned long)p1 << 8) | ((unsigned long)p2 << 16) });
+    }
+    m_FreePlayAudioCv.notify_one();
+}
+
+void FreePlayScreen::FreePlayAudioThreadMain()
+{
+    timeBeginPeriod(1);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    const uint64_t qpcFreq = PGFAQpcFrequency();
+    uint64_t hzStart = PGFAQpcNow();
+    uint64_t hzTicks = 0;
+    std::vector<unsigned long> batch;
+    batch.reserve(256);
+    // Keep the freeplay-time <-> QPC mapping current: both advance at real time.
+    long long mapFp = m_llFreePlayAudioClockFpUs.load(std::memory_order_relaxed);
+    uint64_t mapQpc = PGFAQpcNow();
+
+    // Calibrate the real wait granularity of this process. Timer resolution is
+    // ref-counted process-wide (Timer dtor calls timeEndPeriod) and Windows 11
+    // throttles it for background windows, so timed waits can round up to
+    // ~15.6 ms. Scheduled sends must not depend on that.
+    double waitGranUs = 15600.0;
+    {
+        std::unique_lock<std::mutex> lock(m_FreePlayAudioMutex);
+        const uint64_t calStart = PGFAQpcNow();
+        for (int i = 0; i < 4; i++)
+            m_FreePlayAudioCv.wait_for(lock, std::chrono::milliseconds(1));
+        waitGranUs = (double)(PGFAQpcNow() - calStart) * 1000000.0 / (double)qpcFreq / 4.0;
+        if (waitGranUs < 100.0)
+            waitGranUs = 100.0; // QPC jitter floor
+    }
+    const long long spinWindowUs = 2500;                       // final stretch: spin for exact timing
+    const long long sleepGuardUs = (long long)waitGranUs + spinWindowUs + 500;
+
+    bool exiting = false;
+    while (!exiting) {
+        ++hzTicks;
+
+        const uint64_t now = PGFAQpcNow();
+        if (now > mapQpc) {
+            mapFp += (long long)(now - mapQpc);
+            mapQpc = now;
+            m_llFreePlayAudioClockFpUs.store(mapFp, std::memory_order_relaxed);
+            m_llFreePlayAudioClockQpcUs.store((long long)mapQpc, std::memory_order_relaxed);
+        }
+
+        batch.clear();
+        unsigned long long nextDue = 0;
+        bool haveFuture = false;
+        {
+            std::unique_lock<std::mutex> lock(m_FreePlayAudioMutex);
+            exiting = m_bFreePlayAudioExit.load(std::memory_order_acquire);
+            // On exit, flush everything regardless of schedule.
+            const unsigned long long cutoff = exiting ? ~0ULL : now;
+            while (!m_qFreePlayAudio.empty() && m_qFreePlayAudio.top().dueQpcUs <= cutoff) {
+                batch.push_back(m_qFreePlayAudio.top().msg);
+                m_qFreePlayAudio.pop();
+            }
+            if (!m_qFreePlayAudio.empty()) {
+                nextDue = m_qFreePlayAudio.top().dueQpcUs;
+                haveFuture = true;
+            }
+        }
+
+        for (unsigned long msg : batch)
+            m_OutDevice.PlayEvent((unsigned char)(msg & 0xffu),
+                                  (unsigned char)((msg >> 8) & 0xffu),
+                                  (unsigned char)((msg >> 16) & 0xffu));
+
+        if (!exiting && haveFuture) {
+            // Hybrid precision wait: block in coarse slices while far from the
+            // deadline, then spin the final stretch so the fire time is exact
+            // no matter what the system timer resolution is.
+            for (;;) {
+                const long long remainUs = (long long)(nextDue - PGFAQpcNow());
+                if (remainUs <= spinWindowUs ||
+                    m_bFreePlayAudioExit.load(std::memory_order_acquire))
+                    break;
+                if (remainUs > sleepGuardUs) {
+                    std::unique_lock<std::mutex> lock(m_FreePlayAudioMutex);
+                    m_FreePlayAudioCv.wait_for(lock, std::chrono::milliseconds(
+                        (int)(std::min)((remainUs - sleepGuardUs) / 1000, (long long)4)));
+                } else {
+                    YieldProcessor();
+                }
+            }
+        } else if (!exiting) {
+            // Idle: heartbeat so pushes wake us instantly and the Audio FPS
+            // readout keeps updating like normal play's scheduler.
+            std::unique_lock<std::mutex> lock(m_FreePlayAudioMutex);
+            m_FreePlayAudioCv.wait_for(lock, std::chrono::milliseconds(1));
+        }
+
+        const uint64_t nowQpc = PGFAQpcNow();
+        if (nowQpc - hzStart >= qpcFreq / 2) {
+            const double elapsed = (double)(nowQpc - hzStart) / (double)qpcFreq;
+            m_dPlaybackAudioSchedulerHz.store(elapsed > 0.0 ? hzTicks / elapsed : 0.0,
+                std::memory_order_relaxed);
+            hzStart = nowQpc;
+            hzTicks = 0;
+        }
+    }
+}
+
 void MainScreen::PlaybackAudioSeek(long long songUs)
 {
     if (IsFreePlay())
         return;
     songUs = PGFAClampSongTime(songUs, GetMinTime(), GetMaxTime());
+    {
+        const long long prev = m_llPlaybackAudioClockUs.load(std::memory_order_relaxed);
+        if (prev - songUs > 500000LL || songUs - prev > 500000LL) {
+            char b[128];
+            sprintf_s(b, "clockjump:seekstore %.3fs -> %.3fs",
+                (double)prev / 1e6, (double)songUs / 1e6);
+            HeartbeatLog(b);
+        }
+    }
     m_llPlaybackAudioControlSongUs.store(songUs, std::memory_order_relaxed);
     m_llPlaybackAudioClockUs.store(songUs, std::memory_order_relaxed);
     m_uPlaybackAudioSeekSerial.fetch_add(1, std::memory_order_release);
@@ -469,6 +642,19 @@ void MainScreen::SyncPlaybackAudioThread(bool forceSeek)
         if (m_bPlaybackAudioControlInitialized && !forceSeek)
             anchor = PlaybackAudioClockNow();
         anchor = PGFAClampSongTime(anchor, GetMinTime(), GetMaxTime());
+        {
+            // Diagnostics: name any re-anchor that moves the scheduler position
+            // significantly without an explicit user seek.
+            const long long prevCtrl = m_llPlaybackAudioControlSongUs.load(std::memory_order_relaxed);
+            if (!forceSeek &&
+                (prevCtrl - anchor > 500000LL || anchor - prevCtrl > 500000LL)) {
+                char b[160];
+                sprintf_s(b, "clockjump:reanchor %.3fs -> %.3fs (paused=%d live=%d init=%d)",
+                    (double)prevCtrl / 1e6, (double)anchor / 1e6,
+                    (int)paused, (int)live, (int)m_bPlaybackAudioControlInitialized);
+                HeartbeatLog(b);
+            }
+        }
         m_llPlaybackAudioControlSongUs.store(anchor, std::memory_order_relaxed);
         if (forceSeek || (!m_bPlaybackAudioLastLive && live))
             m_uPlaybackAudioSeekSerial.fetch_add(1, std::memory_order_release);
@@ -729,10 +915,14 @@ GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
         return result;
     }
 
+    // Pause-state changes and seeks are independent events: the prewarm gate
+    // flipping GetPaused() must never shadow the seek notification, otherwise
+    // the scheduler keeps its pre-seek position and playback snaps back to it.
     if (!IsFreePlay() && wasPaused != nowPaused) {
         StartPlaybackAudioThread();
         SyncPlaybackAudioThread(false);
-    } else if (!IsFreePlay() && m_llStartTime != before) {
+    }
+    if (!IsFreePlay() && m_llStartTime != before) {
         StartPlaybackAudioThread();
         PlaybackAudioSeek(m_llStartTime);
     }
@@ -751,9 +941,21 @@ GameState::GameError MainScreen::Logic(void)
 
     // For live synth playback the audio QPC clock is authoritative, including the exact pause
     // position. Resetting the legacy frame timer here prevents its old FPS-based elapsed step
-    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering) {
+    // Adoption is skipped while paused/gate-held: a frozen visual must never be dragged by a
+    // stale or reset scheduler clock (that presented as the song snapping back).
+    if (m_bPlaybackAudioLiveEnabled.load(std::memory_order_acquire) && !g_bVideoRendering &&
+        !Config::GetConfig().GetPlaybackSettings().GetPaused()) {
         const long long audioClock = PlaybackAudioClockNow();
         if (audioClock >= GetMinTime() && audioClock <= GetMaxTime()) {
+            // Diagnostics: a large jump adopted from the scheduler clock means the
+            // audio-side position reset unexpectedly (seek/anchor bug), which
+            // presents as the song snapping back to an earlier moment.
+            if (audioClock - m_llStartTime > 500000LL || m_llStartTime - audioClock > 500000LL) {
+                char b[128];
+                sprintf_s(b, "clockjump:live %.3fs -> %.3fs",
+                    (double)m_llStartTime / 1e6, (double)audioClock / 1e6);
+                HeartbeatLog(b);
+            }
             m_llStartTime = audioClock;
             m_llDisplayTime = audioClock;
             m_Timer.Start();

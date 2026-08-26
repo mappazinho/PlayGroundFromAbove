@@ -776,6 +776,11 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         const size_t startIdx = total - noteLimit;
         const size_t batchSize = MaxNotesPerPass;
 
+        // Chunk bakes earlier this frame left m_pNoteBuffer bound as input;
+        // unbind so the DISCARD maps below can rename safely.
+        ID3D11ShaderResourceView* nullNoteSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
+        m_pContext->VSSetShaderResources(0, 4, nullNoteSRVs);
+
         for (size_t i = startIdx; i < total; i += batchSize) {
             if (i == startIdx)
                 SetPipeline(Pipeline::Note);
@@ -1523,6 +1528,11 @@ void D3D11Renderer::DrawPianoRollStrip() {
 
     // The note buffer is still mapped (single DISCARD per frame); write the
     // decimated strip notes after the main batches in the same region.
+    // Unbind any lingering note-buffer SRV so DISCARD can rename.
+    {
+        ID3D11ShaderResourceView* nullStripSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
+        m_pContext->VSSetShaderResources(0, 4, nullStripSRVs);
+    }
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_pContext->Map(m_pNoteBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
         return;
@@ -1637,6 +1647,12 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
     FixedSizeConstants chunkFixed;
     ImageBufferBuildChunkFixed(chunkFixed);
 
+    // WRITE_DISCARD on m_pNoteBuffer cannot rename while a view of it is still
+    // bound as shader input (previous bake/fallback/strip pass leaves it
+    // bound), which corrupts or fails the update - unbind first.
+    ID3D11ShaderResourceView* nullNoteSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
+    m_pContext->VSSetShaderResources(0, 4, nullNoteSRVs);
+
     for (const auto& req : m_vChunkBuilds) {
         if (ImageBufferGetChunkSlot(req.chunk) >= 0)
             continue; // already baked this frame
@@ -1685,6 +1701,9 @@ HRESULT D3D11Renderer::RenderImageBuffer() {
             ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pChunkFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pNoteSRV.Get() };
             m_pContext->VSSetShaderResources(0, 4, bindSRVs);
             m_pContext->DrawIndexed((UINT)req.noteCount * 6, 0, 0);
+            // Leave the note buffer unbound so the next iteration's DISCARD map
+            // (and any later pass) can rename it safely.
+            m_pContext->VSSetShaderResources(0, 4, nullNoteSRVs);
         }
 
         ImageBufferMarkBaked(slot, req.chunk);
