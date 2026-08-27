@@ -37,7 +37,6 @@ struct ImageBufferPrewarmGpuState {
     bool hugeMode = false;
     uint64_t hugeSignature = 0;
     bool playRequested = false;
-    bool wakeIssued = false;
     size_t cached = 0;
     size_t total = 0;
     size_t cpuPrepared = 0;
@@ -1173,6 +1172,9 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
     if (!viz.bSysStats || g_bVideoRendering)
         return;
 
+    if (Config::GetConfig().GetPlaybackSettings().GetPlayMode() == GameState::Splash)
+        return;
+
     const MainScreen* statsScreen = dynamic_cast<const MainScreen*>(g_pGameState);
     const float bounceScale = statsScreen ? statsScreen->GetStatsBounceScaleForOverlay() : 1.0f;
 
@@ -1343,8 +1345,6 @@ VOID ImageBufferPrewarmPlaybackRequested(BOOL bPlaying)
             s_ImageBufferPrewarmGpu.cpuTotal = 0;
             s_ImageBufferPrewarmGpu.chunks.clear();
         }
-        if (ownerChanged || !cpu.initialized)
-            s_ImageBufferPrewarmGpu.wakeIssued = false;
         s_ImageBufferPrewarmGpu.playRequested = true;
     }
     {
@@ -1381,7 +1381,6 @@ VOID ImageBufferPrewarmRestartAfterSeek(BOOL bInvalidateData)
         s_ImageBufferPrewarmGpu.cpuPrepared = 0;
         s_ImageBufferPrewarmGpu.cpuTotal = 0;
         s_ImageBufferPrewarmGpu.chunks.clear();
-        s_ImageBufferPrewarmGpu.wakeIssued = false;
         s_ImageBufferPrewarmGpu.restartKeepReady = !bInvalidateData;
         s_ImageBufferPrewarmGpu.playRequested = true;
     }
@@ -1429,7 +1428,6 @@ BOOL ImageBufferPrewarmPlaybackHold()
         return FALSE;
     }
 
-    Renderer* wakeRenderer = nullptr;
     {
         std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
         if (!s_ImageBufferPrewarmGpu.playRequested) {
@@ -1454,23 +1452,8 @@ BOOL ImageBufferPrewarmPlaybackHold()
             s_ImageBufferPrewarmGpu.cpuPrepared = 0;
             s_ImageBufferPrewarmGpu.cpuTotal = 0;
             s_ImageBufferPrewarmGpu.chunks.clear();
-            s_ImageBufferPrewarmGpu.wakeIssued = false;
             TrackGateState(9, b);
         }
-
-        // The explicit frame-start kick is primary. Keep this invalidation as a one-shot nudge for
-        // already-cached renderers, but prewarm no longer depends on a subsequent visible CollectChunk
-        if (!s_ImageBufferPrewarmGpu.initialized &&
-            !s_ImageBufferPrewarmGpu.wakeIssued &&
-            s_ImageBufferPrewarmGpu.renderer) {
-            s_ImageBufferPrewarmGpu.wakeIssued = true;
-            wakeRenderer = s_ImageBufferPrewarmGpu.renderer;
-        }
-    }
-    if (wakeRenderer) {
-        wakeRenderer->ImageBufferInvalidate();
-        TrackGateState(3, "prewarm:hold(wake-nudge)");
-        return TRUE;
     }
 
     if (ImageBufferPreparedShouldHoldPlayback(screen)) {

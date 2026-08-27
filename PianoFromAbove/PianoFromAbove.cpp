@@ -13,6 +13,7 @@
 #include <Shlobj.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <wincodec.h>
 #pragma comment(lib, "dbghelp.lib")
 #include <ctime>
 #include <shlwapi.h>
@@ -46,6 +47,79 @@ HWND g_hWnd = NULL;
 HWND g_hWndGfx = NULL;
 bool g_bGfxDestroyed = false;
 GameState* g_pGameState = nullptr;
+
+// The UI now ships one small PNG rather than a legacy multi-image .ico.  WIC
+// turns the embedded PNG into the window icon at startup, so the executable
+// and taskbar use the same source asset as the ImGui-focused UI.
+static HICON LoadApplicationIconFromPNG(HINSTANCE hInstance)
+{
+    HRSRC resource = FindResourceW(hInstance, MAKEINTRESOURCEW(IDR_APPICON_PNG), RT_RCDATA);
+    if (!resource)
+        return NULL;
+    HGLOBAL resourceData = LoadResource(hInstance, resource);
+    const DWORD resourceSize = SizeofResource(hInstance, resource);
+    const BYTE* pngData = static_cast<const BYTE*>(LockResource(resourceData));
+    if (!pngData || resourceSize == 0)
+        return NULL;
+
+    IStream* stream = SHCreateMemStream(pngData, resourceSize);
+    if (!stream)
+        return NULL;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HICON icon = NULL;
+
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromStream(stream, NULL, WICDecodeMetadataCacheOnLoad, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) &&
+        SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+        SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                                        WICBitmapDitherTypeNone, NULL, 0.0,
+                                        WICBitmapPaletteTypeCustom))) {
+        UINT width = 0, height = 0;
+        if (SUCCEEDED(converter->GetSize(&width, &height)) && width > 0 && height > 0) {
+            std::vector<BYTE> pixels((size_t)width * height * 4);
+            if (SUCCEEDED(converter->CopyPixels(NULL, width * 4, (UINT)pixels.size(), pixels.data()))) {
+                BITMAPV5HEADER bitmap = {};
+                bitmap.bV5Size = sizeof(bitmap);
+                bitmap.bV5Width = (LONG)width;
+                bitmap.bV5Height = -(LONG)height;
+                bitmap.bV5Planes = 1;
+                bitmap.bV5BitCount = 32;
+                bitmap.bV5Compression = BI_BITFIELDS;
+                bitmap.bV5RedMask = 0x00FF0000;
+                bitmap.bV5GreenMask = 0x0000FF00;
+                bitmap.bV5BlueMask = 0x000000FF;
+                bitmap.bV5AlphaMask = 0xFF000000;
+                void* iconPixels = nullptr;
+                HBITMAP color = CreateDIBSection(NULL, reinterpret_cast<BITMAPINFO*>(&bitmap),
+                                                  DIB_RGB_COLORS, &iconPixels, NULL, 0);
+                HBITMAP mask = CreateBitmap((int)width, (int)height, 1, 1, NULL);
+                if (color && mask && iconPixels) {
+                    memcpy(iconPixels, pixels.data(), pixels.size());
+                    ICONINFO iconInfo = {};
+                    iconInfo.fIcon = TRUE;
+                    iconInfo.hbmColor = color;
+                    iconInfo.hbmMask = mask;
+                    icon = CreateIconIndirect(&iconInfo);
+                }
+                if (color) DeleteObject(color);
+                if (mask) DeleteObject(mask);
+            }
+        }
+    }
+
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    stream->Release();
+    return icon;
+}
 
 void HeartbeatLog(const char* tag) {
     if (!g_bLoggingEnabled.load(std::memory_order_relaxed))
@@ -439,13 +513,14 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     wc.cbClsExtra = 0L;
     wc.cbWndExtra = 0L;
     wc.hInstance = hInstance;
-    wc.hIcon = LoadIcon( hInstance, MAKEINTRESOURCE( IDI_PFAICON ) );
+    HICON applicationIcon = LoadApplicationIconFromPNG(hInstance);
+    wc.hIcon = applicationIcon ? applicationIcon : LoadIcon(NULL, IDI_APPLICATION);
     wc.hCursor = LoadCursor( NULL, IDC_ARROW );
     // Window is only a container... never seen, thus null brush
     wc.hbrBackground = NULL; //( HBRUSH )GetStockObject( NULL_BRUSH );
     wc.lpszMenuName = NULL;
     wc.lpszClassName = CLASSNAME;
-    wc.hIconSm = NULL;
+    wc.hIconSm = wc.hIcon;
     if ( !RegisterClassEx( &wc ) )
         return 1;
 

@@ -399,22 +399,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="Images\mediaiconssmall.bmp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="Images\PFA Icon.ico">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="Images\Mirror Small.bmp">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="images\Welcome.ico">
-      <Filter>Resource Files</Filter>
-    </None>
     <None Include="Images\Godowsky - Study of Chopin Etude Op. 10, No. 1.mid">
       <Filter>Resource Files</Filter>
     </None>
-    <None Include="Images\Lock.bmp">
+    <None Include="Images\icon16x16.png">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="common.hlsli">

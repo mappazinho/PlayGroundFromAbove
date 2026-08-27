@@ -12,11 +12,24 @@
 #include <TChar.h>
 
 #include <fstream>
+#include <algorithm>
+#include <mutex>
 using namespace std;
 
 #include "Config.h"
 #include "Misc.h"
 #include "Globals.h"
+
+namespace {
+constexpr size_t RecentMIDILimit = 10;
+std::mutex g_RecentMIDIsMutex;
+
+bool SameRecentMIDIPath(const std::wstring& left, const std::wstring& right)
+{
+    return CompareStringOrdinal(left.c_str(), (int)left.size(),
+        right.c_str(), (int)right.size(), TRUE) == CSTR_EQUAL;
+}
+}
 // Main Config class
 
 Config &Config::GetConfig()
@@ -232,6 +245,7 @@ void VizSettings::LoadDefaultValues() {
     this->bNerdStats = false;
     this->bSysStats = false;
     this->sSplashMIDI = L"";
+    this->vRecentMIDIs.clear();
     this->bVisualizePitchBends = false;
     this->bDualPianoRoll = false;
     this->bHorizontalPianoRoll = false;
@@ -286,6 +300,27 @@ void VizSettings::LoadDefaultValues() {
     this->bRenderShowPreview = true;
     this->bRenderAdvanced = false;
     this->sRenderAdvancedOptions = L"";
+}
+
+void VizSettings::AddRecentMIDI(const std::wstring& path)
+{
+    if (path.empty())
+        return;
+
+    std::lock_guard<std::mutex> lock(g_RecentMIDIsMutex);
+    const auto existing = std::find_if(vRecentMIDIs.begin(), vRecentMIDIs.end(),
+        [&](const std::wstring& entry) { return SameRecentMIDIPath(entry, path); });
+    if (existing != vRecentMIDIs.end())
+        vRecentMIDIs.erase(existing);
+    vRecentMIDIs.insert(vRecentMIDIs.begin(), path);
+    if (vRecentMIDIs.size() > RecentMIDILimit)
+        vRecentMIDIs.resize(RecentMIDILimit);
+}
+
+std::vector<std::wstring> VizSettings::GetRecentMIDIs() const
+{
+    std::lock_guard<std::mutex> lock(g_RecentMIDIsMutex);
+    return vRecentMIDIs;
 }
 
 void AudioSettings::LoadMIDIDevices()
@@ -558,6 +593,26 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
     std::string sTempStr;
     txViz->QueryStringAttribute("SplashMIDI", &sTempStr);
     sSplashMIDI = Util::StringToWstring(sTempStr);
+    {
+        std::vector<std::wstring> recentMIDIs;
+        if (TiXmlElement* txRecent = txViz->FirstChildElement("RecentMIDIs")) {
+            for (TiXmlElement* txMIDI = txRecent->FirstChildElement("MIDI"); txMIDI;
+                 txMIDI = txMIDI->NextSiblingElement("MIDI")) {
+                const char* path = txMIDI->Attribute("Path");
+                if (!path || !*path)
+                    continue;
+                const std::wstring recentPath = Util::StringToWstring(path);
+                const bool duplicate = std::any_of(recentMIDIs.begin(), recentMIDIs.end(),
+                    [&](const std::wstring& entry) { return SameRecentMIDIPath(entry, recentPath); });
+                if (!duplicate)
+                    recentMIDIs.push_back(recentPath);
+                if (recentMIDIs.size() == RecentMIDILimit)
+                    break;
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_RecentMIDIsMutex);
+        vRecentMIDIs = std::move(recentMIDIs);
+    }
     sTempStr = "";
     txViz->QueryStringAttribute("Background", &sTempStr);
     sBackground = Util::StringToWstring(sTempStr);
@@ -784,6 +839,16 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("NerdStats", bNerdStats);
     txViz->SetAttribute("SysStats", bSysStats);
     txViz->SetAttribute("SplashMIDI", Util::WstringToString(sSplashMIDI));
+    const std::vector<std::wstring> recentMIDIs = GetRecentMIDIs();
+    if (!recentMIDIs.empty()) {
+        TiXmlElement* txRecent = new TiXmlElement("RecentMIDIs");
+        txViz->LinkEndChild(txRecent);
+        for (const std::wstring& path : recentMIDIs) {
+            TiXmlElement* txMIDI = new TiXmlElement("MIDI");
+            txRecent->LinkEndChild(txMIDI);
+            txMIDI->SetAttribute("Path", Util::WstringToString(path));
+        }
+    }
     txViz->SetAttribute("VisualizePitchBends", bVisualizePitchBends);
     txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);
     txViz->SetAttribute("HorizontalPianoRoll", bHorizontalPianoRoll);

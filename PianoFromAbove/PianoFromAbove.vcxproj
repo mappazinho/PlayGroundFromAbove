@@ -121,7 +121,7 @@
     <LibraryPath>$(DXSDK_DIR)Lib\x86;C:\Users\Pantano\Dev\protobuf-2.5.0\vsprojects\Release;$(LibraryPath)</LibraryPath>
     <TargetName>PFA-1.1.0viz-x86</TargetName>
   </PropertyGroup>
-<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(ProjectDir);$(IncludePath)</IncludePath>
     <LibraryPath>$(ProjectDir)lzma\lib;$(ProjectDir)freetype\lib;$(ProjectDir)bassmidi\lib;$(ProjectDir)sdl2;$(LibraryPath)</LibraryPath>
@@ -235,7 +235,7 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalOptions>/clang:-Ofast %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/clang:-O3 /clang:-ffast-math %(AdditionalOptions)</AdditionalOptions>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
@@ -418,11 +418,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Images\Godowsky - Study of Chopin Etude Op. 10, No. 1.mid" />
-    <None Include="Images\Lock.bmp" />
-    <None Include="Images\Mirror Small.bmp" />
-    <None Include="Images\PFA Icon.ico" />
-    <None Include="Images\mediaiconssmall.bmp" />
-    <None Include="images\Welcome.ico" />
+    <None Include="Images\icon16x16.png" />
     <None Include="common.hlsli" />
   </ItemGroup>
   <ItemGroup>

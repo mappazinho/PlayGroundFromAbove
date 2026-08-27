@@ -1050,6 +1050,12 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     }
                     ImGui::SameLine();
                     ImGui::Checkbox("Color Loop", &viz.bColorLoop);
+                    {
+                        float bkg[3];
+                        unpackCol(vs.iBkgColor, bkg);
+                        if (ImGui::ColorEdit3("Background", bkg))
+                            vs.iBkgColor = packColor(bkg);
+                    }
                     ImGui::Separator();
                     if (ImGui::Button("Import config.xml...")) {
                         OPENFILENAMEA ofn = {};
@@ -1363,7 +1369,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
           ImGui::SameLine();
           if (ImGui::Button("Generate palette"))
               PGFAGenerateGuiPalette(viz, base);
-          ImGui::TextDisabled("Generates a dark UI palette around one hue; individual colors remain editable below.");
+          ImGui::TextDisabled("The palette base color also tints the Recent MIDIs splash card.");
           ImGui::Separator();
 
           if (viz.vGUIColors.size() != ImGuiCol_COUNT)

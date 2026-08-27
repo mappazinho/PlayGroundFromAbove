@@ -113,6 +113,7 @@ private:
     void RenderGlobals();
     void RenderNotes();
     void RenderNote(MIDIChannelEvent pNote);
+    void RenderOverlay();
     float GetNoteX( int iNote );
     void GenNoteXTable();
 

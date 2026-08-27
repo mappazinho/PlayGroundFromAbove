@@ -207,6 +207,8 @@ struct VizSettings : public ISettings {
     void LoadDefaultValues();
     void LoadConfigValues(TiXmlElement* txRoot);
     bool SaveConfigValues(TiXmlElement* txRoot);
+    void AddRecentMIDI(const std::wstring& path);
+    std::vector<std::wstring> GetRecentMIDIs() const;
 
     bool bTickBased;
     bool bShowMarkers;
@@ -214,6 +216,7 @@ struct VizSettings : public ISettings {
     bool bNerdStats;
     bool bSysStats;
     std::wstring sSplashMIDI;
+    std::vector<std::wstring> vRecentMIDIs;
     bool bVisualizePitchBends;
     bool bDualPianoRoll;
     bool bHorizontalPianoRoll;

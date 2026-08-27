@@ -638,8 +638,13 @@ void MainScreen::SyncPlaybackAudioThread(bool forceSeek)
         std::fabs(speed - m_dPlaybackAudioLastSpeed) > 1e-9;
 
     if (controlChanged) {
+        // Pause and resume must retain the visual clock exactly.  The worker's
+        // last published sample can be old while it is blocked in a device
+        // call, so using it as the anchor here made a resume visibly rewind.
+        const bool pauseStateChanged = m_bPlaybackAudioControlInitialized &&
+            paused != m_bPlaybackAudioLastPaused;
         long long anchor = m_llStartTime;
-        if (m_bPlaybackAudioControlInitialized && !forceSeek)
+        if (m_bPlaybackAudioControlInitialized && !forceSeek && !pauseStateChanged)
             anchor = PlaybackAudioClockNow();
         anchor = PGFAClampSongTime(anchor, GetMinTime(), GetMaxTime());
         {
@@ -656,6 +661,11 @@ void MainScreen::SyncPlaybackAudioThread(bool forceSeek)
             }
         }
         m_llPlaybackAudioControlSongUs.store(anchor, std::memory_order_relaxed);
+        // The game thread may sample the clock before the worker observes the
+        // new control serial.  Publish pause/resume anchors immediately so
+        // that sample cannot reintroduce the stale position we just rejected.
+        if (forceSeek || pauseStateChanged)
+            m_llPlaybackAudioClockUs.store(anchor, std::memory_order_release);
         if (forceSeek || (!m_bPlaybackAudioLastLive && live))
             m_uPlaybackAudioSeekSerial.fetch_add(1, std::memory_order_release);
         m_uPlaybackAudioControlSerial.fetch_add(1, std::memory_order_release);

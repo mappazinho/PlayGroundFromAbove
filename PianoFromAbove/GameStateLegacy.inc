@@ -786,6 +786,9 @@ void SplashScreen::SetChannelSettings( const vector< bool > &, const vector< boo
     }
 }
 
+static bool SplashRecentMIDIHitTest(Renderer* renderer, const std::vector<std::wstring>& recentMIDIs,
+                                    int mouseX, int mouseY, size_t& recentIndex);
+
 GameState::GameError SplashScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM lParam )
 {
     static Config &config = Config::GetConfig();
@@ -824,6 +827,22 @@ GameState::GameError SplashScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARA
                     return Success;
             }
         }
+        case WM_LBUTTONUP:
+        {
+            const std::vector<std::wstring> recentMIDIs = cViz.GetRecentMIDIs();
+            size_t recentIndex = 0;
+            if (SplashRecentMIDIHitTest(m_pRenderer, recentMIDIs,
+                (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam), recentIndex)) {
+                // Parsing/loading changes window state, so hand it back to the
+                // UI thread instead of doing it while the splash renderer owns
+                // this frame.
+                std::wstring* selectedPath = new std::wstring(recentMIDIs[recentIndex]);
+                if (!PostMessageW(g_hWnd, WM_RECENT_MIDI_OPEN, 0, (LPARAM)selectedPath))
+                    delete selectedPath;
+                return Success;
+            }
+            break;
+        }
     }
 
     return Success;
@@ -837,6 +856,8 @@ static unsigned s_dFileChans = 0;
 static long long s_llFedUs = 0;         // total time fed into the SDL queue
 static double s_dFeedFrac = 0.0;        // fractional frame remainder between feeds
 static bool s_bCustomEof = false;       // decoder reported end of file (BASS_ERROR_ENDED)
+static double s_dResampleFrac = 0.0;    // fractional frame accumulator for resampling
+static double s_dFilePosUs = 0.0;       // file-time position in microseconds (for WAV recording)
 
 static void CustomAudioStop()
 {
@@ -856,6 +877,8 @@ static void CustomAudioStop()
     s_llFedUs = 0;
     s_dFeedFrac = 0.0;
     s_bCustomEof = false;
+    s_dResampleFrac = 0.0;
+    s_dFilePosUs = 0.0;
     CustomWavStop();
 }
 
@@ -1005,7 +1028,7 @@ static HSTREAM CustomAudioOpen(const wstring &sFile)
 }
 
 static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long long llFirstNoteUs,
-                              bool bPaused, bool bMute, double dVolume)
+                              bool bPaused, bool bMute, double dVolume, double dSpeed)
 {
     static auto s_tLog = std::chrono::steady_clock::now();
     auto tNow = std::chrono::steady_clock::now();
@@ -1045,8 +1068,9 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
 
     long long llTargetUs = min(llAudioUs, (long long)dFileEndUs);
     double dPlayedUs = (double)s_llFedUs - dQueuedUs;
+    double dTargetAudioUs = dSpeed != 1.0 ? llTargetUs / dSpeed : (double)llTargetUs;
 
-    if ((s_bCustomEof && dQueuedUs <= 0.0) || fabs(dPlayedUs - llTargetUs) > 250000.0)
+    if ((s_bCustomEof && dQueuedUs <= 0.0) || fabs(dPlayedUs - dTargetAudioUs) > 250000.0)
     {
         // Rewind only when there is still audio before the end to rewind to;
         // otherwise the stream genuinely ended and the hold below pauses it.
@@ -1054,8 +1078,10 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
         {
             SDL_ClearQueuedAudio(s_hCustomSdl);
             BASS_ChannelSetPosition(s_hCustomAudio, BASS_ChannelSeconds2Bytes(s_hCustomAudio, llTargetUs / 1e6), BASS_POS_BYTE);
-            s_llFedUs = llTargetUs;
+            s_llFedUs = (long long)((double)llTargetUs / dSpeed);
             s_dFeedFrac = 0.0;
+            s_dResampleFrac = 0.0;
+            s_dFilePosUs = (double)llTargetUs;
             s_bCustomEof = false; // a seek can restart decoding past the previous end
             if (bLog) PRE_DbgLog("CUSTOM resync target=%.2f played=%.2f eof=%d", (double)llTargetUs / 1e6, dPlayedUs / 1e6, (int)s_bCustomEof);
         }
@@ -1079,10 +1105,10 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
     const double kRefillBelowUs = 40000.0;
     if (dQueuedUs < kRefillBelowUs)
     {
-        long long llWantUs = llTargetUs + kKeepAheadUs - s_llFedUs;
+        long long llWantUs = (long long)((double)llTargetUs / dSpeed) + kKeepAheadUs - s_llFedUs;
         if (llWantUs > 0)
         {
-            double dFrames = min((double)llWantUs / 1e6 * s_dFileRate, 0.25 * s_dFileRate) + s_dFeedFrac;
+            double dFrames = min((double)llWantUs / 1e6 * s_dFileRate * dSpeed, 0.25 * s_dFileRate * dSpeed) + s_dFeedFrac;
             int nFrames = (int)dFrames;
             s_dFeedFrac = dFrames - nFrames;
             if (nFrames > 0)
@@ -1106,13 +1132,42 @@ static void CustomAudioUpdate(const wstring &sFile, long long llSongUs, long lon
                         CustomWavStart(s_sCustomWavPath.c_str());
                     if (s_pCustomWav)
                     {
-                        long long llStartUs = s_llFedUs - (long long)((double)nGotFrames / s_dFileRate * 1e6);
-                        long long llFrame = (long long)((double)(llStartUs + 3000000) / 1e6 * s_dFileRate + 0.5);
+                        long long llFrame = (long long)((s_dFilePosUs + 3000000.0) / 1e6 * s_dFileRate + 0.5);
                         CustomWavWriteFrames(llFrame, s_pBuf.data(), (int)nGotFrames);
                     }
-                    SDL_QueueAudio(s_hCustomSdl, s_pBuf.data(), (Uint32)(nGotFrames * s_dFileChans * sizeof(float)));
+                    // Resample to match playback speed, then queue to SDL.
+                    // Linear interpolation: same technique as the prerender resampler (MIDIAudio.cpp).
+                    if (dSpeed != 1.0)
+                    {
+                        static std::vector<float> s_pResampled;
+                        double dOutFrames = (double)nGotFrames / dSpeed + s_dResampleFrac;
+                        size_t nOutFrames = (size_t)dOutFrames;
+                        s_dResampleFrac = dOutFrames - nOutFrames;
+                        if (nOutFrames < 1) nOutFrames = 1;
+                        s_pResampled.resize(nOutFrames * s_dFileChans);
+                        for (size_t o = 0; o < nOutFrames; o++)
+                        {
+                            double p = (double)o * dSpeed + 0.0; // source position
+                            int i0 = (int)floor(p);
+                            double w = p - (double)i0;
+                            if (i0 >= (int)nGotFrames - 1) { i0 = (int)nGotFrames - 2; w = 1.0; }
+                            if (i0 < 0) { i0 = 0; w = 0.0; }
+                            for (unsigned c = 0; c < s_dFileChans; c++)
+                            {
+                                s_pResampled[o * s_dFileChans + c] = (float)(
+                                    s_pBuf[i0 * s_dFileChans + c] * (1.0 - w) +
+                                    s_pBuf[(i0 + 1) * s_dFileChans + c] * w);
+                            }
+                        }
+                        SDL_QueueAudio(s_hCustomSdl, s_pResampled.data(), (Uint32)(nOutFrames * s_dFileChans * sizeof(float)));
+                    }
+                    else
+                    {
+                        SDL_QueueAudio(s_hCustomSdl, s_pBuf.data(), (Uint32)(nGotFrames * s_dFileChans * sizeof(float)));
+                    }
                 }
-                s_llFedUs += (long long)((double)nGotFrames / s_dFileRate * 1e6);
+                s_dFilePosUs += (double)nGotFrames / s_dFileRate * 1e6;
+                s_llFedUs += (long long)((double)nGotFrames / (dSpeed * s_dFileRate) * 1e6);
                 if (bLog) PRE_DbgLog("CUSTOM run song=%.2f target=%.2f fed=%.2f queued=%.2f nGotF=%zu err=%d", (double)llSongUs / 1e6, (double)llTargetUs / 1e6, (double)s_llFedUs / 1e6, dQueuedUs / 1e6, nGotFrames, (int)BASS_ErrorGetCode());
             }
         }
@@ -1427,6 +1482,201 @@ void SplashScreen::UpdateState(int iPos)
 
 const float SplashScreen::SharpRatio = 0.65f;
 
+struct SplashRecentMIDILayout {
+    float scale = 1.0f;
+    float headerH = 0.0f;
+    float rowH = 0.0f;
+    float panelLeft = 0.0f;
+    float panelTop = 0.0f;
+    float panelRight = 0.0f;
+    float panelBottom = 0.0f;
+    float rowLeft = 0.0f;
+    float rowRight = 0.0f;
+    float rowTop = 0.0f;
+    size_t visibleRows = 0;
+};
+
+static bool GetSplashRecentMIDILayout(
+    Renderer* renderer, size_t recentCount, SplashRecentMIDILayout& layout)
+{
+    if (!renderer)
+        return false;
+
+    const float screenW = (float)renderer->GetBufferWidth();
+    const float screenH = (float)renderer->GetBufferHeight();
+    layout.scale = (std::min)((std::max)(Config::GetConfig().GetVizSettings().fUIScale, 0.75f), 1.50f);
+    const float margin = 20.0f * layout.scale;
+    if (screenW < 280.0f * layout.scale || screenH < 180.0f * layout.scale)
+        return false;
+
+    layout.headerH = 40.0f * layout.scale;
+    layout.rowH = 27.0f * layout.scale;
+    const float availableRows = floorf((screenH - margin * 2.0f - layout.headerH - 10.0f * layout.scale) / layout.rowH);
+    if (availableRows < 1.0f)
+        return false;
+
+    const size_t requestedRows = (std::max)((size_t)1, recentCount);
+    layout.visibleRows = (std::min)(requestedRows, (size_t)availableRows);
+    const float panelW = (std::min)(360.0f * layout.scale, screenW - margin * 2.0f);
+    const float panelH = layout.headerH + layout.rowH * layout.visibleRows + 10.0f * layout.scale;
+    layout.panelRight = screenW - margin;
+    layout.panelBottom = screenH - margin;
+    layout.panelLeft = layout.panelRight - panelW;
+    layout.panelTop = layout.panelBottom - panelH;
+    layout.rowLeft = layout.panelLeft + 12.0f * layout.scale;
+    layout.rowRight = layout.panelRight - 12.0f * layout.scale;
+    layout.rowTop = layout.panelTop + layout.headerH + 5.0f * layout.scale;
+    return true;
+}
+
+static bool SplashRecentMIDIHitTest(Renderer* renderer, const std::vector<std::wstring>& recentMIDIs,
+                                    int mouseX, int mouseY, size_t& recentIndex)
+{
+    SplashRecentMIDILayout layout;
+    if (recentMIDIs.empty() || !GetSplashRecentMIDILayout(renderer, recentMIDIs.size(), layout))
+        return false;
+    if (mouseX < layout.rowLeft || mouseX > layout.rowRight || mouseY < layout.rowTop)
+        return false;
+
+    const size_t index = (size_t)((mouseY - layout.rowTop) / layout.rowH);
+    if (index >= layout.visibleRows || index >= recentMIDIs.size())
+        return false;
+    if (mouseY > layout.rowTop + layout.rowH * index + layout.rowH - 3.0f * layout.scale)
+        return false;
+    recentIndex = index;
+    return true;
+}
+
+static std::string SplashRecentMIDIName(const std::wstring& path)
+{
+    const size_t filenameStart = path.find_last_of(L"\\/");
+    std::wstring name = filenameStart == std::wstring::npos
+        ? path : path.substr(filenameStart + 1);
+    if (name.empty())
+        name = path;
+
+    static constexpr size_t kMaxNameLength = 42;
+    if (name.length() > kMaxNameLength) {
+        const size_t extensionStart = name.find_last_of(L'.');
+        const std::wstring extension = extensionStart == std::wstring::npos
+            ? L"" : name.substr(extensionStart);
+        const size_t prefixLength = extension.length() + 3 < kMaxNameLength
+            ? kMaxNameLength - extension.length() - 3 : kMaxNameLength - 3;
+        name = name.substr(0, prefixLength) + L"..." + extension;
+    }
+    return std::string(Util::WstringToString(name));
+}
+
+void SplashScreen::RenderOverlay()
+{
+    ImDrawList* draw = m_pRenderer ? m_pRenderer->GetDrawList() : nullptr;
+    ImFont* font = ImGui::GetFont();
+    if (!draw || !font)
+        return;
+
+    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    const float screenH = (float)m_pRenderer->GetBufferHeight();
+    const float scale = (std::min)((std::max)(viz.fUIScale, 0.75f), 1.50f);
+    const float margin = 20.0f * scale;
+
+    // A soft, breathing wordmark keeps the splash feeling alive without competing
+    // with the falling notes.
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const float breath = 0.5f + 0.5f * sinf((float)seconds * 0.82f);
+    const int wordmarkAlpha = (int)(75.0f + 110.0f * breath);
+    const float wordmarkSize = 27.0f * scale;
+    const ImVec2 wordmarkPos(margin, (std::max)(6.0f * scale, screenH - margin - wordmarkSize));
+    draw->AddText(font, wordmarkSize, ImVec2(wordmarkPos.x + 1.0f * scale, wordmarkPos.y + 2.0f * scale),
+        IM_COL32(0, 0, 0, wordmarkAlpha / 2), "PlayGroundFromAbove");
+    draw->AddText(font, wordmarkSize, wordmarkPos,
+        IM_COL32(223, 241, 255, wordmarkAlpha), "PlayGroundFromAbove");
+
+    SplashRecentMIDILayout layout;
+    const std::vector<std::wstring> recentMIDIs = viz.GetRecentMIDIs();
+    if (!GetSplashRecentMIDILayout(m_pRenderer, recentMIDIs.size(), layout))
+        return;
+
+    const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(viz.uGUIPaletteBase);
+    const auto accentColor = [&accent](float mix, int alpha) {
+        const float baseR = 9.0f, baseG = 17.0f, baseB = 30.0f;
+        return IM_COL32(
+            (int)(baseR + (accent.x * 255.0f - baseR) * mix + 0.5f),
+            (int)(baseG + (accent.y * 255.0f - baseG) * mix + 0.5f),
+            (int)(baseB + (accent.z * 255.0f - baseB) * mix + 0.5f), alpha);
+    };
+
+    const float rounding = 9.0f * layout.scale;
+    const float panelLeft = layout.panelLeft;
+    const float panelTop = layout.panelTop;
+    const float panelRight = layout.panelRight;
+    const float panelBottom = layout.panelBottom;
+    const float headerH = layout.headerH;
+
+    // A high-contrast card keeps filenames clear over the animated splash notes.
+    draw->AddRectFilled(ImVec2(panelLeft + 3.0f * scale, panelTop + 5.0f * scale),
+        ImVec2(panelRight + 3.0f * scale, panelBottom + 5.0f * scale),
+        IM_COL32(0, 0, 0, 92), rounding);
+    draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+        accentColor(0.14f, 232), rounding);
+    draw->AddRectFilled(ImVec2(panelLeft + 1.0f * scale, panelTop + 1.0f * scale),
+        ImVec2(panelRight - 1.0f * scale, panelTop + headerH), accentColor(0.32f, 245),
+        rounding - 1.0f * scale);
+    draw->AddRect(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+        accentColor(0.88f, 175), rounding, 0, 1.0f * scale);
+    draw->AddLine(ImVec2(panelLeft + 12.0f * scale, panelTop + headerH),
+        ImVec2(panelRight - 12.0f * scale, panelTop + headerH), accentColor(0.90f, 195), 1.0f * scale);
+
+    const float titleX = panelLeft + 15.0f * scale;
+    const float titleY = panelTop + 12.0f * scale;
+    draw->AddText(font, 15.0f * scale, ImVec2(titleX + 1.0f * scale, titleY + 1.0f * scale),
+        IM_COL32(0, 0, 0, 175), "Recent MIDIs");
+    draw->AddText(font, 15.0f * scale, ImVec2(titleX, titleY),
+        IM_COL32(242, 249, 255, 255), "Recent MIDIs");
+
+    char count[24] = {};
+    sprintf_s(count, "%zu %s", recentMIDIs.size(), recentMIDIs.size() == 1 ? "FILE" : "FILES");
+    const ImVec2 countSize = font->CalcTextSizeA(10.0f * scale, 10000.0f, 0.0f, count);
+    draw->AddText(font, 10.0f * scale,
+        ImVec2(panelRight - countSize.x - 15.0f * scale, panelTop + 15.0f * scale),
+        accentColor(0.75f, 235), count);
+
+    const float rowLeft = layout.rowLeft;
+    const float rowRight = layout.rowRight;
+    draw->PushClipRect(ImVec2(rowLeft, panelTop + headerH), ImVec2(rowRight, panelBottom), true);
+    if (recentMIDIs.empty()) {
+        draw->AddText(font, 12.0f * scale, ImVec2(rowLeft + 10.0f * scale, layout.rowTop + 5.0f * scale),
+            IM_COL32(193, 215, 230, 230), "Open a MIDI file to build your recent list.");
+    } else {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        for (size_t index = 0; index < layout.visibleRows; ++index) {
+            const float rowTop = layout.rowTop + layout.rowH * index;
+            const float rowBottom = rowTop + layout.rowH - 3.0f * scale;
+            const bool hovered = mouse.x >= rowLeft && mouse.x <= rowRight &&
+                mouse.y >= rowTop && mouse.y <= rowBottom;
+            draw->AddRectFilled(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
+                hovered ? accentColor(0.58f, 220) : accentColor(0.46f, 58), 5.0f * scale);
+            draw->AddRectFilled(ImVec2(rowLeft + 6.0f * scale, rowTop + 7.0f * scale),
+                ImVec2(rowLeft + 9.0f * scale, rowBottom - 7.0f * scale),
+                hovered ? accentColor(1.00f, 255) : accentColor(0.88f, 225), 1.5f * scale);
+
+            const std::string filename = SplashRecentMIDIName(recentMIDIs[index]);
+            const float filenameX = rowLeft + 18.0f * scale;
+            const float textY = rowTop + 5.0f * scale;
+            draw->AddText(font, 12.0f * scale, ImVec2(filenameX + 1.0f * scale, textY + 1.0f * scale),
+                IM_COL32(0, 0, 0, 185), filename.c_str());
+            draw->AddText(font, 12.0f * scale, ImVec2(filenameX, textY),
+                IM_COL32(246, 250, 253, 255), filename.c_str());
+            if (hovered) {
+                draw->AddText(font, 10.0f * scale,
+                    ImVec2(rowRight - 37.0f * scale, textY + 1.0f * scale),
+                    accentColor(1.00f, 255), "Play");
+            }
+        }
+    }
+    draw->PopClipRect();
+}
+
 GameState::GameError SplashScreen::Render()
 {
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
@@ -1435,6 +1685,9 @@ GameState::GameError SplashScreen::Render()
     m_pRenderer->DrawRect( 0.0f, 0.0f, static_cast< float >( m_pRenderer->GetBufferWidth() ),
                            static_cast< float >( m_pRenderer->GetBufferHeight() ), 0x00000000 );
     RenderNotes();
+    m_pRenderer->BeginText();
+    RenderOverlay();
+    m_pRenderer->EndText();
 
     m_pRenderer->EndScene();
     m_pRenderer->Present();
@@ -2184,6 +2437,13 @@ GameState::GameError MainScreen::Logic( void )
     long long llTimeSpan = static_cast< long long >( 3.0 * dNSpeed * 1000000 );
     bool bPausedChanged = ( bPaused != m_bPaused );
     bool bMuteChanged = ( bMute != m_bMute );
+    // The prerender ring remains paused at its old read position.  Rebuild it
+    // from the visual clock when playback resumes, and do not use that stale
+    // read position for this frame's drift correction.
+    const bool bResumePreRender = bPausedChanged && !bPaused && bPreAudio && !m_bRenderVideo;
+
+    if ( bResumePreRender )
+        m_bAudioStarted = false;
 
     if ( bPausedChanged && bPaused && !m_bTrackZoom && !m_bTrackPos ) {
         char b[96];
@@ -2286,7 +2546,7 @@ GameState::GameError MainScreen::Logic( void )
         // advance to a fixed slew would break speed changes; instead cap the
         const long long kDeadZone = 20000;   // ignore drift smaller than 20ms
         const long long kMaxCatchUp = 10000; // extra catch-up at most 10ms per frame
-        if ( bPreAudio && config.GetAudioSettings().bPreStutterOnLag && !m_bRenderVideo
+        if ( bPreAudio && !bResumePreRender && config.GetAudioSettings().bPreStutterOnLag && !m_bRenderVideo
              && m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->IsAudioStarted() )
         {
             long long llAudioTime = (long long)( PRE_MIDIAudio->GetPlayerTime() * 1000000.0 );
@@ -2352,7 +2612,7 @@ GameState::GameError MainScreen::Logic( void )
             static bool s_bPausedLogged = false;
             if (!s_bPausedLogged) { s_bPausedLogged = true; PRE_DbgLog("CUSTOM: SDL paused"); }
         }
-        CustomAudioUpdate(m_sCustomAudioPath, m_llStartTime, mInfo.llFirstNote, m_bPaused, m_bMute, m_dVolume);
+        CustomAudioUpdate(m_sCustomAudioPath, m_llStartTime, mInfo.llFirstNote, m_bPaused, m_bMute, m_dVolume, m_dSpeed);
     }
     else
         UpdatePreRenderAudio(m_vEvents, m_MIDI, m_llStartTime, m_iStartPos, m_bAudioStarted);

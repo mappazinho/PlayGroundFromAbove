@@ -218,6 +218,18 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             }
             return 0;
         }
+        case WM_RECENT_MIDI_OPEN:
+        {
+            // Splash-screen recent entries are drawn by the game thread, but
+            // loading owns window state and must remain on this UI thread.
+            std::wstring* pPath = (std::wstring*)lParam;
+            if (pPath)
+            {
+                PlayFile(*pPath, false);
+                delete pPath;
+            }
+            return 0;
+        }
         case WM_COMMAND:
         {
             int iId = LOWORD( wParam );
@@ -680,6 +692,7 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
     cPlayback.SetPaused( ePlayMode != GameState::Practice, true );
     cPlayback.SetPosition( 0 );
     cView.SetZoomMove( false, true );
+    config.GetVizSettings().AddRecentMIDI(sFile);
     SetMainTitle( sFile.c_str() + ( sFile.find_last_of( L'\\' ) + 1 ) );
 
     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )pGameState );

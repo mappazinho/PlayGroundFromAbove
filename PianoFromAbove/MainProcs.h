@@ -59,3 +59,4 @@ VOID ImageBufferPrewarmRendererSeen( Renderer *pRenderer );
 extern bool g_bReproCustomAudio;
 extern std::wstring g_sReproCustomAudioPath;
 #define WM_REPRO_OPEN (WM_APP + 0x203)
+#define WM_RECENT_MIDI_OPEN (WM_APP + 0x204)
