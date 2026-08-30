@@ -406,8 +406,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     m_pDrawList = new ImDrawList(ImGui::GetDrawListSharedData());
 
     HRESULT blurRes = CreateBlurResources();
-    if (FAILED(blurRes))
-        return std::make_tuple(blurRes, "CreateBlurResources");
+    if (FAILED(blurRes)) {
+        // Blur is cosmetic and every call site null-guards its resources:
+        // a GPU that rejects the blur work textures (e.g. FL 11.0 IGPs returning
+        // E_INVALIDARG) must not fail the whole init. Continue without blur.
+        char eb[160];
+        sprintf_s(eb, "init(d3d11):blur disabled hr=0x%08X", (unsigned)blurRes);
+        HeartbeatLog(eb);
+    }
     HeartbeatLog("init(d3d11):done");
 
     return std::make_tuple(S_OK, "");
@@ -419,6 +425,12 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
         HeartbeatLog("resize(d3d11):gpuwait");
         if (FAILED(WaitForGPU()))
             return std::make_tuple(E_FAIL, "WaitForGPU (device lost)");
+
+        if (m_pContext) {
+            m_pContext->OMSetRenderTargets(0, nullptr, nullptr);
+            m_pContext->ClearState();
+            m_pContext->Flush();
+        }
 
         for (uint32_t i = 0; i < FrameCount; i++)
             m_pRTVs[i].Reset();
@@ -590,8 +602,11 @@ HRESULT D3D11Renderer::ResetDevice() {
         return std::get<0>(res);
     HeartbeatLog("reset(d3d11):blur-create-start");
     if (FAILED(CreateBlurResources())) {
-        HeartbeatLog("reset(d3d11):createblurfail");
-        return E_FAIL;
+        // Non-fatal: blur call sites null-guard their resources, so the app
+        // keeps rendering (unblurred) instead of aborting the device reset.
+        // Failing here aborted the video-render resize reset, which killed
+        // Start Render and wedged the renderer in a failed recovery loop.
+        HeartbeatLog("reset(d3d11):createblurfail - continuing without blur");
     }
     HeartbeatLog("reset(d3d11):done");
 

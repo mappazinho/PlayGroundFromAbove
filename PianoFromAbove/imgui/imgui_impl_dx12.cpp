@@ -671,7 +671,8 @@ bool ImGui_ImplDX12_Init(ID3D12Device* device, int num_frames_in_flight, DXGI_FO
 void ImGui_ImplDX12_Shutdown()
 {
     ImGui_ImplDX12_Data* bd = ImGui_ImplDX12_GetBackendData();
-    IM_ASSERT(bd != nullptr && "No renderer backend to shutdown, or already shutdown?");
+    if (!bd)
+        return;
     ImGuiIO& io = ImGui::GetIO();
 
     ImGui_ImplDX12_InvalidateDeviceObjects();
@@ -684,7 +685,8 @@ void ImGui_ImplDX12_Shutdown()
 void ImGui_ImplDX12_NewFrame()
 {
     ImGui_ImplDX12_Data* bd = ImGui_ImplDX12_GetBackendData();
-    IM_ASSERT(bd != nullptr && "Did you call ImGui_ImplDX12_Init()?");
+    if (!bd)
+        return;
 
     if (!bd->pPipelineState)
         ImGui_ImplDX12_CreateDeviceObjects();

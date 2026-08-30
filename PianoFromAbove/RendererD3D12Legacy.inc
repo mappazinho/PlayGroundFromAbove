@@ -835,8 +835,13 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
 
     {
         HRESULT blur_hr = CreateBlurResources();
-        if (FAILED(blur_hr))
-            return std::make_tuple(blur_hr, "CreateBlurResources");
+        if (FAILED(blur_hr)) {
+            // Blur is cosmetic and every call site null-guards its resources:
+            // don't fail the whole init when a GPU rejects the blur pipeline.
+            char eb[160];
+            sprintf_s(eb, "init:blur disabled hr=0x%08X", (unsigned)blur_hr);
+            HeartbeatLog(eb);
+        }
     }
 
     return std::make_tuple(S_OK, "");
@@ -854,6 +859,10 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
             m_pRenderTargets[i].Reset();
             m_pFenceValues[i] = m_pFenceValues[m_uFrameIndex];
         }
+        m_pDepthBuffer.Reset();
+        m_pScreenshotStaging.Reset();
+        m_pTextureBuffer.Reset();
+        m_pTextureUpload.Reset();
 
         HeartbeatLog("resize:resizebuffers");
         res = m_pSwapChain->ResizeBuffers(FrameCount, 0, 0, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -1075,8 +1084,10 @@ HRESULT D3D12Renderer::ResetDevice() {
         return std::get<0>(res);
     HeartbeatLog("blur:create-start");
     if (FAILED(CreateBlurResources())) {
-        HeartbeatLog("reset:createblurfail");
-        return E_FAIL;
+        // Non-fatal: blur call sites null-guard their resources. Failing here
+        // aborted the video-render resize reset and wedged the renderer in a
+        // failed recovery loop ("Error calling DirectX" box).
+        HeartbeatLog("reset:createblurfail - continuing without blur");
     }
     HeartbeatLog("reset:done");
 
@@ -1254,6 +1265,11 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
     // Build the image-buffer key only after fixed constants and track-color
     // stamps have been updated for this frame.
     ImageBufferBeginFrame();
+
+    if (!m_pRenderTargets[m_uFrameIndex]) {
+        HeartbeatLog("clear:null-rendertarget");
+        return E_FAIL;
+    }
 
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pRenderTargets[m_uFrameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     m_pCommandList->ResourceBarrier(1, &barrier);
@@ -1580,6 +1596,11 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_pCommandList.Get());
     }
     auto s_t4 = std::chrono::steady_clock::now();
+
+    if (!m_pRenderTargets[m_uFrameIndex]) {
+        HeartbeatLog("endscene:null-rendertarget");
+        return E_FAIL;
+    }
 
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pRenderTargets[m_uFrameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     m_pCommandList->ResourceBarrier(1, &barrier);
@@ -2205,6 +2226,10 @@ void D3D12Renderer::SetupCommandList() {
 char* D3D12Renderer::Screenshot() {
     static int s_cnt = 0;
     if (s_cnt < 3) { char b[128]; snprintf(b, sizeof(b), "shot:enter cnt=%d", s_cnt); HeartbeatLog(b); }
+    if (!m_pRenderTargets[m_uFrameIndex] || !m_pScreenshotStaging) {
+        HeartbeatLog("shot:null-resources");
+        return nullptr;
+    }
     HRESULT hrResetA = m_pCommandAllocator[m_uFrameIndex]->Reset();
     HRESULT hrResetL = m_pCommandList->Reset(m_pCommandAllocator[m_uFrameIndex].Get(), m_pRectPipelineState.Get());
     if (s_cnt < 3) { char b[160]; snprintf(b, sizeof(b), "shot:reset a=0x%08X l=0x%08X", (unsigned)hrResetA, (unsigned)hrResetL); HeartbeatLog(b); }

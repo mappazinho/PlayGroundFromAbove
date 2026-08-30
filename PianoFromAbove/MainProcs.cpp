@@ -33,6 +33,7 @@ bool g_bShowLoading = false;
 bool g_bInSizeMove = false;
 bool g_bResetPending = false;
 bool g_bSysResize = false;
+bool g_bInRenderResize = false;
 bool g_bSkipGPUWait = false;
 bool g_bDisableBlur = false;
 std::atomic<bool> g_bLoggingEnabled{ false };
@@ -361,8 +362,12 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                 case ID_HELP_ABOUT:
                     return 0;
                 case ID_GAMEERROR:
-                    MessageBoxW( hWnd, GameState::Errors[lParam].c_str(), L"Error", MB_OK | MB_ICONEXCLAMATION );
+                {
+                    wchar_t sErrText[512];
+                    _snwprintf_s(sErrText, _TRUNCATE, L"%s%s", GameState::Errors[lParam].c_str(), g_wszRecoverDetail);
+                    MessageBoxW( hWnd, sErrText, L"Error", MB_OK | MB_ICONEXCLAMATION );
                     return 0;
+                }
                 case ID_UPDATE:
                     ShellExecute(NULL, L"open", L"https://github.com/khang06/PianoFromAbove/releases", NULL, NULL, SW_SHOWNORMAL);
                     return 0;
@@ -389,16 +394,24 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             {
                 g_bInSizeMove = true;
                 g_bSysResize = true;
-                HANDLE hDrain = CreateEvent(NULL, TRUE, FALSE, NULL);
-                if (hDrain)
+                // When BeginVideoRender/RestoreMainWindowAfterRender triggers
+                // a restore/maximize, the game thread already drained the GPU
+                // and is blocked inside ShowWindow (cross-thread SendMessage).
+                // Pushing a drain request would deadlock: the game thread
+                // can't process it while blocked.  Skip the drain in that case.
+                if (!g_bInRenderResize)
                 {
-                    MSG m = {};
-                    m.message = WM_COMMAND;
-                    m.wParam = ID_PRELOAD_DRAIN;
-                    m.lParam = (LPARAM)hDrain;
-                    g_MsgQueue.Push(m);
-                    WaitForSingleObject(hDrain, 1500);
-                    CloseHandle(hDrain);
+                    HANDLE hDrain = CreateEvent(NULL, TRUE, FALSE, NULL);
+                    if (hDrain)
+                    {
+                        MSG m = {};
+                        m.message = WM_COMMAND;
+                        m.wParam = ID_PRELOAD_DRAIN;
+                        m.lParam = (LPARAM)hDrain;
+                        g_MsgQueue.Push(m);
+                        WaitForSingleObject(hDrain, 1500);
+                        CloseHandle(hDrain);
+                    }
                 }
             }
             break;
@@ -416,7 +429,7 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             if ( wParam == SIZE_MINIMIZED ) return 0;
             SizeWindows( LOWORD( lParam ), HIWORD( lParam ) );
 
-            if ( wParam != SIZE_MAXIMIZED && !cView.GetFullScreen() )
+            if ( wParam != SIZE_MAXIMIZED && !cView.GetFullScreen() && !g_bVideoRendering && !g_bInRenderResize )
             {
                 RECT rcMain;
                 GetWindowRect( hWnd, &rcMain );

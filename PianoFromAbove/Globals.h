@@ -21,6 +21,7 @@ extern bool g_bShowLoading;
 extern bool g_bInSizeMove;
 extern bool g_bResetPending;
 extern bool g_bSysResize; // SC_MAXIMIZE/SC_RESTORE in flight (titlebar button transitions)
+extern bool g_bInRenderResize; // Video render resolution resize in progress
 // Discard the current song (events + SoA pools) BEFORE parsing the next one: the
 // old state stays fully resident through the whole load otherwise, and the combined
 // peak TDRs the driver on 16GB machines. Runs on the game thread (it owns the state).
@@ -37,6 +38,7 @@ extern bool g_bD3D12Available; // Probed at startup: can this machine create a D
 extern bool g_bBootedFallback; // Set when the requested renderer failed to init and we fell back to D3D11
 extern bool g_bForceWARP;     // Retry D3D11 init on the WARP software rasterizer (hardware swapchain failed)
 extern const wchar_t* g_pwszRenderMode; // Active backend name ("DirectX 12"/"DirectX 11"), set after init
+extern wchar_t g_wszRecoverDetail[192]; // Last renderer recovery failure ("Failing step: ..."), shown with the DirectX error
 extern TSQueue< MSG > g_MsgQueue; // Producer/consumer to hold events for our game thread
 
 // Video render: captures playback frames into an FFmpeg pipe, records the

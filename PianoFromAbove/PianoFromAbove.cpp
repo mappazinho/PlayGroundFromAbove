@@ -645,27 +645,13 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     return 0;
 }
 
-static void RecoverRenderer(Renderer* pRenderer) {
-    static bool s_bErrorPosted = false;
-    HRESULT res = pRenderer->RecoverDevice(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
-    if (FAILED(res)) {
-        if (!s_bErrorPosted) {
-            s_bErrorPosted = true;
-            PostMessage(g_hWnd, WM_COMMAND, ID_GAMEERROR, (LPARAM)GameState::DirectXError);
-        }
-        Sleep(1000);
-    } else {
-        s_bErrorPosted = false;
-    }
-}
-
-DWORD WINAPI GameThread( LPVOID lpParameter )
-{    if ( !g_hWndGfx ) { delete reinterpret_cast<GameState*>(lpParameter); return 0; }
-    g_dwGameThreadId = GetCurrentThreadId();
-
-    __try {
-
-    Renderer *pRenderer = Renderer::CreateInstance();
+// Creates a renderer and runs the full boot init ladder: up to three direct
+// attempts, then a D3D12 -> D3D11 fallback, then hardware D3D11 -> WARP.
+// Returns nullptr when nothing can be initialized (the caller decides whether
+// that is fatal). Used both at boot and when a lost device cannot recover.
+static Renderer* InitRendererLadder(std::tuple<HRESULT, const char*>* pLastFail = nullptr, bool bShowFallbackMsgs = true)
+{
+    Renderer* pRenderer = Renderer::CreateInstance();
     std::tuple<HRESULT, const char*> init_res = { E_FAIL, "Init not attempted" };
     auto TryInitOnce = [&]() {
         init_res = pRenderer->Init(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
@@ -695,13 +681,13 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
                 break;
             Sleep(500);
         }
-        if (SUCCEEDED(std::get<0>(init_res)))
+        if (SUCCEEDED(std::get<0>(init_res)) && bShowFallbackMsgs)
             MessageBox(g_hWnd, TEXT("DirectX 12 could not be initialized; this session is running on DirectX 11."), TEXT("PlayGroundFromAbove"), MB_OK | MB_ICONINFORMATION);
     }
     // Last resort: hardware D3D11 failed to create a swap chain (e.g. WDDM 1.x,
     // RDP, or a virtual GPU). Retry once on the WARP software rasterizer so the
     // app can still boot.
-    if (FAILED(std::get<0>(init_res)) && !g_bForceWARP && !g_bInRecovery) {
+    if (FAILED(std::get<0>(init_res)) && !g_bForceWARP) {
         g_bForceWARP = true;
         delete pRenderer;
         pRenderer = Renderer::CreateInstance();
@@ -712,15 +698,98 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
                 break;
             Sleep(500);
         }
-        if (SUCCEEDED(std::get<0>(init_res)))
+        if (SUCCEEDED(std::get<0>(init_res)) && bShowFallbackMsgs)
             MessageBox(g_hWnd, TEXT("Hardware accelerated rendering is unavailable on this system; this session is running on the software (WARP) renderer."), TEXT("PlayGroundFromAbove"), MB_OK | MB_ICONINFORMATION);
     }
-    if( FAILED(std::get<0>(init_res)) )
+    if (FAILED(std::get<0>(init_res))) {
+        if (pLastFail)
+            *pLastFail = init_res;
+        delete pRenderer;
+        return nullptr;
+    }
+    return pRenderer;
+}
+
+wchar_t g_wszRecoverDetail[192] = L"";
+
+// Runs on the game thread. When the active D3D backend loses its device and
+// cannot rebuild on the same API (e.g. D3D12CreateDevice keeps failing with
+// E_FAIL after an iGPU TDR), fall back through the boot init ladder - DirectX
+// 11 hardware, then the WARP software rasterizer - instead of retrying the
+// dead backend and popping a scary error for something we can recover from.
+// The Error box is only posted if every backend fails.
+static void RecoverRenderer(Renderer*& pRenderer, GameState* pGameState) {
+    static bool s_bErrorPosted = false;
+    // Always log diagnostics for the whole recovery attempt (the toggle may be
+    // off and this is exactly when we need the trace).
+    const bool wasLogging = g_bLoggingEnabled.load(std::memory_order_relaxed);
+    g_bLoggingEnabled.store(true, std::memory_order_relaxed);
+
+    HRESULT res = pRenderer->RecoverDevice(g_hWndGfx, Config::GetConfig().GetVideoSettings().bLimitFPS);
+    g_wszRecoverDetail[0] = L'\0';
+    if (SUCCEEDED(res)) {
+        s_bErrorPosted = false;
+        HeartbeatLog("recover:ok");
+        g_bLoggingEnabled.store(wasLogging, std::memory_order_relaxed);
+        return;
+    }
+
+    Sleep(200); // let the driver settle after the TDR before rebuilding
+    std::tuple<HRESULT, const char*> ladderFail = {};
+    Renderer* pNew = InitRendererLadder(&ladderFail, /*bShowFallbackMsgs*/ false);
+    if (pNew)
+    {
+        // A different backend came up. Swap it in. A video render's capture
+        // size is bound to the old swapchain, so cancel it: the user can press
+        // Start Render again on the stable backend.
+        if (g_bVideoRendering)
+            StopVideoRender();
+        if (pGameState)
+            pGameState->SetRenderer(pNew);
+        delete pRenderer;
+        pRenderer = pNew;
+        g_pwszRenderMode = pRenderer->GetModeName();
+        SetMainTitle(L"PlayGroundFromAbove");
+        g_bLoggingEnabled.store(true, std::memory_order_relaxed);
+        HeartbeatLog("recover:backend-switched");
+        g_bLoggingEnabled.store(wasLogging, std::memory_order_relaxed);
+        if (!wasLogging)
+            MessageBoxW(g_hWnd, L"DirectX 12 stopped responding while starting the render. The app has switched to DirectX 11 to keep running - press Start Render again.",
+                        L"PlayGroundFromAbove", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Nothing can initialize. Surface the TRUE final failure (last ladder
+    // attempt, e.g. WARP), not the initial D3D12 stage.
+    wchar_t stage[128] = L"?";
+    const char* sStage = std::get<1>(ladderFail);
+    if (!sStage || !*sStage)
+        sStage = pRenderer->LastRecoverStage();
+    MultiByteToWideChar(CP_UTF8, 0, sStage, -1, stage, 128);
+    swprintf_s(g_wszRecoverDetail, L"\n\nFailing step: %s (hr=0x%08X)", stage, (unsigned)std::get<0>(ladderFail));
+    char ebuf[192];
+    sprintf_s(ebuf, "recover:all-backends-failed %s hr=0x%08X", sStage, (unsigned)std::get<0>(ladderFail));
+    HeartbeatLog(ebuf);
+    if (!s_bErrorPosted) {
+        s_bErrorPosted = true;
+        PostMessage(g_hWnd, WM_COMMAND, ID_GAMEERROR, (LPARAM)GameState::DirectXError);
+    }
+    g_bLoggingEnabled.store(wasLogging, std::memory_order_relaxed);
+}
+
+DWORD WINAPI GameThread( LPVOID lpParameter )
+{    if ( !g_hWndGfx ) { delete reinterpret_cast<GameState*>(lpParameter); return 0; }
+    g_dwGameThreadId = GetCurrentThreadId();
+
+    __try {
+
+    std::tuple<HRESULT, const char*> boot_fail = { S_OK, "" };
+    Renderer *pRenderer = InitRendererLadder(&boot_fail);
+    if ( !pRenderer )
     {
         wchar_t msg[1024] = {};
-        _snwprintf_s(msg, 1024, L"Fatal error initializing the graphics device.\n%S failed with code 0x%x.", std::get<1>(init_res), std::get<0>(init_res));
+        _snwprintf_s(msg, 1024, L"Fatal error initializing the graphics device.\n%S failed with code 0x%x.", std::get<1>(boot_fail), std::get<0>(boot_fail));
         MessageBox( g_hWnd, msg, TEXT( "Error" ), MB_OK | MB_ICONEXCLAMATION );
-        delete pRenderer;
         delete reinterpret_cast<GameState*>(lpParameter);
         PostMessage( g_hWnd, WM_QUIT, 1, 0 );
         return 1;
@@ -806,7 +875,7 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
 
         if (pRenderer->DeviceLost()) {
             HeartbeatLog("recover:drain");
-            RecoverRenderer(pRenderer);
+            RecoverRenderer(pRenderer, pGameState);
             continue;
         }
 
@@ -832,6 +901,8 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
             }
             auto tLogic = std::chrono::steady_clock::now();
             pGameState->Logic();
+            if (!g_bDisableGates && (g_bResetPending || g_bInSizeMove))
+                continue;
             auto tRender = std::chrono::steady_clock::now();
             pGameState->Render();
             auto tEnd = std::chrono::steady_clock::now();
@@ -849,7 +920,7 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
 
         if (pRenderer->DeviceLost()) {
             HeartbeatLog("recover:postrender");
-            RecoverRenderer(pRenderer);
+            RecoverRenderer(pRenderer, pGameState);
         }
     }
 

@@ -8,12 +8,6 @@
 #include <thread>
 #include <vector>
 
-// PostProcess used to find the next global event by scanning every track for
-// every event. This drop-in cursor first orders equal-sized event slices on one
-// worker per physical CPU core, then performs a tiny N-way merge while the
-// existing tempo/sister/finalization logic consumes the events. Channel refs use
-// 32 bits; bit 31 is available as a meta-event tag because the MIDI pool itself
-// already reserves that bit in thin-owner references.
 class ParallelMIDIPos
 {
 public:

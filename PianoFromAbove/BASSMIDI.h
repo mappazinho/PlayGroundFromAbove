@@ -52,10 +52,6 @@ public:
 		return BASS_MIDI_StreamEvents(m_hsHandle, BASS_MIDI_EVENTS_RAW | BASS_MIDI_EVENTS_NORSTATUS, data, length);
 	}
 
-	// Scheduled STRUCT|TIME event: fires when the stream position reaches
-	// (current position + deltaSamples). Position-explicit events cannot be
-	// lost to RAW-stream position drift. deltaSamples is clamped to >= 0
-	// (already-past events fire immediately, like the legacy KShortMessage path).
 	DWORD SendEventScheduled(BYTE code, BYTE p1, BYTE p2, long long deltaSamples)
 	{
 		if (deltaSamples < 0) deltaSamples = 0;

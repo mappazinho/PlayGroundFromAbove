@@ -159,6 +159,11 @@ public:
     int GetBufferWidth() const { return m_iBufferWidth; }
     int GetBufferHeight() const { return m_iBufferHeight; }
 
+    // Diagnostics from the last RecoverDevice attempt (valid after it fails):
+    // which Init() step refused and the raw HRESULT, surfaced in the UI.
+    const char* LastRecoverStage() const { return m_sLastRecoverStage.c_str(); }
+    unsigned LastRecoverHr() const { return m_uLastRecoverHr; }
+
     HRESULT BeginText();
     HRESULT DrawTextW( const WCHAR *sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1 );
     HRESULT DrawTextA( const CHAR *sText, FontSize fsFont, LPRECT rcPos, DWORD dwFormat, DWORD dwColor, INT iChars = -1 );
@@ -287,6 +292,10 @@ protected:
     int m_iBufferWidth = 0;
     int m_iBufferHeight = 0;
     bool m_bLimitFPS = false;
+
+    // Last RecoverDevice failure detail (see LastRecoverStage/LastRecoverHr)
+    std::string m_sLastRecoverStage;
+    unsigned m_uLastRecoverHr = 0;
     bool m_bDeviceLost = false;
     bool m_bAllowTearing = true;
     bool m_bUnlimitedNotes = true;

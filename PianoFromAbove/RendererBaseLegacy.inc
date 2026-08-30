@@ -91,10 +91,18 @@ HRESULT Renderer::RecoverDevice(HWND hWnd, bool bLimitFPS) {
     m_vChunkQuads.clear();
     ImGuiBackendShutdown();
     ImGui_ImplWin32_Shutdown();
+    // Tear the ImGui context down too: Init() calls CreateContext(), and this
+    // ImGui version keeps the previous context current when one already exists,
+    // so skipping this would leave recovery running on a stale leaked context.
+    ImGui::DestroyContext();
     ReleaseDeviceResources();
     m_bDeviceLost = false;
     g_bInRecovery = true;
     auto res = Init(hWnd, bLimitFPS);
+    m_sLastRecoverStage = std::get<1>(res);
+    m_uLastRecoverHr = (unsigned)std::get<0>(res);
+    if (FAILED(std::get<0>(res)))
+        m_bDeviceLost = true;
     g_bInRecovery = false;
     HeartbeatLog("recover:done");
     return std::get<0>(res);
@@ -497,6 +505,11 @@ bool Renderer::LoadBackgroundBitmap(std::wstring path) {
 
 void Renderer::ImGuiStartFrame()
 {
+    if (m_bDeviceLost || !ImGui::GetCurrentContext())
+        return;
+    auto& io = ImGui::GetIO();
+    if (!io.BackendPlatformUserData)
+        return;
     const auto& viz = Config::GetConfig().GetVizSettings();
     if (m_fLastUIScale != viz.fUIScale || m_sLastFont != viz.sUIFont)
         UpdateImGuiSettings();
@@ -1838,13 +1851,17 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             ImGui::InputInt("Width", &m_resWidth);
             ImGui::InputInt("Height", &m_resHeight);
             if (ImGui::Button("OK", ImVec2(80, 0))) {
+                WaitForGPU();
+                if (IsZoomed(g_hWnd))
+                    ShowWindow(g_hWnd, SW_RESTORE);
+                g_bInSizeMove = true;
+                g_bSysResize = true;
+                g_bResetPending = true;
                 RECT adjusted = {0, 0, max(MINWIDTH, min(m_resWidth, 65535)), max(MINHEIGHT, min(m_resHeight, 65535))};
                 if (view.GetControls())
                     adjusted.bottom += (int)toolbarHeight;
-                AdjustWindowRectEx(&adjusted, GetWindowLongPtrA(g_hWnd, GWL_STYLE), TRUE, GetWindowLongPtrA(g_hWnd, GWL_EXSTYLE));
-                SetWindowPos(g_hWnd, NULL, 0, 0, adjusted.right - adjusted.left, adjusted.bottom - adjusted.top, SWP_NOMOVE);
-                g_bResetPending = true;
-                PostMessage(g_hWnd, WM_COMMAND, ID_VIEW_RESETDEVICE, 0);
+                AdjustWindowRectEx(&adjusted, (DWORD)GetWindowLongPtrA(g_hWnd, GWL_STYLE), TRUE, (DWORD)GetWindowLongPtrA(g_hWnd, GWL_EXSTYLE));
+                SetWindowPos(g_hWnd, NULL, 0, 0, adjusted.right - adjusted.left, adjusted.bottom - adjusted.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 m_bShowSetResolution = false;
             }
             ImGui::SameLine();

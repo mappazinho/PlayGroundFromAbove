@@ -139,6 +139,7 @@ void MainScreen::StartVideoRender()
     }
 
     m_bRenderPending = true;
+    m_bRenderResizePending = true;
     PRE_DbgLog("RENDER: requested");
 }
 
@@ -147,8 +148,7 @@ void MainScreen::BeginVideoRender()
     Config& config = Config::GetConfig();
     VizSettings& viz = config.GetVizSettings();
 
-    // Output file names: the user's path (with the chosen container extension,
-    // like Comet's replace_extension) or a default next to the executable.
+    // Output file names: the user's path or a default next to the executable.
     std::wstring sName = m_MIDI.GetInfo().sFilename;
     size_t slash = sName.find_last_of(L"\\/");
     if (slash != std::wstring::npos)
@@ -173,37 +173,50 @@ void MainScreen::BeginVideoRender()
         m_sFFVideoOut += L"." + sExt;
     }
 
-    ShowWindow(g_hWnd, SW_HIDE);
     int w = (int)m_pRenderer->GetBufferWidth(), h = (int)m_pRenderer->GetBufferHeight();
-    RECT rcWork = {};
-    SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
-    int iWinW = viz.iRenderWidth, iWinH = viz.iRenderHeight;
-    if (viz.bRenderShowPreview)
+    const bool bZoomed = (IsZoomed(g_hWnd) != FALSE);
+    if (m_bRenderResizePending)
     {
-        // The preview window must fit on the screen; the swapchain follows the
-        // clamped size and the scale filter upscales to the full resolution.
-        iWinW = min(iWinW, max(128, rcWork.right - rcWork.left));
-        iWinH = min(iWinH, max(128, rcWork.bottom - rcWork.top));
-    }
-    if (w != iWinW || h != iWinH)
-    {
-        if (!m_bRenderMainRectSaved)
+        m_bRenderResizePending = false;
+        // Do NOT resize the window/swapchain to chase the render resolution:
+        // ResizeBuffers mid-render-start TDRs on older D3D12 GPUs (e.g. Intel
+        // HD 4400) and aborts Start Render with "Error calling DirectX". The
+        // capture uses the current buffer size (w/h below) and ffmpeg's scale
+        // filter reaches the requested output resolution. Only restore a
+        // maximized window (a maximized capture frame would be misshapen) -
+        // that restore also re-enters via the safe WM_SIZE -> ResetDevice path.
+        if (bZoomed)
         {
-            GetWindowRect(g_hWnd, &m_rcRenderMainSaved);
-            m_bRenderMainRectSaved = true;
+            if (!m_bRenderMainRectSaved)
+            {
+                m_bRenderWasMaximized = true;
+                WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+                GetWindowPlacement(g_hWnd, &wp);
+                m_rcRenderMainSaved = wp.rcNormalPosition;
+                m_bRenderMainRectSaved = true;
+            }
+
+            // Drain in-flight GPU commands before the window transition
+            if (m_pRenderer)
+                m_pRenderer->WaitForGPU();
+
+            g_bInSizeMove = true;
+            g_bSysResize = true;
+            g_bResetPending = true;
+            g_bInRenderResize = true;
+
+            ShowWindow(g_hWnd, SW_RESTORE);
+            return; // the WM_SIZE -> ResetDevice is in flight; run again next frame
         }
-        RECT rc = { 0, 0, iWinW, iWinH };
-        AdjustWindowRectEx(&rc, GetWindowLongPtrA(g_hWnd, GWL_STYLE), FALSE, GetWindowLongPtrA(g_hWnd, GWL_EXSTYLE));
-        SetWindowPos(g_hWnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        return; // the WM_SIZE -> ResetDevice is in flight; run again next frame
     }
+    g_bInRenderResize = false;
     m_bRenderPending = false;
     s_FFCapW = w;
     s_FFCapH = h;
+    if (!viz.bRenderShowPreview)
+        ShowWindow(g_hWnd, SW_HIDE);
 
-    // Encoder settings: codec, x264/x265 preset, constant bitrate or CRF, and
-    // the user's extra ffmpeg options (mirrors Comet's FFmpegCommandBuilder).
+    // codec, x264/x265 preset, constant bitrate or CRF, and the user's extra ffmpeg options
     static const char* sPresets[] = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo" };
     std::string sEnc = std::string("-c:v ") + (viz.iRenderCodec == 1 ? "libx265" : "libx264") + " -preset " + sPresets[max(0, min(viz.iRenderPreset, 9))] + " ";
     char sNum[128];
@@ -257,22 +270,6 @@ void MainScreen::BeginVideoRender()
     m_hFFProc = pi.hProcess;
     CloseHandle(pi.hThread);
 
-    if (viz.bRenderShowPreview)
-    {
-        SetParent(g_hWndGfx, NULL);
-        SetWindowLongPtrA(g_hWndGfx, GWL_STYLE, (GetWindowLongPtrA(g_hWndGfx, GWL_STYLE) & ~WS_CHILD) | WS_POPUP);
-        {
-            RECT rcWork = {};
-            SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
-            int iWinW = min(w, max(128, rcWork.right - rcWork.left));
-            int iWinH = min(h, max(128, rcWork.bottom - rcWork.top));
-            int iX = rcWork.left + max(0, ((rcWork.right - rcWork.left) - iWinW) / 2);
-            int iY = rcWork.top + max(0, ((rcWork.bottom - rcWork.top) - iWinH) / 2);
-            SetWindowPos(g_hWndGfx, HWND_TOP, iX, iY, iWinW, iWinH, SWP_SHOWWINDOW);
-        }
-        SetWindowText(g_hWndGfx, L"Render to Video");
-    }
-
     const bool bCustomAudio = m_bUseCustomAudio && !m_sCustomAudioPath.empty();
     if (PRE_MIDIAudio && !bCustomAudio)
         PRE_MIDIAudio->StartWavRecording(m_sFFWav.c_str());
@@ -297,10 +294,13 @@ void MainScreen::BeginVideoRender()
 
 void MainScreen::FinishVideoRender()
 {
-    if (!m_bRenderVideo)
+    if (!m_bRenderVideo && !m_bRenderPending)
         return;
     m_bRenderVideo = false;
     g_bVideoRendering = false;
+    g_bInRenderResize = false;
+    m_bRenderPending = false;
+    m_bRenderResizePending = false;
     s_FFCapW = s_FFCapH = 0;
 
     // Close the Win32 progress window and restore the ImGui UI.
@@ -323,20 +323,8 @@ void MainScreen::FinishVideoRender()
         m_hFFProc = NULL;
     }
 
-    ShowWindow(g_hWnd, SW_SHOW);
-    Config& cfg = Config::GetConfig();
-    if (cfg.GetVizSettings().bRenderShowPreview)
-    {
-        SetParent(g_hWndGfx, g_hWnd);
-        SetWindowLongPtrA(g_hWndGfx, GWL_STYLE, (GetWindowLongPtrA(g_hWndGfx, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
-        {
-            RECT rcClient;
-            GetClientRect(g_hWnd, &rcClient);
-            SetWindowPos(g_hWndGfx, NULL, 0, 0, rcClient.right, rcClient.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        ShowWindow(g_hWndGfx, SW_SHOW);
-        SetFocus(g_hWndGfx);
-    }
+    if (m_pRenderer)
+        m_pRenderer->WaitForGPU();
 
     RestoreMainWindowAfterRender();
 
@@ -377,16 +365,39 @@ void MainScreen::FinishVideoRender()
 
 void MainScreen::RestoreMainWindowAfterRender()
 {
-    // Shrink the main window back to its pre-render size (position kept) and show it again. The
-    // WM_SIZE -> gate -> ResetDevice path resizes the swapchain to match on the game thread, so
+    // Restore the main window back to its pre-render size and maximized state.
     if (m_bRenderMainRectSaved)
     {
-        RECT rc = m_rcRenderMainSaved;
-        SetWindowPos(g_hWnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (m_pRenderer)
+            m_pRenderer->WaitForGPU();
+
+        g_bInSizeMove = true;
+        g_bSysResize = true;
+        g_bResetPending = true;
+        // Prevent the SC_MAXIMIZE/SC_RESTORE drain handler from deadlocking:
+        // the GPU is already drained above, and the game thread will be blocked
+        // inside ShowWindow/SetWindowPos (cross-thread SendMessage).
+        g_bInRenderResize = true;
+
+        if (m_bRenderWasMaximized)
+        {
+            ShowWindow(g_hWnd, SW_MAXIMIZE);
+        }
+        else
+        {
+            RECT rc = m_rcRenderMainSaved;
+            SetWindowPos(g_hWnd, NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(g_hWnd, SW_SHOW);
+        }
+        g_bInRenderResize = false;
         m_bRenderMainRectSaved = false;
+        m_bRenderWasMaximized = false;
     }
-    ShowWindow(g_hWnd, SW_SHOW);
+    else
+    {
+        ShowWindow(g_hWnd, SW_SHOW);
+    }
 }
 
 static ULONGLONG s_ullLastKernel = 0, s_ullLastUser = 0, s_ullLastIdle = 0;
@@ -654,6 +665,7 @@ GameState::GameError IntroScreen::Logic()
 
 GameState::GameError IntroScreen::Render()
 {
+    if (g_bResetPending || g_bInSizeMove) return Success;
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
 
     m_pRenderer->ClearAndBeginScene( D3DCOLOR_XRGB( 0, 0, 0 ) );
@@ -1679,6 +1691,7 @@ void SplashScreen::RenderOverlay()
 
 GameState::GameError SplashScreen::Render()
 {
+    if (g_bResetPending || g_bInSizeMove) return Success;
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
 
     m_pRenderer->ClearAndBeginScene( D3DCOLOR_XRGB( 0, 0, 0 ) );
@@ -2210,7 +2223,11 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     JumpTo(static_cast<long long>(m_llStartTime - cControls.dFwdBackSecs * 1000000));
                     return Success;
                 case ID_VIEW_RESETDEVICE:
-                    m_pRenderer->ResetDevice();
+                    if (FAILED(m_pRenderer->ResetDevice())) {
+                        HeartbeatLog("reset:failed-aborting-render");
+                        if (m_bRenderVideo || m_bRenderPending)
+                            StopVideoRender();
+                    }
                     return Success;
                 case ID_FILE_RENDERVIDEO:
                     // Open the render settings dialog; the actual render starts
@@ -2391,7 +2408,11 @@ GameState::GameError MainScreen::Logic( void )
         return Success;
     }
     if (m_bRenderPending)
+    {
         BeginVideoRender();
+        if (m_bRenderPending)
+            return Success;
+    }
     // Start new ImGui frame
     m_pRenderer->ImGuiStartFrame();
 
@@ -3169,6 +3190,7 @@ const float MainScreen::KeyRatio = 0.1775f;
 
 GameState::GameError MainScreen::Render() 
 {
+    if (g_bResetPending || g_bInSizeMove) return Success;
     if (m_bDiscarded)
     {
         // Minimal frame: clear + present the loading modal. Keeps the GPU busy
@@ -3257,7 +3279,56 @@ GameState::GameError MainScreen::Render()
         auto t1 = std::chrono::steady_clock::now();
         m_pRenderer->EndScene(m_bBackgroundLoaded);
         auto t2 = std::chrono::steady_clock::now();
-        m_pRenderer->Present();
+
+        if (m_bDumpFrames) {
+            auto* frame = m_pRenderer->Screenshot();
+            if (frame) {
+                WriteFile(m_hVideoPipe, frame, static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4), nullptr, nullptr);
+            }
+            const std::wstring& name = m_MIDI.GetInfo().sFilename;
+            TCHAR sTitle[1024];
+            _stprintf_s(sTitle, TEXT("%ws (%.1lf%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), (m_dFPS / m_Timer.m_dFramerate) * 100.0);
+            SetMainTitle(sTitle);
+        }
+
+        if (m_bRenderVideo) {
+            // The raw stream was started with the render resolution; if the window
+            // was resized mid-render the capture would corrupt, so finish cleanly.
+            if ((int)m_pRenderer->GetBufferWidth() != s_FFCapW || (int)m_pRenderer->GetBufferHeight() != s_FFCapH) {
+                FinishVideoRender();
+                return Success;
+            }
+            auto* frame = m_pRenderer->Screenshot();
+            if (frame) {
+                DWORD dwBytes = static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4);
+                DWORD dwWritten = 0;
+                WriteFile(m_hFFPipeWrite, frame, dwBytes, &dwWritten, nullptr);
+            }
+            const std::wstring& name = m_MIDI.GetInfo().sFilename;
+            TCHAR sTitle[1024];
+            double dPct = (GetMaxTime() > GetMinTime()) ? (m_llStartTime - GetMinTime()) * 100.0 / (GetMaxTime() - GetMinTime()) : 0.0;
+            _stprintf_s(sTitle, TEXT("%ws (%.0f fps, %.1f%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), m_dFPS, dPct);
+            SetMainTitle(sTitle);
+            SetWindowText(g_hWndGfx, sTitle);
+
+            // Feed the Win32 progress window (throttled to ~10 updates per second):
+            // progress, output size, and the render speed the machine achieves.
+            static ULONGLONG s_ullLastProgUpdate = 0;
+            ULONGLONG ullNow = GetTickCount64();
+            if (ullNow - s_ullLastProgUpdate >= 100)
+            {
+                s_ullLastProgUpdate = ullNow;
+                VizSettings& viz2 = Config::GetConfig().GetVizSettings();
+                wchar_t sProg[512];
+                swprintf_s(sProg, L"Rendering %.1f%%\nOutput: %dx%d @ %d fps\nRender speed: %.0f fps",
+                    dPct, viz2.iRenderWidth, viz2.iRenderHeight, viz2.iRenderFPS, m_dFPS);
+                UpdateRenderProgressWindow((int)(dPct * 10.0 + 0.5), sProg);
+            }
+        }
+
+        if (!m_bRenderVideo || Config::GetConfig().GetVizSettings().bRenderShowPreview)
+            m_pRenderer->Present();
+
         auto t3 = std::chrono::steady_clock::now();
         tStrip += std::chrono::duration<double, std::milli>(t1 - t0).count();
         tEnd += std::chrono::duration<double, std::milli>(t3 - t2).count();
@@ -3266,76 +3337,6 @@ GameState::GameError MainScreen::Render()
             sprintf_s(buf, "r:strip=%.2f present=%.2f", tStrip / 128.0, tEnd / 128.0);
             HeartbeatLog(buf);
             tStrip = tEnd = 0;
-        }
-    }
-
-    if (m_bDumpFrames) {
-        {
-            static int s_logged = 0;
-            if (s_logged++ < 3) {
-                char buf[192];
-                snprintf(buf, sizeof(buf), "dump:pre-shot frame=%p", (void*)m_hVideoPipe);
-                HeartbeatLog(buf);
-            }
-        }
-        auto* frame = m_pRenderer->Screenshot();
-        {
-            static int s_logged = 0;
-            if (s_logged++ < 3) {
-                char buf[192];
-                snprintf(buf, sizeof(buf), "dump:post-shot frame=%p", (void*)frame);
-                HeartbeatLog(buf);
-            }
-        }
-
-        BOOL bWrite = WriteFile(m_hVideoPipe, frame, static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4), nullptr, nullptr);
-        {
-            static int s_logged = 0;
-            if (s_logged++ < 3) {
-                char buf[192];
-                snprintf(buf, sizeof(buf), "dump:write=%d err=%u frame=%p", (int)bWrite, (unsigned)GetLastError(), (void*)frame);
-                HeartbeatLog(buf);
-            }
-        }
-
-        const std::wstring& name = m_MIDI.GetInfo().sFilename;
-        TCHAR sTitle[1024];
-        _stprintf_s(sTitle, TEXT("%ws (%.1lf%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), (m_dFPS / m_Timer.m_dFramerate) * 100.0);
-        SetMainTitle(sTitle);
-    }
-
-    if (m_bRenderVideo) {
-        // The raw stream was started with the render resolution; if the window
-        // was resized mid-render the capture would corrupt, so finish cleanly.
-        if ((int)m_pRenderer->GetBufferWidth() != s_FFCapW || (int)m_pRenderer->GetBufferHeight() != s_FFCapH) {
-            FinishVideoRender();
-            return Success;
-        }
-        auto* frame = m_pRenderer->Screenshot();
-        if (frame) {
-            DWORD dwBytes = static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4);
-            DWORD dwWritten = 0;
-            WriteFile(m_hFFPipeWrite, frame, dwBytes, &dwWritten, nullptr);
-        }
-        const std::wstring& name = m_MIDI.GetInfo().sFilename;
-        TCHAR sTitle[1024];
-        double dPct = (GetMaxTime() > GetMinTime()) ? (m_llStartTime - GetMinTime()) * 100.0 / (GetMaxTime() - GetMinTime()) : 0.0;
-        _stprintf_s(sTitle, TEXT("%ws (%.0f fps, %.1f%%)"), name.c_str() + (name.find_last_of(L'\\') + 1), m_dFPS, dPct);
-        SetMainTitle(sTitle);
-        SetWindowText(g_hWndGfx, sTitle);
-
-        // Feed the Win32 progress window (throttled to ~10 updates per second):
-        // progress, output size, and the render speed the machine achieves.
-        static ULONGLONG s_ullLastProgUpdate = 0;
-        ULONGLONG ullNow = GetTickCount64();
-        if (ullNow - s_ullLastProgUpdate >= 100)
-        {
-            s_ullLastProgUpdate = ullNow;
-            VizSettings& viz2 = Config::GetConfig().GetVizSettings();
-            wchar_t sProg[512];
-            swprintf_s(sProg, L"Rendering %.1f%%\nOutput: %dx%d @ %d fps\nRender speed: %.0f fps",
-                dPct, viz2.iRenderWidth, viz2.iRenderHeight, viz2.iRenderFPS, m_dFPS);
-            UpdateRenderProgressWindow((int)(dPct * 10.0 + 0.5), sProg);
         }
     }
     return Success;

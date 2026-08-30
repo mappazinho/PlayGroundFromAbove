@@ -163,7 +163,8 @@ bool    ImGui_ImplWin32_Init(void* hwnd)
 void    ImGui_ImplWin32_Shutdown()
 {
     ImGui_ImplWin32_Data* bd = ImGui_ImplWin32_GetBackendData();
-    IM_ASSERT(bd != nullptr && "No platform backend to shutdown, or already shutdown?");
+    if (!bd)
+        return;
     ImGuiIO& io = ImGui::GetIO();
 
     // Unload XInput library

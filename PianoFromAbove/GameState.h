@@ -468,7 +468,9 @@ void RenderText();
     HANDLE m_hFFProc = NULL;
     std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
     bool m_bRenderPending = false;
+    bool m_bRenderResizePending = false;
     bool m_bRenderMainRectSaved = false;
+    bool m_bRenderWasMaximized = false;
     RECT m_rcRenderMainSaved = {};
 
     // Debug assertion fail workaround

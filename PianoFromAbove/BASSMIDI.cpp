@@ -143,7 +143,6 @@ std::wstring BASSMIDI::ResolveSoundfontPath(const std::wstring& path, const std:
 	return path;
 }
 
-// only one soundfont because i'm lazy lmfao
 void BASSMIDI::FreeSoundfont()
 {
 	if (m_bmFontArr != NULL)
@@ -155,11 +154,6 @@ void BASSMIDI::FreeSoundfont()
 	}
 }
 
-// ---- memory-backed soundfont loading ----------------------------------------
-// Some bass.dll builds in the wild cannot open files by path (BASS_ERROR_FILEOPEN
-// from BASS_MIDI_FontInit / BASS_StreamCreateFile even for valid files). Loading
-// the sf2 into memory and handing it to BASS via BASS_MIDI_FontInitUser sidesteps
-// that entirely and is identical in behaviour for BASSMIDI synthesis.
 struct SfMemState { const unsigned char* p; QWORD len; QWORD pos; };
 static SfMemState g_sfMem;
 
@@ -201,9 +195,6 @@ static HSOUNDFONT LoadSoundfontMem(const std::wstring& path)
 	BASS_FILEPROCS procs = { SfMemClose, SfMemLen, SfMemRead, SfMemSeek };
 	HSOUNDFONT font = BASS_MIDI_FontInitUser(&procs, NULL, 0);
 	if (font == 0) free(pBuf);
-	// BASS keeps the font data alive via the procs until FontFree; the buffer is
-	// intentionally leaked (tiny: <1KB) rather than freed while BASS may still
-	// touch it during teardown races.
 	return font;
 }
 
@@ -353,9 +344,6 @@ DWORD BASSMIDI::Read(float* buffer, int offset, int count) {
 
 	if (ret != size)
 	{
-		// Diagnostic: GetData must return exactly the requested bytes on a
-		// decode stream. Short returns mean the stream has ended or stalled -
-		// the generator silently zero-fills the remainder of the chunk.
 		static int sLogCount = 0;
 		if (sLogCount < 30)
 		{
