@@ -1426,8 +1426,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 ImGui::GetWindowDrawList()->AddRectFilled(wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y), 0x80000000);
             }
             const bool hasSong = VideoRenderSongLoaded();
-            const bool hasFFmpeg = !viz.sFFmpegDir.empty() &&
-                GetFileAttributesW((viz.sFFmpegDir + L"\\ffmpeg.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+            const bool hasFFmpeg = !GetFFmpegExePath(viz.sFFmpegDir).empty();
             const bool canRender = hasSong && hasFFmpeg;
 
             // --- Status Header ---
@@ -1454,14 +1453,15 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ShellExecuteA(g_hWnd, "open", "https://ffmpeg.org/download.html", NULL, NULL, SW_SHOWNORMAL);
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Auto-Detect")) {
-                        wchar_t exePath[MAX_PATH] = {};
-                        if (GetModuleFileNameW(NULL, exePath, MAX_PATH)) {
-                            std::wstring dir = exePath;
-                            size_t sp = dir.find_last_of(L"\\/");
+                        std::wstring found = GetFFmpegExePath(L"");
+                        if (found.empty())
+                            found = GetFFmpegExePath(viz.sFFmpegDir);
+                        if (!found.empty()) {
+                            size_t sp = found.find_last_of(L"\\/");
                             if (sp != std::wstring::npos)
-                                dir = dir.substr(0, sp);
-                            if (GetFileAttributesW((dir + L"\\ffmpeg.exe").c_str()) != INVALID_FILE_ATTRIBUTES)
-                                viz.sFFmpegDir = dir;
+                                viz.sFFmpegDir = found.substr(0, sp);
+                            else
+                                viz.sFFmpegDir = found;
                         }
                     }
                 }
@@ -1649,17 +1649,19 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
 
                     const char* sExt = viz.iRenderFormat == 1 ? "mov" : (viz.iRenderFormat == 2 ? "avi" : "mp4");
                     static char sOut[MAX_PATH] = {};
-                    static bool sOutInit = false;
-                    if (!sOutInit) {
+                    static std::wstring sLastOut;
+                    if (sLastOut != viz.sRenderOutputPath) {
                         std::string s = Util::WstringToString(viz.sRenderOutputPath);
                         strncpy_s(sOut, s.c_str(), sizeof(sOut));
-                        sOutInit = true;
+                        sLastOut = viz.sRenderOutputPath;
                     }
 
                     ImGui::Text("Output File Path:");
                     ImGui::SetNextItemWidth(max(100.0f, ImGui::GetContentRegionAvail().x - 85.0f));
-                    if (ImGui::InputText("##outpath", sOut, sizeof(sOut)))
+                    if (ImGui::InputText("##outpath", sOut, sizeof(sOut))) {
                         viz.sRenderOutputPath = Util::StringToWstring(sOut);
+                        sLastOut = viz.sRenderOutputPath;
+                    }
                     ImGui::SameLine();
                     if (ImGui::Button("Browse##out", ImVec2(75, 0))) {
                         OPENFILENAMEA ofn = {};
@@ -1683,9 +1685,10 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ofn.nMaxFile = sizeof(fn);
                         ofn.lpstrDefExt = sExt;
                         ofn.lpstrTitle = "Save render video as...";
-                        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT;
+                        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
                         if (GetSaveFileNameA(&ofn)) {
                             viz.sRenderOutputPath = Util::StringToWstring(fn);
+                            sLastOut = viz.sRenderOutputPath;
                             strncpy_s(sOut, fn, sizeof(sOut));
                         }
                     }
@@ -1698,17 +1701,19 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
 
                     // FFmpeg Folder Path
                     static char sFfDir[MAX_PATH] = {};
-                    static bool sFfDirInit = false;
-                    if (!sFfDirInit) {
+                    static std::wstring sLastFfDir;
+                    if (sLastFfDir != viz.sFFmpegDir) {
                         std::string s = Util::WstringToString(viz.sFFmpegDir);
                         strncpy_s(sFfDir, s.c_str(), sizeof(sFfDir));
-                        sFfDirInit = true;
+                        sLastFfDir = viz.sFFmpegDir;
                     }
 
                     ImGui::Text("FFmpeg Binary Location:");
                     ImGui::SetNextItemWidth(max(100.0f, ImGui::GetContentRegionAvail().x - 85.0f));
-                    if (ImGui::InputText("##ffdir", sFfDir, sizeof(sFfDir)))
+                    if (ImGui::InputText("##ffdir", sFfDir, sizeof(sFfDir))) {
                         viz.sFFmpegDir = Util::StringToWstring(sFfDir);
+                        sLastFfDir = viz.sFFmpegDir;
+                    }
                     ImGui::SameLine();
                     if (ImGui::Button("Browse##ffdir", ImVec2(75, 0))) {
                         OPENFILENAMEA ofn = {};
@@ -1719,13 +1724,14 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ofn.lpstrFile = fn;
                         ofn.nMaxFile = sizeof(fn);
                         ofn.lpstrTitle = "Select ffmpeg.exe";
-                        ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                        ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
                         if (GetOpenFileNameA(&ofn)) {
                             std::string s = fn;
                             size_t sp = s.find_last_of("\\/");
                             if (sp != std::string::npos)
                                 s = s.substr(0, sp);
                             viz.sFFmpegDir = Util::StringToWstring(s);
+                            sLastFfDir = viz.sFFmpegDir;
                             strncpy_s(sFfDir, s.c_str(), sizeof(sFfDir));
                         }
                     }
@@ -1737,15 +1743,17 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImGui::Checkbox("Enable custom FFmpeg arguments (advanced)", &viz.bRenderAdvanced);
                     if (viz.bRenderAdvanced) {
                         static char sAdv[4096] = {};
-                        static bool sAdvInit = false;
-                        if (!sAdvInit) {
+                        static std::wstring sLastAdv;
+                        if (sLastAdv != viz.sRenderAdvancedOptions) {
                             std::string s = Util::WstringToString(viz.sRenderAdvancedOptions);
                             strncpy_s(sAdv, s.c_str(), sizeof(sAdv));
-                            sAdvInit = true;
+                            sLastAdv = viz.sRenderAdvancedOptions;
                         }
                         ImGui::TextDisabled("Additional flags injected before video output:");
-                        if (ImGui::InputTextMultiline("##advOptions", sAdv, sizeof(sAdv), ImVec2(-1, 60)))
+                        if (ImGui::InputTextMultiline("##advOptions", sAdv, sizeof(sAdv), ImVec2(-1, 60))) {
                             viz.sRenderAdvancedOptions = Util::StringToWstring(sAdv);
+                            sLastAdv = viz.sRenderAdvancedOptions;
+                        }
                     }
 
                     ImGui::EndTabItem();
@@ -1973,6 +1981,8 @@ void Renderer::UpdateImGuiSettings() {
     auto& io = ImGui::GetIO();
     io.Fonts->Clear();
     ImFontConfig font_config = {};
+    font_config.OversampleH = 3;
+    font_config.OversampleV = 2;
     if (!viz.sUIFont.empty()) {
         io.Fonts->AddFontFromFileTTF(Util::WstringToString(viz.sUIFont), 14.0f * scale, &font_config, io.Fonts->GetGlyphRangesDefault());
     } else {
@@ -1982,6 +1992,37 @@ void Renderer::UpdateImGuiSettings() {
         font_config.MergeMode = true;
         io.Fonts->AddFontFromFileTTF((std::string(fonts_dir) + "\\msgothic.ttc").c_str(), 14.0f * scale, &font_config, io.Fonts->GetGlyphRangesJapanese());
     }
+
+    // High-resolution font for wordmarks / splash title (modern, sleek typography)
+    ImFontConfig title_font_config = {};
+    title_font_config.OversampleH = 3;
+    title_font_config.OversampleV = 2;
+    if (!viz.sUIFont.empty()) {
+        io.Fonts->AddFontFromFileTTF(Util::WstringToString(viz.sUIFont), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+    } else {
+        std::string bahnPath = std::string(fonts_dir) + "\\bahnschrift.ttf";
+        std::string segoeSbPath = std::string(fonts_dir) + "\\seguisb.ttf";
+        std::string segoePath = std::string(fonts_dir) + "\\segoeui.ttf";
+        std::string candaraPath = std::string(fonts_dir) + "\\Candara.ttf";
+        std::string tahomaPath = std::string(fonts_dir) + "\\Tahoma.ttf";
+
+        DWORD dwBahn = GetFileAttributesA(bahnPath.c_str());
+        DWORD dwSegoeSb = GetFileAttributesA(segoeSbPath.c_str());
+        DWORD dwSegoe = GetFileAttributesA(segoePath.c_str());
+        DWORD dwCandara = GetFileAttributesA(candaraPath.c_str());
+        if (dwBahn != INVALID_FILE_ATTRIBUTES && !(dwBahn & FILE_ATTRIBUTE_DIRECTORY)) {
+            io.Fonts->AddFontFromFileTTF(bahnPath.c_str(), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+        } else if (dwSegoeSb != INVALID_FILE_ATTRIBUTES && !(dwSegoeSb & FILE_ATTRIBUTE_DIRECTORY)) {
+            io.Fonts->AddFontFromFileTTF(segoeSbPath.c_str(), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+        } else if (dwSegoe != INVALID_FILE_ATTRIBUTES && !(dwSegoe & FILE_ATTRIBUTE_DIRECTORY)) {
+            io.Fonts->AddFontFromFileTTF(segoePath.c_str(), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+        } else if (dwCandara != INVALID_FILE_ATTRIBUTES && !(dwCandara & FILE_ATTRIBUTE_DIRECTORY)) {
+            io.Fonts->AddFontFromFileTTF(candaraPath.c_str(), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+        } else {
+            io.Fonts->AddFontFromFileTTF(tahomaPath.c_str(), 26.0f * scale, &title_font_config, io.Fonts->GetGlyphRangesDefault());
+        }
+    }
+
     io.IniFilename = nullptr;
     if (!io.Fonts->Build()) {
         io.Fonts->Clear();

@@ -466,7 +466,7 @@ void RenderText();
     bool m_bRenderVideo = false;
     HANDLE m_hFFPipeWrite = NULL;
     HANDLE m_hFFProc = NULL;
-    std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav;
+    std::wstring m_sFFVideoRaw, m_sFFVideoOut, m_sFFWav, m_sFFLog;
     bool m_bRenderPending = false;
     bool m_bRenderResizePending = false;
     bool m_bRenderMainRectSaved = false;

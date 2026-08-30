@@ -17,6 +17,7 @@
 #include <thread>
 #include <atomic>
 #include <cstdio>
+#include <ShlObj.h>
 
 #include "Globals.h"
 #include "GameState.h"
@@ -46,15 +47,111 @@ static void SyncTrackColors(Renderer* pRenderer, const vector<TrackSettings>& vT
     }
 }
 
-// ---- video render (FFmpeg capture) -----------------------------------------
+/// ---- video render (FFmpeg capture) -----------------------------------------
 bool g_bVideoRendering = false;
 
 // Resolution the raw stream was started with (the capture aborts cleanly if
 // the window is resized mid-render, which would corrupt the stream).
 static int s_FFCapW = 0, s_FFCapH = 0;
 
+std::wstring GetFFmpegExePath(const std::wstring& inPath)
+{
+    std::wstring s = inPath;
+    // Trim leading/trailing whitespace and quotes
+    while (!s.empty() && (s.front() == L' ' || s.front() == L'\t' || s.front() == L'\"' || s.front() == L'\''))
+        s.erase(s.begin());
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\"' || s.back() == L'\''))
+        s.pop_back();
+
+    if (s.empty())
+    {
+        // Try application directory
+        wchar_t exePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
+        {
+            std::wstring appDir = exePath;
+            size_t slash = appDir.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                appDir = appDir.substr(0, slash);
+            std::wstring testPath = appDir + L"\\ffmpeg.exe";
+            if (GetFileAttributesW(testPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+                return testPath;
+        }
+        return L"";
+    }
+
+    // Check if directly a file ending with .exe
+    if (s.length() >= 4 && _wcsicmp(s.c_str() + s.length() - 4, L".exe") == 0)
+    {
+        if (GetFileAttributesW(s.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return s;
+    }
+
+    // Remove trailing slash
+    while (!s.empty() && (s.back() == L'\\' || s.back() == L'/'))
+        s.pop_back();
+
+    std::wstring testPath = s + L"\\ffmpeg.exe";
+    if (GetFileAttributesW(testPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return testPath;
+
+    // In case s is already the full path without .exe extension
+    if (GetFileAttributesW(s.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        DWORD dwAttr = GetFileAttributesW(s.c_str());
+        if (!(dwAttr & FILE_ATTRIBUTE_DIRECTORY))
+            return s;
+    }
+
+    return L"";
+}
+
+static std::wstring ReadLogTail(const std::wstring& logPath, size_t maxChars = 800)
+{
+    if (logPath.empty())
+        return L"";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, logPath.c_str(), L"rb") != 0 || !f)
+        return L"";
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0)
+    {
+        fclose(f);
+        return L"";
+    }
+    long readSz = (long)min((size_t)sz, (size_t)4096);
+    fseek(f, -readSz, SEEK_END);
+    std::vector<char> buf(readSz + 1, 0);
+    size_t bytesRead = fread(buf.data(), 1, readSz, f);
+    fclose(f);
+    buf[bytesRead] = '\0';
+
+    int len = MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)bytesRead, NULL, 0);
+    std::wstring wstr;
+    if (len > 0)
+    {
+        wstr.resize(len);
+        MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)bytesRead, &wstr[0], len);
+    }
+    else
+    {
+        len = MultiByteToWideChar(CP_ACP, 0, buf.data(), (int)bytesRead, NULL, 0);
+        if (len > 0)
+        {
+            wstr.resize(len);
+            MultiByteToWideChar(CP_ACP, 0, buf.data(), (int)bytesRead, &wstr[0], len);
+        }
+    }
+
+    if (wstr.length() > maxChars)
+        wstr = wstr.substr(wstr.length() - maxChars);
+    return wstr;
+}
+
 // Runs an ffmpeg command to completion (used for the final mux pass).
-static void RunFFmpegSync(wchar_t* sCmd)
+// Returns true if the process was created and exited with code 0.
+static bool RunFFmpegSync(wchar_t* sCmd)
 {
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
@@ -62,10 +159,46 @@ static void RunFFmpegSync(wchar_t* sCmd)
     if (CreateProcessW(NULL, sCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     {
         WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD dwExitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &dwExitCode);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+        return (dwExitCode == 0);
+    }
+    return false;
+}
+
+static bool FileExistsAndNonEmpty(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        return false;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return false;
+    return (fad.nFileSizeHigh > 0 || fad.nFileSizeLow > 0);
+}
+
+static uint64_t GetFileSizeHelper(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        return 0;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return 0;
+    return ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+}
+
+static void EnsureDirectoryExistsForFile(const std::wstring& filePath)
+{
+    size_t slash = filePath.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+    {
+        std::wstring dir = filePath.substr(0, slash);
+        if (!dir.empty())
+            SHCreateDirectoryExW(NULL, dir.c_str(), NULL);
     }
 }
+
 
 bool RequestVideoRender()
 {
@@ -80,11 +213,7 @@ bool RequestVideoRender()
 
 void StopVideoRender()
 {
-    if (!g_pGameState)
-        return;
-    MainScreen* ms = dynamic_cast<MainScreen*>(g_pGameState);
-    if (ms)
-        ms->FinishVideoRender();
+    HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
 }
 
 bool VideoRenderSongLoaded()
@@ -126,15 +255,10 @@ void MainScreen::StartVideoRender()
         MessageBox(g_hWnd, TEXT("Enable Pre-rendered Audio in Settings -> Audio first.\nThe video render records the prerendered audio track."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
         return;
     }
-    if (viz.sFFmpegDir.empty())
+    std::wstring sFFmpegExe = GetFFmpegExePath(viz.sFFmpegDir);
+    if (sFFmpegExe.empty())
     {
-        MessageBox(g_hWnd, TEXT("Set the FFmpeg folder (the one containing ffmpeg.exe) first."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-    std::wstring sFFmpeg = viz.sFFmpegDir + L"\\ffmpeg.exe";
-    if (GetFileAttributesW(sFFmpeg.c_str()) == INVALID_FILE_ATTRIBUTES)
-    {
-        MessageBox(g_hWnd, TEXT("ffmpeg.exe was not found in the FFmpeg folder."), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+        MessageBox(g_hWnd, TEXT("ffmpeg.exe was not found. Please set the FFmpeg binary folder in Render to Video settings."), TEXT("Render Video"), MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -156,22 +280,52 @@ void MainScreen::BeginVideoRender()
     size_t dot = sName.find_last_of(L'.');
     if (dot != std::wstring::npos)
         sName = sName.substr(0, dot);
-    wchar_t cwd[MAX_PATH] = {};
-    GetCurrentDirectoryW(MAX_PATH, cwd);
-    m_sFFWav = std::wstring(cwd) + L"\\Render_" + sName + L"_audio.wav";
-    m_sFFVideoRaw = std::wstring(cwd) + L"\\Render_" + sName + L"_video.mp4";
+    if (sName.empty())
+        sName = L"Output";
+
     const std::wstring sExt = viz.iRenderFormat == 1 ? L"mov" : viz.iRenderFormat == 2 ? L"avi" : L"mp4";
+
+    // Determine output video path
     m_sFFVideoOut = viz.sRenderOutputPath;
     if (m_sFFVideoOut.empty())
+    {
+        wchar_t cwd[MAX_PATH] = {};
+        GetCurrentDirectoryW(MAX_PATH, cwd);
         m_sFFVideoOut = std::wstring(cwd) + L"\\Render_" + sName + L"." + sExt;
+    }
     else
     {
-        size_t dot2 = m_sFFVideoOut.find_last_of(L'.');
-        size_t slash2 = m_sFFVideoOut.find_last_of(L"\\/");
-        if (dot2 != std::wstring::npos && (slash2 == std::wstring::npos || dot2 > slash2))
-            m_sFFVideoOut = m_sFFVideoOut.substr(0, dot2);
-        m_sFFVideoOut += L"." + sExt;
+        // Check if user passed a directory
+        DWORD dwAttr = GetFileAttributesW(m_sFFVideoOut.c_str());
+        if (dwAttr != INVALID_FILE_ATTRIBUTES && (dwAttr & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            if (m_sFFVideoOut.back() != L'\\' && m_sFFVideoOut.back() != L'/')
+                m_sFFVideoOut += L"\\";
+            m_sFFVideoOut += L"Render_" + sName + L"." + sExt;
+        }
+        else if (m_sFFVideoOut.back() == L'\\' || m_sFFVideoOut.back() == L'/')
+        {
+            m_sFFVideoOut += L"Render_" + sName + L"." + sExt;
+        }
+        else
+        {
+            size_t dot2 = m_sFFVideoOut.find_last_of(L'.');
+            size_t slash2 = m_sFFVideoOut.find_last_of(L"\\/");
+            if (dot2 != std::wstring::npos && (slash2 == std::wstring::npos || dot2 > slash2))
+                m_sFFVideoOut = m_sFFVideoOut.substr(0, dot2);
+            m_sFFVideoOut += L"." + sExt;
+        }
     }
+
+    // Ensure output directory exists
+    EnsureDirectoryExistsForFile(m_sFFVideoOut);
+
+    // Get temp directory for intermediate raw video and audio files
+    wchar_t tempDir[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tempDir);
+    DWORD pid = GetCurrentProcessId();
+    m_sFFWav = std::wstring(tempDir) + L"PFA_render_" + std::to_wstring(pid) + L"_audio.wav";
+    m_sFFVideoRaw = std::wstring(tempDir) + L"PFA_render_" + std::to_wstring(pid) + L"_raw.mp4";
 
     int w = (int)m_pRenderer->GetBufferWidth(), h = (int)m_pRenderer->GetBufferHeight();
     const bool bZoomed = (IsZoomed(g_hWnd) != FALSE);
@@ -233,12 +387,27 @@ void MainScreen::BeginVideoRender()
     }
     if (viz.bRenderAdvanced && !viz.sRenderAdvancedOptions.empty())
         sEnc += std::string(Util::WstringToString(viz.sRenderAdvancedOptions)) + " ";
-    if (w != viz.iRenderWidth || h != viz.iRenderHeight)
+
+    // Ensure output dimensions are even (libx264/libx265 yuv420p requires even width and height)
+    int targetW = max(2, (viz.iRenderWidth + 1) & ~1);
+    int targetH = max(2, (viz.iRenderHeight + 1) & ~1);
+    if (w != targetW || h != targetH || (w % 2 != 0) || (h % 2 != 0))
     {
-        sprintf_s(sNum, "-vf scale=%d:%d ", viz.iRenderWidth, viz.iRenderHeight);
+        sprintf_s(sNum, "-vf \"scale=%d:%d\" ", targetW, targetH);
         sEnc += sNum;
     }
     sEnc += "-pix_fmt yuv420p";
+
+    std::wstring sFFmpegExe = GetFFmpegExePath(viz.sFFmpegDir);
+    if (sFFmpegExe.empty())
+    {
+        RestoreMainWindowAfterRender();
+        MessageBox(g_hWnd, TEXT("ffmpeg.exe was not found. Please verify your FFmpeg binary location in settings."), TEXT("Render Video"), MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    m_sFFLog = std::wstring(tempDir) + L"PFA_render_" + std::to_wstring(pid) + L"_ffmpeg.log";
+    DeleteFileW(m_sFFLog.c_str());
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hPipeRead = NULL, hPipeWrite = NULL;
@@ -249,23 +418,32 @@ void MainScreen::BeginVideoRender()
         return;
     }
     SetHandleInformation(hPipeWrite, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE hLog = CreateFileW(m_sFFLog.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
     wchar_t sCmd[4096];
-    swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -f rawvideo -pix_fmt bgra -s %dx%d -r %d -i pipe:0 -an %hs -r %d \"%ls\"",
-        viz.sFFmpegDir.c_str(), w, h, viz.iRenderFPS, sEnc.c_str(), viz.iRenderFPS, m_sFFVideoRaw.c_str());
+    swprintf_s(sCmd, L"\"%ls\" -y -f rawvideo -pix_fmt bgra -s %dx%d -framerate %d -i pipe:0 -an %hs \"%ls\"",
+        sFFmpegExe.c_str(), w, h, viz.iRenderFPS, sEnc.c_str(), m_sFFVideoRaw.c_str());
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = hPipeRead;
+    si.hStdOutput = (hLog != INVALID_HANDLE_VALUE) ? hLog : NULL;
+    si.hStdError = (hLog != INVALID_HANDLE_VALUE) ? hLog : NULL;
     PROCESS_INFORMATION pi = {};
     if (!CreateProcessW(NULL, sCmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     {
         CloseHandle(hPipeRead);
         CloseHandle(hPipeWrite);
+        if (hLog != INVALID_HANDLE_VALUE)
+            CloseHandle(hLog);
         RestoreMainWindowAfterRender();
         MessageBox(g_hWnd, TEXT("Could not start ffmpeg.exe."), TEXT("Render Video"), MB_OK | MB_ICONERROR);
         return;
     }
     CloseHandle(hPipeRead);
+    if (hLog != INVALID_HANDLE_VALUE)
+        CloseHandle(hLog);
     m_hFFPipeWrite = hPipeWrite;
     m_hFFProc = pi.hProcess;
     CloseHandle(pi.hThread);
@@ -318,7 +496,13 @@ void MainScreen::FinishVideoRender()
     }
     if (m_hFFProc)
     {
-        WaitForSingleObject(m_hFFProc, 60000);
+        DWORD dwWait = WaitForSingleObject(m_hFFProc, 10000);
+        if (dwWait == WAIT_TIMEOUT)
+        {
+            PRE_DbgLog("RENDER: FFmpeg process timed out, terminating");
+            TerminateProcess(m_hFFProc, 1);
+            WaitForSingleObject(m_hFFProc, 2000);
+        }
         CloseHandle(m_hFFProc);
         m_hFFProc = NULL;
     }
@@ -334,33 +518,81 @@ void MainScreen::FinishVideoRender()
         PRE_MIDIAudio->StopWavRecording();
     CustomWavStop();
 
-    // Mux the raw video with the recorded WAV (unless audio is disabled), padding the audio with
-    // silence if it came up short, and remux into the chosen container at the user's output path.
     Config& config = Config::GetConfig();
+    config.GetPlaybackSettings().SetPaused(true, true);
     VizSettings& viz = config.GetVizSettings();
+
+    // Check if raw video was produced
+    bool bRawVideoExists = FileExistsAndNonEmpty(m_sFFVideoRaw);
+    if (!bRawVideoExists)
+    {
+        std::wstring errTail = ReadLogTail(m_sFFLog);
+        DeleteFileW(m_sFFWav.c_str());
+        DeleteFileW(m_sFFVideoRaw.c_str());
+        DeleteFileW(m_sFFLog.c_str());
+        std::wstring msg = L"Video encoding failed: raw video stream was not generated.";
+        if (!errTail.empty())
+            msg += L"\n\nFFmpeg details:\n" + errTail;
+        MessageBox(g_hWnd, msg.c_str(), TEXT("Render Video"), MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Check audio availability (header is 44 bytes, so file size must be > 44 bytes to have audio data)
+    const bool bHasAudio = viz.bRenderIncludeAudio && FileExistsAndNonEmpty(m_sFFWav) && (GetFileSizeHelper(m_sFFWav) > 44);
+
     const wchar_t* sFmt = viz.iRenderFormat == 1 ? L"mov" : viz.iRenderFormat == 2 ? L"avi" : L"mp4";
     const wchar_t* sFast = viz.iRenderFormat == 2 ? L"" : L" -movflags +faststart";
-    wchar_t sCmd[4096];
-    if (viz.bRenderIncludeAudio)
-        swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -i \"%ls\" -i \"%ls\" -filter:a apad -c:v copy -c:a aac -b:a 192k -shortest%s -f %ls \"%ls\"",
-            viz.sFFmpegDir.c_str(), m_sFFVideoRaw.c_str(), m_sFFWav.c_str(), sFast, sFmt, m_sFFVideoOut.c_str());
-    else
-        swprintf_s(sCmd, L"\"%ls\\ffmpeg.exe\" -y -i \"%ls\" -c:v copy -f %ls \"%ls\"",
-            viz.sFFmpegDir.c_str(), m_sFFVideoRaw.c_str(), sFmt, m_sFFVideoOut.c_str());
-    RunFFmpegSync(sCmd);
+    // For AVI, standard FFmpeg muxer requires MP3 or PCM; AAC is rejected.
+    const wchar_t* sAudioEnc = viz.iRenderFormat == 2 ? L"-c:a mp3 -b:a 192k" : L"-c:a aac -b:a 192k";
 
-    PRE_DbgLog("RENDER: done out=%ls", m_sFFVideoOut.c_str());
+    std::wstring sFFmpegExe = GetFFmpegExePath(viz.sFFmpegDir);
+    wchar_t sCmd[4096];
+    if (bHasAudio)
+    {
+        swprintf_s(sCmd, L"\"%ls\" -y -i \"%ls\" -i \"%ls\" -filter:a apad -c:v copy %ls -shortest%ls -f %ls \"%ls\"",
+            sFFmpegExe.c_str(), m_sFFVideoRaw.c_str(), m_sFFWav.c_str(), sAudioEnc, sFast, sFmt, m_sFFVideoOut.c_str());
+    }
+    else
+    {
+        swprintf_s(sCmd, L"\"%ls\" -y -i \"%ls\" -c:v copy%ls -f %ls \"%ls\"",
+            sFFmpegExe.c_str(), m_sFFVideoRaw.c_str(), sFast, sFmt, m_sFFVideoOut.c_str());
+    }
+
+    bool bMuxSuccess = RunFFmpegSync(sCmd) && FileExistsAndNonEmpty(m_sFFVideoOut);
+
+    if (!bMuxSuccess)
+    {
+        PRE_DbgLog("RENDER: mux failed, attempting fallback move to out: %ls", m_sFFVideoOut.c_str());
+        // Fallback: try copy/move the raw video directly to output so user doesn't lose the render
+        if (CopyFileW(m_sFFVideoRaw.c_str(), m_sFFVideoOut.c_str(), FALSE))
+        {
+            bMuxSuccess = true;
+            PRE_DbgLog("RENDER: fallback copy succeeded");
+        }
+    }
+
+    PRE_DbgLog("RENDER: done out=%ls (success=%d)", m_sFFVideoOut.c_str(), (int)bMuxSuccess);
+
+    // Clean up temporary files
     DeleteFileW(m_sFFVideoRaw.c_str());
     DeleteFileW(m_sFFWav.c_str());
+    DeleteFileW(m_sFFLog.c_str());
 
     const std::wstring& name = m_MIDI.GetInfo().sFilename;
     TCHAR sTitle[1024];
     _stprintf_s(sTitle, TEXT("%ws"), name.c_str() + (name.find_last_of(L'\\') + 1));
     SetMainTitle(sTitle);
 
-    std::wstring sMsg = L"Render complete:\n" + m_sFFVideoOut;
-    MessageBox(g_hWnd, sMsg.c_str(), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
-    PRE_DbgLog("RENDER: done %ls", m_sFFVideoOut.c_str());
+    if (bMuxSuccess)
+    {
+        std::wstring sMsg = L"Render complete:\n" + m_sFFVideoOut;
+        MessageBox(g_hWnd, sMsg.c_str(), TEXT("Render Video"), MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        std::wstring sMsg = L"Failed to save video to output file:\n" + m_sFFVideoOut + L"\n\nPlease check FFmpeg path, permissions, and disk space.";
+        MessageBox(g_hWnd, sMsg.c_str(), TEXT("Render Video"), MB_OK | MB_ICONERROR);
+    }
 }
 
 void MainScreen::RestoreMainWindowAfterRender()
@@ -1521,16 +1753,16 @@ static bool GetSplashRecentMIDILayout(
     if (screenW < 280.0f * layout.scale || screenH < 180.0f * layout.scale)
         return false;
 
-    layout.headerH = 40.0f * layout.scale;
-    layout.rowH = 27.0f * layout.scale;
-    const float availableRows = floorf((screenH - margin * 2.0f - layout.headerH - 10.0f * layout.scale) / layout.rowH);
+    layout.headerH = 42.0f * layout.scale;
+    layout.rowH = 46.0f * layout.scale;
+    const float availableRows = floorf((screenH - margin * 2.0f - layout.headerH - 12.0f * layout.scale) / layout.rowH);
     if (availableRows < 1.0f)
         return false;
 
     const size_t requestedRows = (std::max)((size_t)1, recentCount);
     layout.visibleRows = (std::min)(requestedRows, (size_t)availableRows);
-    const float panelW = (std::min)(360.0f * layout.scale, screenW - margin * 2.0f);
-    const float panelH = layout.headerH + layout.rowH * layout.visibleRows + 10.0f * layout.scale;
+    const float panelW = (std::min)(440.0f * layout.scale, screenW - margin * 2.0f);
+    const float panelH = layout.headerH + layout.rowH * layout.visibleRows + 12.0f * layout.scale;
     layout.panelRight = screenW - margin;
     layout.panelBottom = screenH - margin;
     layout.panelLeft = layout.panelRight - panelW;
@@ -1553,7 +1785,7 @@ static bool SplashRecentMIDIHitTest(Renderer* renderer, const std::vector<std::w
     const size_t index = (size_t)((mouseY - layout.rowTop) / layout.rowH);
     if (index >= layout.visibleRows || index >= recentMIDIs.size())
         return false;
-    if (mouseY > layout.rowTop + layout.rowH * index + layout.rowH - 3.0f * layout.scale)
+    if (mouseY > layout.rowTop + layout.rowH * index + layout.rowH - 4.0f * layout.scale)
         return false;
     recentIndex = index;
     return true;
@@ -1567,7 +1799,7 @@ static std::string SplashRecentMIDIName(const std::wstring& path)
     if (name.empty())
         name = path;
 
-    static constexpr size_t kMaxNameLength = 42;
+    static constexpr size_t kMaxNameLength = 36;
     if (name.length() > kMaxNameLength) {
         const size_t extensionStart = name.find_last_of(L'.');
         const std::wstring extension = extensionStart == std::wstring::npos
@@ -1577,6 +1809,84 @@ static std::string SplashRecentMIDIName(const std::wstring& path)
         name = name.substr(0, prefixLength) + L"..." + extension;
     }
     return std::string(Util::WstringToString(name));
+}
+
+struct SplashRecentMIDIInfo {
+    std::string displayName;
+    std::string folderName;
+    std::string sizeStr;
+    std::string detailStr;
+    bool exists = false;
+};
+
+static SplashRecentMIDIInfo GetSplashRecentMIDIInfo(const std::wstring& path)
+{
+    static std::unordered_map<std::wstring, SplashRecentMIDIInfo> s_cache;
+    auto it = s_cache.find(path);
+    if (it != s_cache.end())
+        return it->second;
+
+    SplashRecentMIDIInfo info;
+    info.displayName = SplashRecentMIDIName(path);
+
+    size_t lastSlash = path.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos && lastSlash > 0) {
+        size_t prevSlash = path.find_last_of(L"\\/", lastSlash - 1);
+        std::wstring folder = (prevSlash == std::wstring::npos)
+            ? path.substr(0, lastSlash)
+            : path.substr(prevSlash + 1, lastSlash - prevSlash - 1);
+        if (!folder.empty()) {
+            if (folder.back() == L':') folder += L"\\";
+            info.folderName = Util::WstringToString(folder);
+        }
+    }
+    if (info.folderName.empty()) {
+        info.folderName = "MIDI";
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        info.exists = true;
+        uint64_t fileSize = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        if (fileSize >= 1024 * 1024) {
+            char buf[32];
+            sprintf_s(buf, "%.1f MB", (double)fileSize / (1024.0 * 1024.0));
+            info.sizeStr = buf;
+        } else if (fileSize >= 1024) {
+            char buf[32];
+            sprintf_s(buf, "%llu KB", (fileSize + 512) / 1024);
+            info.sizeStr = buf;
+        } else {
+            char buf[32];
+            sprintf_s(buf, "%llu B", fileSize);
+            info.sizeStr = buf;
+        }
+
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            unsigned char hdr[14] = {};
+            DWORD bytesRead = 0;
+            if (ReadFile(hFile, hdr, 14, &bytesRead, NULL) && bytesRead == 14) {
+                if (hdr[0] == 'M' && hdr[1] == 'T' && hdr[2] == 'h' && hdr[3] == 'd') {
+                    int format = (hdr[8] << 8) | hdr[9];
+                    int numTracks = (hdr[10] << 8) | hdr[11];
+                    char buf[64];
+                    if (numTracks > 1)
+                        sprintf_s(buf, "%d tracks (Fmt %d)", numTracks, format);
+                    else
+                        sprintf_s(buf, "1 track (Fmt %d)", format);
+                    info.detailStr = buf;
+                }
+            }
+            CloseHandle(hFile);
+        }
+    } else {
+        info.exists = false;
+        info.sizeStr = "Missing";
+    }
+
+    s_cache[path] = info;
+    return info;
 }
 
 void SplashScreen::RenderOverlay()
@@ -1591,25 +1901,131 @@ void SplashScreen::RenderOverlay()
     const float scale = (std::min)((std::max)(viz.fUIScale, 0.75f), 1.50f);
     const float margin = 20.0f * scale;
 
-    // A soft, breathing wordmark keeps the splash feeling alive without competing
-    // with the falling notes.
+    // High quality wordmark with alternating letter glow and shimmering pulse
+    ImFont* wordmarkFont = (ImGui::GetIO().Fonts->Fonts.size() > 1) ? ImGui::GetIO().Fonts->Fonts[1] : font;
     const double seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    const float breath = 0.5f + 0.5f * sinf((float)seconds * 0.82f);
-    const int wordmarkAlpha = (int)(75.0f + 110.0f * breath);
-    const float wordmarkSize = 27.0f * scale;
+    const float breath = 0.65f + 0.35f * (0.5f + 0.5f * sinf((float)seconds * 0.82f));
+    const float wordmarkSize = 25.0f * scale;
+    const float letterSpacing = 1.8f * scale; // Sleek modern typography tracking
     const ImVec2 wordmarkPos(margin, (std::max)(6.0f * scale, screenH - margin - wordmarkSize));
-    draw->AddText(font, wordmarkSize, ImVec2(wordmarkPos.x + 1.0f * scale, wordmarkPos.y + 2.0f * scale),
-        IM_COL32(0, 0, 0, wordmarkAlpha / 2), "PlayGroundFromAbove");
-    draw->AddText(font, wordmarkSize, wordmarkPos,
-        IM_COL32(223, 241, 255, wordmarkAlpha), "PlayGroundFromAbove");
+    const char* text = "PlayGroundFromAbove";
+    const size_t textLen = strlen(text);
+
+    // Dynamic accent-aware alternating glow colors
+    const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(viz.uGUIPaletteBase);
+    const float colA_r = 0.15f * accent.x + 0.85f * 0.20f;
+    const float colA_g = 0.15f * accent.y + 0.85f * 0.82f;
+    const float colA_z = 0.15f * accent.z + 0.85f * 1.00f;
+
+    const float colB_r = 0.25f * accent.x + 0.75f * 0.70f;
+    const float colB_g = 0.15f * accent.y + 0.85f * 0.45f;
+    const float colB_z = 0.25f * accent.z + 0.75f * 1.00f;
+
+    // Smooth multi-angle diffusion kernel for realistic optical bloom
+    static const float kOuterDirs[12][2] = {
+        {  1.0000f,  0.0000f }, {  0.8660f,  0.5000f }, {  0.5000f,  0.8660f },
+        {  0.0000f,  1.0000f }, { -0.5000f,  0.8660f }, { -0.8660f,  0.5000f },
+        { -1.0000f,  0.0000f }, { -0.8660f, -0.5000f }, { -0.5000f, -0.8660f },
+        {  0.0000f, -1.0000f }, {  0.5000f, -0.8660f }, {  0.8660f, -0.5000f }
+    };
+    static const float kMidDirs[8][2] = {
+        {  1.0f,  0.0f }, { -1.0f,  0.0f }, {  0.0f,  1.0f }, {  0.0f, -1.0f },
+        {  0.7071f,  0.7071f }, { -0.7071f,  0.7071f },
+        {  0.7071f, -0.7071f }, { -0.7071f, -0.7071f }
+    };
+
+    float currentOffsetX = 0.0f;
+    for (size_t i = 0; i < textLen; ++i) {
+        // Alternating letter wave and pulse
+        const float waveOffset = (float)i * 0.38f;
+        const float altPhase = (i % 2 == 0) ? 0.0f : 3.14159265f;
+        const float letterPulse = 0.5f + 0.5f * sinf((float)seconds * 2.2f + waveOffset + altPhase);
+        const float wavePulse = 0.5f + 0.5f * sinf((float)seconds * 1.5f - (float)i * 0.30f);
+        const float glowIntensity = 0.30f + 0.70f * (0.60f * letterPulse + 0.40f * wavePulse);
+
+        // Blend between Tone A (electric cyan/azure) and Tone B (celestial amethyst/violet)
+        const float tColor = (i % 2 == 0)
+            ? (0.10f + 0.80f * letterPulse)
+            : (0.90f - 0.80f * letterPulse);
+
+        const float glowR = colA_r * (1.0f - tColor) + colB_r * tColor;
+        const float glowG = colA_g * (1.0f - tColor) + colB_g * tColor;
+        const float glowB = colA_z * (1.0f - tColor) + colB_z * tColor;
+
+        const ImVec2 charPos(wordmarkPos.x + currentOffsetX, wordmarkPos.y);
+        const char chStr[2] = { text[i], '\0' };
+        const float charW = wordmarkFont->CalcTextSizeA(wordmarkSize, FLT_MAX, 0.0f, chStr, chStr + 1).x;
+        currentOffsetX += charW + letterSpacing;
+
+        // 1. Soft atmospheric drop shadow (clean legibility against falling notes)
+        const int shadowAlpha = (int)(110.0f * breath);
+        draw->AddText(wordmarkFont, wordmarkSize,
+            ImVec2(charPos.x + 1.2f * scale, charPos.y + 1.8f * scale),
+            IM_COL32(0, 0, 0, shadowAlpha), chStr);
+        draw->AddText(wordmarkFont, wordmarkSize,
+            ImVec2(charPos.x + 2.4f * scale, charPos.y + 3.2f * scale),
+            IM_COL32(0, 0, 0, shadowAlpha / 3), chStr);
+
+        // 2. Wide atmospheric haze glow (soft, diffused optical light)
+        const float outerRadius = (4.0f + 2.5f * glowIntensity) * scale;
+        const int outerAlpha = (int)((25.0f + 35.0f * glowIntensity) * breath);
+        const ImU32 outerGlowCol = IM_COL32(
+            (int)(glowR * 255.0f + 0.5f),
+            (int)(glowG * 255.0f + 0.5f),
+            (int)(glowB * 255.0f + 0.5f),
+            (std::max)(1, outerAlpha / 6));
+
+        for (int k = 0; k < 12; ++k) {
+            draw->AddText(wordmarkFont, wordmarkSize,
+                ImVec2(charPos.x + kOuterDirs[k][0] * outerRadius, charPos.y + kOuterDirs[k][1] * outerRadius),
+                outerGlowCol, chStr);
+        }
+
+        // 3. Medium bloom aura
+        const float midRadius = (1.8f + 1.4f * glowIntensity) * scale;
+        const int midAlpha = (int)((55.0f + 65.0f * glowIntensity) * breath);
+        const ImU32 midGlowCol = IM_COL32(
+            (int)(glowR * 255.0f + 0.5f),
+            (int)(glowG * 255.0f + 0.5f),
+            (int)(glowB * 255.0f + 0.5f),
+            (std::max)(1, midAlpha / 4));
+
+        for (int k = 0; k < 8; ++k) {
+            draw->AddText(wordmarkFont, wordmarkSize,
+                ImVec2(charPos.x + kMidDirs[k][0] * midRadius, charPos.y + kMidDirs[k][1] * midRadius),
+                midGlowCol, chStr);
+        }
+
+        // 4. Subtle inner halo
+        const float innerRadius = 0.8f * scale;
+        const int innerAlpha = (int)((70.0f + 50.0f * glowIntensity) * breath);
+        const ImU32 innerGlowCol = IM_COL32(
+            (int)(glowR * 255.0f + 0.5f),
+            (int)(glowG * 255.0f + 0.5f),
+            (int)(glowB * 255.0f + 0.5f),
+            (std::max)(1, innerAlpha / 4));
+
+        for (int k = 0; k < 4; ++k) {
+            draw->AddText(wordmarkFont, wordmarkSize,
+                ImVec2(charPos.x + kMidDirs[k][0] * innerRadius, charPos.y + kMidDirs[k][1] * innerRadius),
+                innerGlowCol, chStr);
+        }
+
+        // 5. Crisp, elegant letter face with pure silver-white luminescence
+        const int faceAlpha = (int)((200.0f + 55.0f * breath));
+        const int faceR = (int)(230.0f + 25.0f * glowIntensity * (1.0f - tColor));
+        const int faceG = (int)(242.0f + 13.0f * glowIntensity);
+        const int faceB = 255;
+        draw->AddText(wordmarkFont, wordmarkSize, charPos,
+            IM_COL32(faceR, faceG, faceB, faceAlpha), chStr);
+    }
 
     SplashRecentMIDILayout layout;
     const std::vector<std::wstring> recentMIDIs = viz.GetRecentMIDIs();
     if (!GetSplashRecentMIDILayout(m_pRenderer, recentMIDIs.size(), layout))
         return;
 
-    const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(viz.uGUIPaletteBase);
     const auto accentColor = [&accent](float mix, int alpha) {
         const float baseR = 9.0f, baseG = 17.0f, baseB = 30.0f;
         return IM_COL32(
@@ -1618,71 +2034,150 @@ void SplashScreen::RenderOverlay()
             (int)(baseB + (accent.z * 255.0f - baseB) * mix + 0.5f), alpha);
     };
 
-    const float rounding = 9.0f * layout.scale;
+    const float rounding = 11.0f * layout.scale;
     const float panelLeft = layout.panelLeft;
     const float panelTop = layout.panelTop;
     const float panelRight = layout.panelRight;
     const float panelBottom = layout.panelBottom;
     const float headerH = layout.headerH;
 
-    // A high-contrast card keeps filenames clear over the animated splash notes.
-    draw->AddRectFilled(ImVec2(panelLeft + 3.0f * scale, panelTop + 5.0f * scale),
-        ImVec2(panelRight + 3.0f * scale, panelBottom + 5.0f * scale),
-        IM_COL32(0, 0, 0, 92), rounding);
-    draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
-        accentColor(0.14f, 232), rounding);
-    draw->AddRectFilled(ImVec2(panelLeft + 1.0f * scale, panelTop + 1.0f * scale),
-        ImVec2(panelRight - 1.0f * scale, panelTop + headerH), accentColor(0.32f, 245),
-        rounding - 1.0f * scale);
-    draw->AddRect(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
-        accentColor(0.88f, 175), rounding, 0, 1.0f * scale);
-    draw->AddLine(ImVec2(panelLeft + 12.0f * scale, panelTop + headerH),
-        ImVec2(panelRight - 12.0f * scale, panelTop + headerH), accentColor(0.90f, 195), 1.0f * scale);
+    // 1. Frosted blur / soft layered backdrop shadows
+    draw->AddRectFilled(ImVec2(panelLeft - 10.0f * scale, panelTop - 8.0f * scale),
+        ImVec2(panelRight + 10.0f * scale, panelBottom + 12.0f * scale),
+        IM_COL32(0, 0, 0, 18), rounding + 8.0f * scale);
+    draw->AddRectFilled(ImVec2(panelLeft - 4.0f * scale, panelTop - 3.0f * scale),
+        ImVec2(panelRight + 4.0f * scale, panelBottom + 6.0f * scale),
+        IM_COL32(0, 0, 0, 38), rounding + 3.0f * scale);
+    draw->AddRectFilled(ImVec2(panelLeft + 2.0f * scale, panelTop + 4.0f * scale),
+        ImVec2(panelRight + 2.0f * scale, panelBottom + 6.0f * scale),
+        IM_COL32(0, 0, 0, 80), rounding);
 
-    const float titleX = panelLeft + 15.0f * scale;
-    const float titleY = panelTop + 12.0f * scale;
-    draw->AddText(font, 15.0f * scale, ImVec2(titleX + 1.0f * scale, titleY + 1.0f * scale),
-        IM_COL32(0, 0, 0, 175), "Recent MIDIs");
-    draw->AddText(font, 15.0f * scale, ImVec2(titleX, titleY),
-        IM_COL32(242, 249, 255, 255), "Recent MIDIs");
+    // 2. Translucent glass body with low color opacity (frosted dark acrylic glass)
+    draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+        IM_COL32(10, 16, 26, 115), rounding);
+    draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+        accentColor(0.20f, 42), rounding);
+
+    // 3. Frosted header bar
+    draw->AddRectFilled(ImVec2(panelLeft + 1.0f * scale, panelTop + 1.0f * scale),
+        ImVec2(panelRight - 1.0f * scale, panelTop + headerH), accentColor(0.35f, 55),
+        rounding - 1.0f * scale);
+
+    // 4. Subtle glass rim highlights
+    draw->AddRect(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+        IM_COL32(255, 255, 255, 28), rounding, 0, 1.0f * scale);
+    draw->AddLine(ImVec2(panelLeft + rounding, panelTop),
+        ImVec2(panelRight - rounding, panelTop),
+        IM_COL32(255, 255, 255, 60), 1.0f * scale);
+    draw->AddLine(ImVec2(panelLeft + 12.0f * scale, panelTop + headerH),
+        ImVec2(panelRight - 12.0f * scale, panelTop + headerH), accentColor(0.85f, 70), 1.0f * scale);
+
+    // Header title & count badge
+    const float titleX = panelLeft + 16.0f * scale;
+    const float titleY = panelTop + 13.0f * scale;
+    draw->AddText(font, 14.0f * scale, ImVec2(titleX + 1.0f * scale, titleY + 1.0f * scale),
+        IM_COL32(0, 0, 0, 160), "Recent Files");
+    draw->AddText(font, 14.0f * scale, ImVec2(titleX, titleY),
+        IM_COL32(245, 250, 255, 255), "Recent Files");
 
     char count[24] = {};
-    sprintf_s(count, "%zu %s", recentMIDIs.size(), recentMIDIs.size() == 1 ? "FILE" : "FILES");
+    sprintf_s(count, "%zu %s", recentMIDIs.size(), recentMIDIs.size() == 1 ? "MIDI" : "MIDIS");
     const ImVec2 countSize = font->CalcTextSizeA(10.0f * scale, 10000.0f, 0.0f, count);
+    const float badgeW = countSize.x + 14.0f * scale;
+    const float badgeH = 18.0f * scale;
+    const float badgeX = panelRight - badgeW - 14.0f * scale;
+    const float badgeY = panelTop + 12.0f * scale;
+    draw->AddRectFilled(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH),
+        accentColor(0.45f, 45), 9.0f * scale);
+    draw->AddRect(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH),
+        accentColor(0.90f, 100), 9.0f * scale, 0, 1.0f * scale);
     draw->AddText(font, 10.0f * scale,
-        ImVec2(panelRight - countSize.x - 15.0f * scale, panelTop + 15.0f * scale),
-        accentColor(0.75f, 235), count);
+        ImVec2(badgeX + 7.0f * scale, badgeY + 2.0f * scale),
+        IM_COL32(225, 240, 255, 235), count);
 
     const float rowLeft = layout.rowLeft;
     const float rowRight = layout.rowRight;
     draw->PushClipRect(ImVec2(rowLeft, panelTop + headerH), ImVec2(rowRight, panelBottom), true);
     if (recentMIDIs.empty()) {
-        draw->AddText(font, 12.0f * scale, ImVec2(rowLeft + 10.0f * scale, layout.rowTop + 5.0f * scale),
-            IM_COL32(193, 215, 230, 230), "Open a MIDI file to build your recent list.");
+        draw->AddText(font, 12.0f * scale, ImVec2(rowLeft + 10.0f * scale, layout.rowTop + 10.0f * scale),
+            IM_COL32(193, 215, 230, 210), "Open a MIDI file to build your recent list.");
     } else {
         const ImVec2 mouse = ImGui::GetIO().MousePos;
         for (size_t index = 0; index < layout.visibleRows; ++index) {
             const float rowTop = layout.rowTop + layout.rowH * index;
-            const float rowBottom = rowTop + layout.rowH - 3.0f * scale;
+            const float rowBottom = rowTop + layout.rowH - 4.0f * scale;
             const bool hovered = mouse.x >= rowLeft && mouse.x <= rowRight &&
                 mouse.y >= rowTop && mouse.y <= rowBottom;
-            draw->AddRectFilled(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
-                hovered ? accentColor(0.58f, 220) : accentColor(0.46f, 58), 5.0f * scale);
-            draw->AddRectFilled(ImVec2(rowLeft + 6.0f * scale, rowTop + 7.0f * scale),
-                ImVec2(rowLeft + 9.0f * scale, rowBottom - 7.0f * scale),
-                hovered ? accentColor(1.00f, 255) : accentColor(0.88f, 225), 1.5f * scale);
 
-            const std::string filename = SplashRecentMIDIName(recentMIDIs[index]);
-            const float filenameX = rowLeft + 18.0f * scale;
-            const float textY = rowTop + 5.0f * scale;
-            draw->AddText(font, 12.0f * scale, ImVec2(filenameX + 1.0f * scale, textY + 1.0f * scale),
-                IM_COL32(0, 0, 0, 185), filename.c_str());
-            draw->AddText(font, 12.0f * scale, ImVec2(filenameX, textY),
-                IM_COL32(246, 250, 253, 255), filename.c_str());
+            const float rowRounding = 6.0f * scale;
             if (hovered) {
+                draw->AddRectFilled(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
+                    accentColor(0.48f, 95), rowRounding);
+                draw->AddRect(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
+                    accentColor(0.95f, 150), rowRounding, 0, 1.0f * scale);
+                draw->AddRectFilled(ImVec2(rowLeft + 2.0f * scale, rowTop + 4.0f * scale),
+                    ImVec2(rowLeft + 5.0f * scale, rowBottom - 4.0f * scale),
+                    accentColor(1.00f, 255), 1.5f * scale);
+            } else {
+                draw->AddRectFilled(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
+                    IM_COL32(255, 255, 255, 8), rowRounding);
+                draw->AddRect(ImVec2(rowLeft, rowTop), ImVec2(rowRight, rowBottom),
+                    IM_COL32(255, 255, 255, 12), rowRounding, 0, 1.0f * scale);
+            }
+
+            const SplashRecentMIDIInfo midiInfo = GetSplashRecentMIDIInfo(recentMIDIs[index]);
+
+            // Index box
+            char numBuf[8];
+            sprintf_s(numBuf, "%02zu", index + 1);
+            const float indexBoxW = 20.0f * scale;
+            const float indexBoxH = 20.0f * scale;
+            const float indexX = rowLeft + 8.0f * scale;
+            const float indexY = rowTop + (layout.rowH - 4.0f * scale - indexBoxH) * 0.5f;
+            draw->AddRectFilled(ImVec2(indexX, indexY), ImVec2(indexX + indexBoxW, indexY + indexBoxH),
+                hovered ? accentColor(0.70f, 65) : IM_COL32(255, 255, 255, 14), 4.0f * scale);
+            const ImVec2 numSize = font->CalcTextSizeA(9.5f * scale, 100.0f, 0.0f, numBuf);
+            draw->AddText(font, 9.5f * scale,
+                ImVec2(indexX + (indexBoxW - numSize.x) * 0.5f, indexY + (indexBoxH - numSize.y) * 0.5f),
+                hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 205, 225, 200), numBuf);
+
+            // Filename (Top line)
+            const float textLeft = rowLeft + 35.0f * scale;
+            const float nameY = rowTop + 4.0f * scale;
+            draw->AddText(font, 13.0f * scale, ImVec2(textLeft + 1.0f * scale, nameY + 1.0f * scale),
+                IM_COL32(0, 0, 0, 180), midiInfo.displayName.c_str());
+            draw->AddText(font, 13.0f * scale, ImVec2(textLeft, nameY),
+                hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(238, 246, 255, 245), midiInfo.displayName.c_str());
+
+            // Metadata info (Bottom line)
+            std::string metaStr;
+            if (!midiInfo.folderName.empty()) {
+                metaStr += midiInfo.folderName;
+            }
+            if (!midiInfo.detailStr.empty()) {
+                if (!metaStr.empty()) metaStr += "  *  ";
+                metaStr += midiInfo.detailStr;
+            }
+            if (!midiInfo.sizeStr.empty()) {
+                if (!metaStr.empty()) metaStr += "  *  ";
+                metaStr += midiInfo.sizeStr;
+            }
+            const float metaY = rowTop + 23.0f * scale;
+            draw->AddText(font, 10.5f * scale, ImVec2(textLeft, metaY),
+                hovered ? accentColor(0.85f, 245) : IM_COL32(150, 180, 205, 210), metaStr.c_str());
+
+            // Play pill on hover
+            if (hovered) {
+                const float playBtnW = 46.0f * scale;
+                const float playBtnH = 22.0f * scale;
+                const float playBtnX = rowRight - playBtnW - 8.0f * scale;
+                const float playBtnY = rowTop + (layout.rowH - 4.0f * scale - playBtnH) * 0.5f;
+                draw->AddRectFilled(ImVec2(playBtnX, playBtnY), ImVec2(playBtnX + playBtnW, playBtnY + playBtnH),
+                    accentColor(0.80f, 215), 11.0f * scale);
+                const ImVec2 playTextSize = font->CalcTextSizeA(10.0f * scale, 100.0f, 0.0f, "Play");
                 draw->AddText(font, 10.0f * scale,
-                    ImVec2(rowRight - 37.0f * scale, textY + 1.0f * scale),
-                    accentColor(1.00f, 255), "Play");
+                    ImVec2(playBtnX + (playBtnW - playTextSize.x) * 0.5f, playBtnY + (playBtnH - playTextSize.y) * 0.5f),
+                    IM_COL32(255, 255, 255, 255), "Play");
             }
         }
     }
@@ -2208,6 +2703,10 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     return Success;
                 case ID_PLAY_STOP:
                     HeartbeatLog("seek:writer(stop-command)");
+                    if (m_bRenderVideo || m_bRenderPending) {
+                        FinishVideoRender();
+                        return Success;
+                    }
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
                     s_fTransitionPhase = 0.0f;
@@ -2226,7 +2725,7 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     if (FAILED(m_pRenderer->ResetDevice())) {
                         HeartbeatLog("reset:failed-aborting-render");
                         if (m_bRenderVideo || m_bRenderPending)
-                            StopVideoRender();
+                            FinishVideoRender();
                     }
                     return Success;
                 case ID_FILE_RENDERVIDEO:
@@ -2235,7 +2734,7 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     m_pRenderer->m_bShowRenderDialog = true;
                     return Success;
                 case ID_FILE_STOPRENDER:
-                    StopVideoRender();
+                    FinishVideoRender();
                     return Success;
                 case ID_VIEW_MOVEANDZOOM:
                     if ( cView.GetZoomMove() )
@@ -2284,6 +2783,13 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
 
             switch( wParam )
             {
+                case VK_ESCAPE:
+                    if (m_bRenderVideo || m_bRenderPending)
+                    {
+                        FinishVideoRender();
+                        return Success;
+                    }
+                    break;
                 case VK_F6:
                     m_pRenderer->m_bShowRenderDialog = true;
                     return Success;
@@ -2292,6 +2798,11 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
                     return Success;
                 case VK_OEM_PERIOD:
                     HeartbeatLog("seek:writer(period-key stop)");
+                    if (m_bRenderVideo || m_bRenderPending)
+                    {
+                        FinishVideoRender();
+                        return Success;
+                    }
                     JumpTo(GetMinTime());
                     cPlayback.SetStopped(true);
                     return Success;
@@ -3302,7 +3813,11 @@ GameState::GameError MainScreen::Render()
             if (frame) {
                 DWORD dwBytes = static_cast<DWORD>(m_pRenderer->GetBufferWidth() * m_pRenderer->GetBufferHeight() * 4);
                 DWORD dwWritten = 0;
-                WriteFile(m_hFFPipeWrite, frame, dwBytes, &dwWritten, nullptr);
+                if (!WriteFile(m_hFFPipeWrite, frame, dwBytes, &dwWritten, nullptr) || dwWritten != dwBytes) {
+                    PRE_DbgLog("RENDER: pipe write failed (err=%u, written=%u expected=%u)", GetLastError(), dwWritten, dwBytes);
+                    FinishVideoRender();
+                    return Success;
+                }
             }
             const std::wstring& name = m_MIDI.GetInfo().sFilename;
             TCHAR sTitle[1024];

@@ -59,9 +59,11 @@ std::wstring g_sReproCustomAudioPath;
 // marshaled to the main thread automatically).
 #define WM_RENDERPROG_CREATE (WM_APP + 0x201)
 #define WM_RENDERPROG_DESTROY (WM_APP + 0x202)
+#define IDC_RENDERPROG_STOP 1001
 
 static HWND s_hRenderProgWnd = NULL;
 static HWND s_hRenderProgBar = NULL;
+static HWND s_hRenderProgBtn = NULL;
 static wchar_t s_wRenderProgText[512] = L"Rendering...";
 static wchar_t s_wRenderProgLast[512] = L"";
 
@@ -69,15 +71,38 @@ static LRESULT CALLBACK RenderProgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 {
     switch (msg)
     {
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_RENDERPROG_STOP || LOWORD(wParam) == ID_FILE_STOPRENDER)
+        {
+            if (s_hRenderProgBtn)
+                EnableWindow(s_hRenderProgBtn, FALSE);
+            UpdateRenderProgressWindow(-1, L"Stopping render & muxing video...");
+            HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         // Closing the progress window cancels the render (same semantics as
         // closing the standalone renderer window).
-        if (g_bVideoRendering)
-            HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
+        if (s_hRenderProgBtn)
+            EnableWindow(s_hRenderProgBtn, FALSE);
+        UpdateRenderProgressWindow(-1, L"Stopping render & muxing video...");
+        HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
         return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE || wParam == VK_SPACE)
+        {
+            if (s_hRenderProgBtn)
+                EnableWindow(s_hRenderProgBtn, FALSE);
+            UpdateRenderProgressWindow(-1, L"Stopping render & muxing video...");
+            HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
+            return 0;
+        }
+        break;
     case WM_DESTROY:
         s_hRenderProgWnd = NULL;
         s_hRenderProgBar = NULL;
+        s_hRenderProgBtn = NULL;
         return 0;
     case WM_PAINT:
     {
@@ -89,7 +114,7 @@ static LRESULT CALLBACK RenderProgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         SetTextColor(hdc, RGB(230, 230, 230));
         HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         HFONT hOld = (HFONT)SelectObject(hdc, hFont);
-        RECT rcText = { 12, 8, rc.right - 12, 62 };
+        RECT rcText = { 12, 8, rc.right - 12, 54 };
         DrawTextW(hdc, s_wRenderProgText, -1, &rcText, DT_LEFT | DT_TOP | DT_WORDBREAK);
         SelectObject(hdc, hOld);
         EndPaint(hWnd, &ps);
@@ -121,7 +146,7 @@ VOID UpdateRenderProgressWindow(INT iPermille, const wchar_t* wText)
                 InvalidateRect(s_hRenderProgWnd, NULL, TRUE);
         }
     }
-    if (s_hRenderProgBar)
+    if (s_hRenderProgBar && iPermille >= 0)
         SendMessageW(s_hRenderProgBar, PBM_SETPOS, iPermille, 0);
 }
 
@@ -142,18 +167,32 @@ static void CreateRenderProgressWindow()
         RegisterClassExW(&wc);
         s_bClassRegistered = true;
     }
+
+    RECT rcDesired = { 0, 0, 324, 118 };
+    AdjustWindowRectEx(&rcDesired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_NOACTIVATE);
+    int winW = rcDesired.right - rcDesired.left;
+    int winH = rcDesired.bottom - rcDesired.top;
+
     s_hRenderProgWnd = CreateWindowExW(WS_EX_NOACTIVATE, L"PGFA_RenderProgress", L"Render to Video",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 340, 120, NULL, NULL, g_hInstance, NULL);
+        CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL, NULL, g_hInstance, NULL);
     if (!s_hRenderProgWnd)
         return;
+
     s_hRenderProgBar = CreateWindowExW(0, PROGRESS_CLASSW, L"",
-        WS_CHILD | WS_VISIBLE, 12, 66, 300, 14, s_hRenderProgWnd, NULL, g_hInstance, NULL);
+        WS_CHILD | WS_VISIBLE, 12, 56, 300, 16, s_hRenderProgWnd, NULL, g_hInstance, NULL);
     SendMessageW(s_hRenderProgBar, PBM_SETRANGE, 0, MAKELPARAM(0, 1000));
+
+    s_hRenderProgBtn = CreateWindowExW(0, L"BUTTON", L"Stop Render",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        107, 80, 110, 26, s_hRenderProgWnd, (HMENU)IDC_RENDERPROG_STOP, g_hInstance, NULL);
+    if (s_hRenderProgBtn)
+        SendMessageW(s_hRenderProgBtn, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
     // Top-right of the work area, clear of the centered renderer window.
     RECT rcWork = {};
     SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
-    SetWindowPos(s_hRenderProgWnd, HWND_TOP, rcWork.right - 350, rcWork.top + 12, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(s_hRenderProgWnd, HWND_TOP, rcWork.right - winW - 16, rcWork.top + 12, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
 }
 
 static void DestroyRenderProgressWindow()
@@ -162,6 +201,7 @@ static void DestroyRenderProgressWindow()
         DestroyWindow(s_hRenderProgWnd);
     s_hRenderProgWnd = NULL;
     s_hRenderProgBar = NULL;
+    s_hRenderProgBtn = NULL;
 }
 
 static void TraceMsg(const char* name, WPARAM wParam, LPARAM lParam) {
@@ -203,6 +243,13 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
 
     switch( msg )
     {
+        case WM_CLOSE:
+            if (g_bVideoRendering)
+            {
+                HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
+                return 0;
+            }
+            break;
         case WM_RENDERPROG_CREATE:
             CreateRenderProgressWindow();
             return 0;
@@ -287,6 +334,11 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     HandOffMsg( WM_COMMAND, ID_FILE_RENDERVIDEO, 0 );
                     return 0;
                 }
+                case ID_FILE_STOPRENDER:
+                {
+                    HandOffMsg( WM_COMMAND, ID_FILE_STOPRENDER, 0 );
+                    return 0;
+                }
                 case ID_PRACTICE_DEFAULT:
                 case ID_PRACTICE_CUSTOM:
                 case ID_PLAY_PLAY:
@@ -300,6 +352,11 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     if ( cPlayback.GetPlayMode() ) cPlayback.TogglePaused( true );
                     return 0;
                 case ID_PLAY_STOP:
+                    if ( g_bVideoRendering )
+                    {
+                        HandOffMsg( WM_COMMAND, ID_FILE_STOPRENDER, 0 );
+                        return 0;
+                    }
                     if ( cPlayback.GetPlayMode() ) HandOffMsg( msg, wParam, lParam );
                     return 0;
                 case ID_PLAY_SKIPFWD: case ID_PLAY_SKIPBACK:
@@ -353,6 +410,11 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                 case ID_VIEW_SETWINDOWSIZE:
                     return 0;
                 case ID_VIEW_NOFULLSCREEN:
+                    if ( g_bVideoRendering )
+                    {
+                        HandOffMsg( WM_COMMAND, ID_FILE_STOPRENDER, 0 );
+                        return 0;
+                    }
                     if ( cView.GetZoomMove() ) HandOffMsg( msg, ID_VIEW_CANCELMOVEANDZOOM, lParam );
                     else if ( cView.GetFullScreen() ) cView.SetFullScreen( false, true );
                     return 0;

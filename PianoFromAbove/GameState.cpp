@@ -686,6 +686,11 @@ static void DrawImageBufferPrewarmProgress(
 {
     if (!renderer || !ImageBufferPreparedGetWaitBeforePlayback())
         return;
+    if (Config::GetConfig().GetPlaybackSettings().GetPlayMode() == GameState::Splash ||
+        dynamic_cast<const SplashScreen*>(g_pGameState) ||
+        (g_pGameState && g_pGameState->IsFreePlay()) ||
+        dynamic_cast<const FreePlayScreen*>(g_pGameState))
+        return;
 
     const ImageBufferPreparedProgress cpu = ImageBufferPreparedGetFullProgress();
 
@@ -787,6 +792,11 @@ static void DrawImageBufferPrewarmProgress(
 static void DrawImageBufferPrewarmProgressLate(Renderer* renderer)
 {
     if (!renderer)
+        return;
+    if (Config::GetConfig().GetPlaybackSettings().GetPlayMode() == GameState::Splash ||
+        dynamic_cast<const SplashScreen*>(g_pGameState) ||
+        (g_pGameState && g_pGameState->IsFreePlay()) ||
+        dynamic_cast<const FreePlayScreen*>(g_pGameState))
         return;
     const float bufferW = (float)renderer->GetBufferWidth();
     const float bufferH = (float)renderer->GetBufferHeight();
@@ -1019,6 +1029,7 @@ static void ImageBufferDriveHugePrewarm(
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
     if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
         const bool imageBufferPrewarmActive = !imageBufferPrewarmSelf->m_bDiscarded && \
+            !imageBufferPrewarmSelf->IsFreePlay() && \
             ImageBufferPreparedGetWaitBeforePlayback() && \
             Config::GetConfig().GetVizSettings().bImageBufferNotes && \
             !g_bVideoRendering && \

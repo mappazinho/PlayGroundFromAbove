@@ -48,6 +48,7 @@ extern bool g_bVideoRendering;
 bool RequestVideoRender();
 void StopVideoRender();
 bool VideoRenderSongLoaded(); // True when the current state is a loaded song screen
+std::wstring GetFFmpegExePath(const std::wstring& inPath);
 
 void HeartbeatLog(const char* tag); // Temporary debug diagnostics (game thread only)
 
