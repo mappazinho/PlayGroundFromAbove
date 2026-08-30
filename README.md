@@ -13,7 +13,8 @@ A modification of PFAviz by khang06 which contains further fixes and additions, 
 * And more...
 
 ## Recommended Requirements
-* You will need a GPU that is *at least* better than a GTX 700 series card, and at LEAST supports DirectX11.
+You will need a GPU that is *at least* better than a GTX 700 series card, and at LEAST supports DirectX11.
+
 CPU, RAM, etc is kept the same as stock PFA.
 
 ## How to build
