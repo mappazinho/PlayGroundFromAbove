@@ -1667,6 +1667,12 @@ HRESULT D3D12Renderer::PresentBackend() {
         HeartbeatLog("present:fencewait");
 
         while (WaitForSingleObjectEx(m_hFenceEvent, 1000, FALSE) == WAIT_TIMEOUT) {
+            HRESULT reason = m_pDevice->GetDeviceRemovedReason();
+            if (FAILED(reason)) {
+                m_bDeviceLost = true;
+                HeartbeatLog("present:deviceremoved");
+                return reason;
+            }
             if (g_bGfxDestroyed)
                 break;
         }
@@ -2230,8 +2236,17 @@ char* D3D12Renderer::Screenshot() {
         HeartbeatLog("shot:null-resources");
         return nullptr;
     }
+
+    // Must wait for previous in-flight commands on this frame to finish before resetting its allocator!
+    if (FAILED(WaitForGPU()))
+        return nullptr;
+
     HRESULT hrResetA = m_pCommandAllocator[m_uFrameIndex]->Reset();
     HRESULT hrResetL = m_pCommandList->Reset(m_pCommandAllocator[m_uFrameIndex].Get(), m_pRectPipelineState.Get());
+    if (FAILED(hrResetA) || FAILED(hrResetL)) {
+        HeartbeatLog("shot:reset-failed");
+        return nullptr;
+    }
     if (s_cnt < 3) { char b[160]; snprintf(b, sizeof(b), "shot:reset a=0x%08X l=0x%08X", (unsigned)hrResetA, (unsigned)hrResetL); HeartbeatLog(b); }
 
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pRenderTargets[m_uFrameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
