@@ -3,26 +3,24 @@
 
 A modification of PFAviz by khang06 which contains further fixes and additions, such as:
 * IMGUI UI for a simpler look
-* Bloom and blur shaders with their controls
-* Directx11+ support
+* Visual Buffers
+* Bloom and blur shaders with controls
+* DirectX11 Backport, and software rendering support
 * Memory efficient multi-threaded parsing
 * Prerendered audio
-* Fixed notes on MIDIs which use incredibly tiny streams of notes
+* Fixed note visuals
 * Dual piano roll modes
 * And more...
 
 ## Recommended Requirements
-* You will need a GPU that is *at least* better than a GTX 700 series card
-
+* You will need a GPU that is *at least* better than a GTX 700 series card, and at LEAST supports DirectX11.
 CPU, RAM, etc is kept the same as stock PFA.
-
-
 
 ## How to build
 
 * Clone this repo
-* Download and install Visual Studio 2019
-  * Make sure to install the Clang compiler and tools, too
+* Download and install Visual Studio 2026
+  * Make sure to install the Clang compiler and tools!
 * Download and install Direct X SDK
 * Retarget project to your installed Windows SDK version
 * Cross fingers
@@ -37,6 +35,8 @@ CPU, RAM, etc is kept the same as stock PFA.
 [PFAViz-PreRendered-Audio](https://github.com/MrCHB1/PFAViz-PreRendered-Audio) - used for prerender audio here, modified
 
 [Comet](https://github.com/MrCHB1/Comet) - based off the memory efficient parsing here
+
+**BPFA** - inspiration for visual buffer mode
 
 
 
