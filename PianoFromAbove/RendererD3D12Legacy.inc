@@ -64,8 +64,46 @@ D3D12Renderer::~D3D12Renderer() {
 #endif
 }
 
+// Logs why the device was removed and, if DRED was enabled at device creation,
+// the last GPU operation each command list reached plus any page-fault address.
+void D3D12Renderer::LogDeviceRemoved(const char* where) {
+    if (!m_pDevice) return;
+    const bool wasLogging = g_bLoggingEnabled.load(std::memory_order_relaxed);
+    g_bLoggingEnabled.store(true, std::memory_order_relaxed);
+    struct Restore { bool v; ~Restore() { g_bLoggingEnabled.store(v, std::memory_order_relaxed); } } restoreLogging{ wasLogging };
+    char b[192];
+    sprintf_s(b, "removed:%s reason=0x%08X", where, (unsigned)m_pDevice->GetDeviceRemovedReason());
+    HeartbeatLog(b);
+    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+    if (FAILED(m_pDevice.As(&dred))) return;
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+        int n = 0;
+        for (auto* node = bc.pHeadAutoBreadcrumbNode; node && n < 8; node = node->pNext, ++n) {
+            UINT last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            if (last >= node->BreadcrumbCount) continue; // finished
+            int op = (node->pCommandHistory && last < node->BreadcrumbCount) ? (int)node->pCommandHistory[last] : -1;
+            sprintf_s(b, "dred:unfinished list done=%u/%u nextop=%d", last, node->BreadcrumbCount, op);
+            HeartbeatLog(b);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA) {
+        sprintf_s(b, "dred:pagefault va=0x%llX", (unsigned long long)pf.PageFaultVA);
+        HeartbeatLog(b);
+    }
+}
+
 std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) {
     HRESULT res;
+    {
+        // DRED: lets a device removal report which GPU op hung / faulted (must precede device creation).
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+            dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        }
+    }
     // Create DXGI factory
 #ifdef _DEBUG
     ID3D12Debug1* d3d12_debug = nullptr;
@@ -869,7 +907,7 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
                                           m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(res)) {
             if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
-                m_bDeviceLost = true;
+                m_bDeviceLost = true; LogDeviceRemoved(__func__);
                 HeartbeatLog("resize:deviceremoved");
             }
             return std::make_tuple(res, "ResizeBuffers");
@@ -877,7 +915,11 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
         HeartbeatLog("resize:afterresize");
     } else {
         // Create swap chain
-        IDXGISwapChain1* temp_swapchain = nullptr;
+        // A ComPtr, not a raw pointer: the raw pointer was never released, so every swap chain this
+        // renderer created stayed alive after m_pSwapChain.Reset(). The window then stayed bound to the dead
+        // swap chain and the next CreateSwapChainForHwnd on it (after a device reset, a fullscreen switch or
+        // a driver reset) failed with E_ACCESSDENIED, forcing the fallback to DirectX 11.
+        ComPtr<IDXGISwapChain1> temp_swapchain;
         DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {
             .Width = 0,
             .Height = 0,
@@ -893,13 +935,31 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
             .AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED,
             .Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
         };
-        res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+        // DXGI releases a destroyed swap chain's hold on the window asynchronously, so right after a device
+        // reset the window can still report E_ACCESSDENIED for a moment: retry that case briefly.
+        auto createSwapChain = [&]() {
+            HRESULT hr = S_OK;
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                temp_swapchain.Reset();
+                hr = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+                if (hr != E_ACCESSDENIED && hr != DXGI_ERROR_ACCESS_DENIED && !(hr == DXGI_ERROR_INVALID_CALL && attempt < 3))
+                    break;
+                char ebuf[64];
+                sprintf_s(ebuf, "swapchain:accessdenied retry %d", attempt + 1);
+                HeartbeatLog(ebuf);
+                Sleep(100);
+            }
+            return hr;
+        };
+        res = createSwapChain();
         if (FAILED(res)) {
-            HeartbeatLog("swapchain:flipfailed - trying bitblt");
+            char ebuf[96];
+            sprintf_s(ebuf, "swapchain:flipfailed hr=0x%08X - trying bitblt", (unsigned)res);
+            HeartbeatLog(ebuf);
             m_bAllowTearing = false;
             swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
             swap_chain_desc.Flags = 0;
-            res = m_pFactory->CreateSwapChainForHwnd(m_pCommandQueue.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+            res = createSwapChain();
         }
         if (FAILED(res))
             return std::make_tuple(res, "CreateSwapChainForHwnd");
@@ -1075,6 +1135,7 @@ std::tuple<HRESULT, const char*> D3D12Renderer::CreateWindowDependentObjects(HWN
 }
 
 HRESULT D3D12Renderer::ResetDevice() {
+    if (m_bDeviceLost || !m_pDevice || !m_pCommandQueue) { HeartbeatLog("reset:skipped-no-device"); return DXGI_ERROR_DEVICE_REMOVED; }
     HeartbeatLog("reset:start");
     DestroyBlurResources();
     HeartbeatLog("reset:destroyblur");
@@ -1110,6 +1171,13 @@ void D3D12Renderer::ReleaseDeviceResources() {
 
     for (uint32_t i = 0; i < FrameCount; i++)
         m_pRenderTargets[i].Reset();
+    if (m_pSwapChain) {
+        // Leave any (implicit) fullscreen state first; a swap chain released while
+        // fullscreen can keep the window bound and break the next CreateSwapChainForHwnd.
+        BOOL fs = FALSE;
+        if (SUCCEEDED(m_pSwapChain->GetFullscreenState(&fs, nullptr)) && fs)
+            m_pSwapChain->SetFullscreenState(FALSE, nullptr);
+    }
     m_pSwapChain.Reset();
     m_pDepthBuffer.Reset();
     m_pCommandList.Reset();
@@ -1253,13 +1321,30 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
         m_pCommandList->ResourceBarrier(1, &fixed_barrier);
 
         void* pUpload = nullptr;
-        m_pGenericUpload->Map(0, nullptr, &pUpload);
-        memcpy((uint8_t*)pUpload + uploadOffset, (const uint8_t*)m_TrackColors + beginBytes, bytes);
-        m_pGenericUpload->Unmap(0, nullptr);
-        m_pCommandList->CopyBufferRegion(m_pTrackColorBuffer.Get(), beginBytes, m_pGenericUpload.Get(), uploadOffset, bytes);
-
-        fixed_barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pTrackColorBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_pCommandList->ResourceBarrier(1, &fixed_barrier);
+        const HRESULT mapRes = m_pGenericUpload->Map(0, nullptr, &pUpload);
+        if (FAILED(mapRes) || !pUpload) {
+            // An unchecked Map here wrote to address 0x240 and crashed (seen after a multi-second GPU stall
+            // while a 300M-note song loaded). Keep the colours dirty so they upload on a later frame and
+            // treat a dead device as a TDR so recovery rebuilds it.
+            char eb[96];
+            sprintf_s(eb, "clear:trackcolor-map-failed hr=0x%08X", (unsigned)mapRes);
+            HeartbeatLog(eb);
+            m_uTrackColorsDirtyBegin = (std::min)(m_uTrackColorsDirtyBegin, beginBytes / (16 * sizeof(TrackColor)));
+            m_uTrackColorsDirtyEnd = (std::max)(m_uTrackColorsDirtyEnd, beginBytes / (16 * sizeof(TrackColor)) + bytes / (16 * sizeof(TrackColor)));
+            if (m_pDevice && FAILED(m_pDevice->GetDeviceRemovedReason())) {
+                m_bDeviceLost = true;
+                LogDeviceRemoved(__func__);
+            }
+            // put the buffer back in its read state and carry on this frame without the upload
+            fixed_barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pTrackColorBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            m_pCommandList->ResourceBarrier(1, &fixed_barrier);
+        } else {
+            memcpy((uint8_t*)pUpload + uploadOffset, (const uint8_t*)m_TrackColors + beginBytes, bytes);
+            m_pGenericUpload->Unmap(0, nullptr);
+            m_pCommandList->CopyBufferRegion(m_pTrackColorBuffer.Get(), beginBytes, m_pGenericUpload.Get(), uploadOffset, bytes);
+            fixed_barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_pTrackColorBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            m_pCommandList->ResourceBarrier(1, &fixed_barrier);
+        }
     }
 
     // Build the image-buffer key only after fixed constants and track-color
@@ -1643,7 +1728,7 @@ HRESULT D3D12Renderer::PresentBackend() {
     }
     if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
         // The display driver was reset (TDR). The device is dead; do not run the
-        m_bDeviceLost = true;
+        m_bDeviceLost = true; LogDeviceRemoved(__func__);
         HeartbeatLog("present:deviceremoved");
         return res;
     }
@@ -1669,7 +1754,7 @@ HRESULT D3D12Renderer::PresentBackend() {
         while (WaitForSingleObjectEx(m_hFenceEvent, 1000, FALSE) == WAIT_TIMEOUT) {
             HRESULT reason = m_pDevice->GetDeviceRemovedReason();
             if (FAILED(reason)) {
-                m_bDeviceLost = true;
+                m_bDeviceLost = true; LogDeviceRemoved(__func__);
                 HeartbeatLog("present:deviceremoved");
                 return reason;
             }
@@ -2158,7 +2243,7 @@ HRESULT D3D12Renderer::WaitForGPU() {
         while (WaitForSingleObjectEx(m_hFenceEvent, 1000, FALSE) == WAIT_TIMEOUT) {
             HRESULT reason = m_pDevice->GetDeviceRemovedReason();
             if (FAILED(reason)) {
-                m_bDeviceLost = true;
+                m_bDeviceLost = true; LogDeviceRemoved(__func__);
                 HeartbeatLog("waitgpu:deviceremoved");
                 return reason;
             }
@@ -2891,6 +2976,16 @@ void D3D12Renderer::DestroyBlurResources() {
     m_pBloomBlurTemp.Reset();
     m_pBloomBlurResult.Reset();
     m_BlurTextureID = 0;
+    // The textures above are recreated in COMMON (scene copy: COPY_DEST). The
+    // tracked states must be reset with them, otherwise the first frame after a
+    // resize/fullscreen switch records barriers from a state the new resource is
+    // not in, which hangs or removes the device on some drivers (NVIDIA).
+    m_BlurTempState = D3D12_RESOURCE_STATE_COMMON;
+    m_BlurOutputState = D3D12_RESOURCE_STATE_COMMON;
+    m_SceneCopyState = D3D12_RESOURCE_STATE_COPY_DEST;
+    m_BloomHalfState = D3D12_RESOURCE_STATE_COMMON;
+    m_BloomBlurTempState = D3D12_RESOURCE_STATE_COMMON;
+    m_BloomBlurResultState = D3D12_RESOURCE_STATE_COMMON;
 }
 
 void D3D12Renderer::ApplyBlur() {

@@ -337,13 +337,18 @@ static DWORD WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static DWORD g_dwGameThreadId = 0;
+DWORD g_dwGameThreadId = 0;
 
 // Last-resort backstop: some fatal traps (breakpoints from corrupted indirect
 // calls, illegal instructions raised inside static CRT helpers) were slipping
 // past the unhandled-exception filter because other components re-register or
 // clear it. A second-chance VEH registered LAST runs before any of that and
 // guarantees we capture registers + stack to crash_log.txt.
+// Set once the game thread is gone and the config is saved. From then on an access violation can
+// only come from a foreign thread running in a DLL that is being unloaded; there is nothing left
+// to protect, so exit quietly instead of writing a crash log for a clean close.
+static volatile LONG g_bTeardown = 0;
+
 static LONG WINAPI FinalCrashBackstop(EXCEPTION_POINTERS* ep) {
     switch (ep->ExceptionRecord->ExceptionCode) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -357,6 +362,8 @@ static LONG WINAPI FinalCrashBackstop(EXCEPTION_POINTERS* ep) {
     default:
         return EXCEPTION_CONTINUE_SEARCH; // C++ exceptions (0xE06D7363) etc. pass through
     }
+    if (g_bTeardown)
+        TerminateProcess(GetCurrentProcess(), 0);
     WriteCrashLog(ep);
     TerminateProcess(GetCurrentProcess(), 1);
     return EXCEPTION_EXECUTE_HANDLER;
@@ -370,6 +377,9 @@ static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
         ep->ExceptionRecord->ExceptionCode != EXCEPTION_IN_PAGE_ERROR &&
         ep->ExceptionRecord->ExceptionCode != EXCEPTION_DATATYPE_MISALIGNMENT)
         return EXCEPTION_CONTINUE_SEARCH;
+
+    if (g_bTeardown)
+        TerminateProcess(GetCurrentProcess(), 0);
 
     if (GetCurrentThreadId() == g_dwGameThreadId)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -641,6 +651,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
 
     UnregisterClass( CLASSNAME, wc.hInstance );
     CoUninitialize();
+    InterlockedExchange(&g_bTeardown, 1);
     FreeEmbeddedDLLs();
     return 0;
 }
@@ -734,7 +745,10 @@ static void RecoverRenderer(Renderer*& pRenderer, GameState* pGameState) {
         return;
     }
 
-    Sleep(200); // let the driver settle after the TDR before rebuilding
+    // The failed renderer still owns a swap chain bound to the window; free it first
+    // or every replacement backend fails CreateSwapChainForHwnd with INVALID_CALL.
+    pRenderer->ReleaseForReplacement();
+    Sleep(300); // let the driver settle after the TDR before rebuilding
     std::tuple<HRESULT, const char*> ladderFail = {};
     Renderer* pNew = InitRendererLadder(&ladderFail, /*bShowFallbackMsgs*/ false);
     if (pNew)

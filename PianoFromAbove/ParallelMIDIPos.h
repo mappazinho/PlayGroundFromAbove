@@ -279,7 +279,7 @@ private:
   metaCount += track->GetMetaCount();
         }
 
-        const uint64_t channelRows = (uint64_t)m_MIDI.m_iFullRows + (uint64_t)m_MIDI.m_vThinTicks.size();
+        const uint64_t channelRows = (uint64_t)m_MIDI.m_iFullRows + (uint64_t)m_MIDI.m_vThinOwners.size();
         if (channelRows >= MetaFlag || metaCount >= MetaFlag)
   throw std::runtime_error("MIDI event count exceeds compact parallel-sort reference range");
 

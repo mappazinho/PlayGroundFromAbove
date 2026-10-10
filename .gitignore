@@ -375,3 +375,5 @@ PianoFromAbove/Soundfonts/
 # Local test harness (not part of the game)
 /StandaloneTest/
 winmm.dll
+
+[Rr]eleasePacked/

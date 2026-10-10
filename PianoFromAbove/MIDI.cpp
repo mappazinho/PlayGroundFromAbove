@@ -10,12 +10,15 @@
 #include "MIDI.h"
 #include "ParallelMIDIPos.h"
 #include "ParallelPostProcess.h"
+#include "PackedMIDI.h"
 #include <fstream>
 #include <stack>
 #include <array>
 #include <exception>
 #include <ppl.h>
 #include <thread>
+#include <memory>
+#include <algorithm>
 #include <intrin.h>
 #include <smmintrin.h>
 #include "lzma.h"
@@ -268,9 +271,93 @@ int MIDIPos::GetNextEvent( int iMicroSecs, MIDIEvent **pOutMeta, MIDIChannelEven
     }
 }
 
+// PGFA_PACKED=1 forces packed mode, =0 disables it. Without it, builds made with PGFA_PACKED_DEFAULT pack
+// every file of at least PGFA_PACKED_MIN_MB (default 100): smaller ones gain nothing and would lose their
+// markers, lyrics and track names for no reason.
+static bool PackedModeWanted( const wstring &sFile )
+{
+    char aEnv[16] = {};
+    if ( GetEnvironmentVariableA( "PGFA_PACKED", aEnv, sizeof( aEnv ) ) > 0 )
+        return aEnv[0] != '0';
+#ifdef PGFA_PACKED_DEFAULT
+    unsigned long long iMinMB = 100;
+    if ( GetEnvironmentVariableA( "PGFA_PACKED_MIN_MB", aEnv, sizeof( aEnv ) ) > 0 )
+        iMinMB = _strtoui64( aEnv, nullptr, 10 );
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if ( GetFileAttributesExW( sFile.c_str(), GetFileExInfoStandard, &fad ) )
+    {
+        const unsigned long long iBytes = ( (unsigned long long)fad.nFileSizeHigh << 32 ) | fad.nFileSizeLow;
+        return iBytes >= iMinMB * 1048576ull;
+    }
+#endif
+    return false;
+}
+
+bool MIDI::LoadPackedWindow( long long llStartUs, uint64_t iMaxNotes, long long llMinSpanUs )
+{
+    try
+    {
+        if ( !m_pPacked )
+        {
+            auto ps = std::make_shared< PGFAPacked::PackedSong >();
+            g_LoadingProgress.stage = MIDILoadingProgress::Stage::ParseTracks;
+            g_LoadingProgress.progress = 0;
+            g_LoadingProgress.max = 1;
+            if ( !PGFAPacked::PackFile( m_sPackedPath, *ps ) ) return false;
+            m_pPacked = ps;
+        }
+        const PGFAPacked::PackedSong &ps = *m_pPacked;
+        const uint32_t t0 = PGFAPacked::TickAtUs( ps, llStartUs );
+        const uint32_t minTicks = PGFAPacked::TickAtUs( ps, llStartUs + llMinSpanUs ) - t0;
+        const uint32_t t1 = PGFAPacked::WindowEnd( ps, t0, iMaxNotes, minTicks );
+        PGFAPacked::SynthStats ss;
+        std::vector< uint8_t > smf = PGFAPacked::SynthWindow( ps, t0, t1, &ss );
+        PRE_DbgLog("PACKED window: ticks [%u,%u) = %.1fs..%.1fs, %llu notes, SMF %.1f MB, synth %.0f ms",
+            t0, t1, PGFAPacked::UsAtTick( ps, t0 ) / 1e6, PGFAPacked::UsAtTick( ps, t1 ) / 1e6,
+            (unsigned long long)ss.notes, smf.size() / 1048576.0, ss.ms );
+        m_llPackedStartUs = PGFAPacked::UsAtTick( ps, t0 );
+        m_llPackedEndUs = PGFAPacked::UsAtTick( ps, t1 );
+        ParseMIDI( smf.data(), smf.size() );
+        m_Info.sFilename = m_sPackedPath;
+        // the slider, the time readout and the end-of-song check use the whole song, not the window
+        m_llPackedSongEndUs = PGFAPacked::UsAtTick( ps, ps.endTick );
+        if ( ps.firstNoteTick != 0xFFFFFFFFu ) m_Info.llFirstNote = PGFAPacked::UsAtTick( ps, ps.firstNoteTick );
+        m_Info.llTotalMicroSecs = m_llPackedSongEndUs;
+        m_bPackedPending = false;
+        return IsValid();
+    }
+    catch ( const std::exception &e )
+    {
+        PRE_DbgLog("PACKED window failed: %s", e.what());
+        clear();
+        return false;
+    }
+}
+
+void MIDI::ApplyPackedSongInfo()
+{
+    if ( !m_pPacked ) return;
+    const PGFAPacked::PackedSong &ps = *m_pPacked;
+    m_llPackedSongEndUs = PGFAPacked::UsAtTick( ps, ps.endTick );
+    if ( ps.firstNoteTick != 0xFFFFFFFFu ) m_Info.llFirstNote = PGFAPacked::UsAtTick( ps, ps.firstNoteTick );
+    m_Info.llTotalMicroSecs = m_llPackedSongEndUs;
+}
+
+void MIDI::ReleasePacked()
+{
+    m_pPacked.reset();
+}
+
 
 MIDI::MIDI ( const wstring &sFilename )
 {
+    if ( PackedModeWanted( sFilename ) || PGFAPacked::g_Cont.active )
+    {
+        // the song is packed and a window of it expanded by MainScreen (LoadPackedWindow)
+        m_sPackedPath = sFilename;
+        m_bPackedPending = true;
+        return;
+    }
     try
     {
         InitFromFile( sFilename );
@@ -287,59 +374,141 @@ void MIDI::InitFromFile( const wstring &sFilename )
     InitFromFileCore(sFilename);
     if (!IsValid())
     {
-        if (m_pcOwnedData)
-        {
-            delete[] m_pcOwnedData;
-            m_pcOwnedData = nullptr;
-        }
+        ReleaseOwnedData();
         clear();
         Sleep(300);
         InitFromFileCore(sFilename);
     }
 }
 
-void MIDI::InitFromFileCore( const wstring &sFilename )
+// Reads the whole file with permissive sharing (AV scanners / other apps often hold
+// transient locks), retrying briefly on lock errors and tolerating short reads.
+static unsigned char* ReadWholeFile( const wstring &sFilename, size_t &iSizeOut, bool &bMappedOut )
 {
-    FILE* stream = nullptr;
-
-    errno_t eOpen = _wfopen_s(&stream, sFilename.c_str(), L"rb");
-    PRE_DbgLog("InitFromFileCore: open '%ls' -> %d", sFilename.c_str(), eOpen);
-    if (eOpen == 0)
+    iSizeOut = 0;
+    bMappedOut = false;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    for ( int iAttempt = 0; iAttempt < 10; iAttempt++ )
     {
-        _fseeki64(stream, 0, SEEK_END);
-        size_t iSize = static_cast<size_t>(_ftelli64(stream));
-        unsigned char* pcMemBlock = nullptr;
+        hFile = CreateFileW( sFilename.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL );
+        if ( hFile != INVALID_HANDLE_VALUE ) break;
+        DWORD dwErr = GetLastError();
+        PRE_DbgLog("ReadWholeFile: open failed err=%lu (attempt %d)", dwErr, iAttempt);
+        if ( dwErr != ERROR_SHARING_VIOLATION && dwErr != ERROR_LOCK_VIOLATION && dwErr != ERROR_ACCESS_DENIED )
+            break;
+        Sleep( 100 );
+    }
+    if ( hFile == INVALID_HANDLE_VALUE ) return nullptr;
 
-        if (_fseeki64(stream, 0, SEEK_SET)) {
-            MessageBoxA(NULL, "_fseeki64 encountered an error.", "Piano From Above", MB_OK | MB_ICONERROR);
-            return;
-        }
+    LARGE_INTEGER liSize = {};
+    if ( !GetFileSizeEx( hFile, &liSize ) || liSize.QuadPart <= 0 )
+    {
+        CloseHandle( hFile );
+        return nullptr;
+    }
+    const size_t iSize = static_cast< size_t >( liSize.QuadPart );
 
-        constexpr uint8_t lzma_magic[] = {0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00};
-        unsigned char aPeek[6] = {};
-        size_t iPeek = fread(aPeek, 1, sizeof(aPeek), stream);
-        _fseeki64(stream, 0, SEEK_SET);
-        bool bIsLzma = iPeek == sizeof(aPeek) && !memcmp(aPeek, lzma_magic, sizeof(lzma_magic));
-
-        // cache pages mid-parse, causing re-reads; a single linear read is
-        if (!bIsLzma)
+    // Huge plain .mid files are mapped instead of copied: the pages are file-backed, so
+    // they cost no private memory, can be trimmed from the working set while parsing, and
+    // the OS can drop them under pressure. (Copy-on-write, so a stray write can't hit the
+    // file.) .xz files are decompressed into a heap block as before, so they take the read path.
+    constexpr size_t kMapMin = (size_t)256 << 20;
+    if ( iSize >= kMapMin )
+    {
+        HANDLE hMap = CreateFileMappingW( hFile, NULL, PAGE_WRITECOPY, 0, 0, NULL );
+        if ( hMap )
         {
-            unsigned char* pBuf = nullptr;
-            try { pBuf = new unsigned char[iSize]; }
-            catch ( const std::bad_alloc & ) { pcMemBlock = nullptr; }
-            if (pBuf)
+            void *pView = MapViewOfFile( hMap, FILE_MAP_COPY, 0, 0, 0 );
+            CloseHandle( hMap ); // the view keeps the mapping alive
+            if ( pView )
             {
-                fread(reinterpret_cast<char*>(pBuf), 1, iSize, stream);
-                pcMemBlock = pBuf;
+                constexpr uint8_t kXzMagic[] = { 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
+                if ( memcmp( pView, kXzMagic, sizeof( kXzMagic ) ) != 0 )
+                {
+                    CloseHandle( hFile );
+                    g_LoadingProgress.stage = MIDILoadingProgress::Stage::CopyToMem;
+                    g_LoadingProgress.max = iSize;
+                    // Page the file in sequentially, one window ahead of a touch pass. Left to the parser, the
+                    // worker threads would fault pages in at random offsets, which is crippling on a spinning
+                    // disk or network share (a cold 300 MB file went from 2 s to 17 s).
+                    {
+                        typedef BOOL ( WINAPI *PrefetchFn )( HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG );
+                        PrefetchFn pPrefetch = (PrefetchFn)GetProcAddress( GetModuleHandleW( L"kernel32.dll" ), "PrefetchVirtualMemory" );
+                        const size_t kWin = (size_t)64 << 20;
+                        auto prefetch = [&]( size_t off ) {
+                            if ( !pPrefetch || off >= iSize ) return;
+                            WIN32_MEMORY_RANGE_ENTRY r = { (unsigned char*)pView + off, (std::min)( kWin, iSize - off ) };
+                            pPrefetch( GetCurrentProcess(), 1, &r, 0 );
+                        };
+                        prefetch( 0 );
+                        volatile unsigned char sink = 0;
+                        g_LoadingProgress.progress = 0;
+                        for ( size_t off = 0; off < iSize; off += kWin )
+                        {
+                            prefetch( off + kWin );
+                            const size_t end = (std::min)( off + kWin, iSize );
+                            for ( size_t p = off; p < end; p += 4096 )
+                                sink = sink + ( (volatile unsigned char*)pView )[p];
+                            g_LoadingProgress.progress = end;
+                        }
+                    }
+                    iSizeOut = iSize;
+                    bMappedOut = true;
+                    PRE_DbgLog("LOAD [ReadWholeFile mapped %zu bytes]", iSize);
+                    return static_cast< unsigned char* >( pView );
+                }
+                UnmapViewOfFile( pView );
             }
         }
-        if (!pcMemBlock)
-        {
-            pcMemBlock = new unsigned char[iSize];
-            fread(reinterpret_cast<char*>(pcMemBlock), 1, iSize, stream);
-        }
+        PRE_DbgLog("ReadWholeFile: mapping unavailable/xz, reading %zu bytes", iSize);
+    }
 
-        fclose(stream);
+    unsigned char *pcBuf = nullptr;
+    try { pcBuf = new unsigned char[iSize]; }
+    catch ( const std::bad_alloc & )
+    {
+        PRE_DbgLog("ReadWholeFile: out of memory for %zu bytes", iSize);
+        CloseHandle( hFile );
+        return nullptr;
+    }
+
+    g_LoadingProgress.stage = MIDILoadingProgress::Stage::CopyToMem;
+    g_LoadingProgress.progress = 0;
+    g_LoadingProgress.max = iSize;
+
+    size_t iRead = 0;
+    while ( iRead < iSize )
+    {
+        DWORD dwWant = (DWORD)( std::min )( iSize - iRead, (size_t)( 16u << 20 ) ), dwGot = 0;
+        if ( !ReadFile( hFile, pcBuf + iRead, dwWant, &dwGot, NULL ) || dwGot == 0 )
+            break;
+        iRead += dwGot;
+        g_LoadingProgress.progress = iRead;
+    }
+    CloseHandle( hFile );
+
+    if ( iRead != iSize )
+        PRE_DbgLog("ReadWholeFile: short read %zu/%zu", iRead, iSize);
+    if ( iRead == 0 )
+    {
+        delete[] pcBuf;
+        return nullptr;
+    }
+    iSizeOut = iRead;
+    return pcBuf;
+}
+
+void MIDI::InitFromFileCore( const wstring &sFilename )
+{
+    size_t iSize = 0;
+    bool bMapped = false;
+    unsigned char* pcMemBlock = ReadWholeFile(sFilename, iSize, bMapped);
+    PRE_DbgLog("InitFromFileCore: read '%ls' -> %p (%zu bytes)", sFilename.c_str(), (void*)pcMemBlock, iSize);
+    if (pcMemBlock)
+    {
+        constexpr uint8_t lzma_magic[] = {0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00};
+        bool bIsLzma = iSize >= sizeof(lzma_magic) && !memcmp(pcMemBlock, lzma_magic, sizeof(lzma_magic));
 
         if (bIsLzma)
         {
@@ -434,22 +603,42 @@ void MIDI::InitFromFileCore( const wstring &sFilename )
             uint8_t* write_ptr = pcMemBlock;
             lzma_end(&strm);
             strm = LZMA_STREAM_INIT;
-            lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED);
+            // Multi-block .xz files (made with xz -T / 7-Zip multithreading) decode on several cores;
+            // single-block files simply run on one. Fall back to the plain decoder if the library
+            // refuses the threaded one.
+            {
+                lzma_mt mt = {};
+                mt.flags = LZMA_CONCATENATED;
+                mt.threads = (std::max)(1u, (std::min)(std::thread::hardware_concurrency(), 16u));
+                mt.memlimit_threading = (uint64_t)2 << 30; // soft: the decoder uses fewer threads rather than more memory
+                mt.memlimit_stop = UINT64_MAX;
+                if (lzma_stream_decoder_mt(&strm, &mt) != LZMA_OK) {
+                    lzma_end(&strm);
+                    strm = LZMA_STREAM_INIT;
+                    lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED);
+                }
+            }
             strm.next_in = compressed;
             strm.avail_in = iSize;
             bool done = false;
             lzma_action action = LZMA_RUN;
+            // Hand the decoder output space before the first call, and top it up in big pieces.
+            const size_t kOutChunk = (size_t)8 << 20;
+            size_t written = 0;
+            auto refill = [&]() {
+                size_t remaining = (std::min)((size_t)decompressed_size - written, kOutChunk);
+                strm.next_out = pcMemBlock + written;
+                strm.avail_out = remaining;
+                written += remaining;
+            };
+            refill();
             while (!done) {
                 if (strm.avail_in == 0)
                     action = LZMA_FINISH;
                 lzma_ret ret = lzma_code(&strm, action);
-                if (strm.avail_out == 0) {
-                    auto remaining = min(decompressed_size - (write_ptr - pcMemBlock), 1 << 20);
-                    strm.next_out = write_ptr;
-                    strm.avail_out = remaining;
-                    g_LoadingProgress.progress = write_ptr - pcMemBlock;
-                    write_ptr += remaining;
-                }
+                g_LoadingProgress.progress = written - strm.avail_out;
+                if (strm.avail_out == 0 && written < decompressed_size)
+                    refill();
                 switch (ret) {
                 case LZMA_STREAM_END:
                     done = true;
@@ -475,25 +664,18 @@ void MIDI::InitFromFileCore( const wstring &sFilename )
         }
 
         m_pcOwnedData = pcMemBlock;
+        m_bOwnedMapped = bMapped;
         ParseMIDI(pcMemBlock, iSize);
         m_Info.sFilename = sFilename;
 
         // heap blocks; if the parse didn't already take ownership and free it
-        if (m_pcOwnedData)
-        {
-            delete[] m_pcOwnedData;
-            m_pcOwnedData = nullptr;
-        }
+        ReleaseOwnedData();
     }
 }
 
 MIDI::~MIDI( void )
 {
-    if ( m_pcOwnedData )
-    {
-        delete[] m_pcOwnedData;
-        m_pcOwnedData = nullptr;
-    }
+    ReleaseOwnedData();
     clear();
 }
 
@@ -506,7 +688,7 @@ MIDIChannelEvent MIDI::AppendChannelEvent( int iTrack, uint32_t iAbsTicks )
     m_vSimult.push_back( 0 );
     m_vEventTrack.push_back( static_cast< uint16_t >( iTrack ) );
     m_vPack.push_back( 0 );
-    return static_cast< MIDIChannelEvent >( m_vTicks.size() - 1 + m_vThinTicks.size() );
+    return static_cast< MIDIChannelEvent >( m_vTicks.size() - 1 + m_vThinOwners.size() );
 }
 
 size_t MIDI::GetEventPoolBytes() const
@@ -518,12 +700,12 @@ size_t MIDI::GetEventPoolBytes() const
            m_vSimult.size() * sizeof( uint16_t ) +
            m_vEventTrack.size() * sizeof( uint16_t ) +
            m_vPack.size() * sizeof( uint32_t ) +
-           m_vThinTicks.size() * 4 * sizeof( uint32_t );
+           m_vThinOwners.size() * ( 2 * sizeof( uint32_t ) + ( m_bThinWide ? sizeof( uint32_t ) : sizeof( uint16_t ) ) ) + m_vThinEsc.size() * sizeof( ThinEsc );
 }
 
 size_t MIDI::GetEventPoolCount() const
 {
-    return m_vTicks.size() + m_vThinTicks.size();
+    return m_vTicks.size() + m_vThinOwners.size();
 }
 
 
@@ -649,27 +831,38 @@ void MIDI::clear( void )
         delete *it;
     m_vTracks.clear();
     m_Info.clear();
-    vector<int64_t>().swap( m_vTimes );
-    vector<uint32_t>().swap( m_vTicks );
-    vector<uint32_t>().swap( m_vLengths );
-    vector<uint32_t>().swap( m_vSisters );
-    vector<uint16_t>().swap( m_vSimult );
-    vector<uint16_t>().swap( m_vEventTrack );
-    vector<uint32_t>().swap( m_vPack );
-    vector<uint32_t>().swap( m_vThinTicks );
-    vector<uint32_t>().swap( m_vThinOwners );
-    vector<uint32_t>().swap( m_vThinSisters );
-    vector<uint32_t>().swap( m_vThinLengths );
+    PoolVec<int64_t>().swap( m_vTimes );
+    PoolVec<uint32_t>().swap( m_vTicks );
+    PoolVec<uint32_t>().swap( m_vLengths );
+    PoolVec<uint32_t>().swap( m_vSisters );
+    PoolVec<uint16_t>().swap( m_vSimult );
+    PoolVec<uint16_t>().swap( m_vEventTrack );
+    PoolVec<uint32_t>().swap( m_vPack );
+    PoolVec<uint32_t>().swap( m_vThinTicks );
+    PoolVec<uint16_t>().swap( m_vThinDelta );
+    PoolVec<ThinEsc>().swap( m_vThinEsc );
+    m_bThinWide = false;
+    PoolVec<uint32_t>().swap( m_vThinOwners );
+    PoolVec<uint32_t>().swap( m_vThinSisters );
     m_iFullRows = 0;
+    m_bComputedTimes = false;
+    m_bTimeStandard = true;
+    m_iTimeTicksPerBeat = m_iTimeTicksPerSecond = 0;
+    SetTimeDivisor( 0 );
+    SetTimeAnchors( 0, nullptr, nullptr, nullptr );
 }
 
 void MIDI::ReleaseOwnedData( void )
 {
     if ( m_pcOwnedData )
     {
-        delete[] m_pcOwnedData;
+        if ( m_bOwnedMapped )
+            UnmapViewOfFile( m_pcOwnedData );
+        else
+            delete[] m_pcOwnedData;
         m_pcOwnedData = nullptr;
     }
+    m_bOwnedMapped = false;
 }
 
 size_t MIDI::ParseMIDI( const unsigned char *pcData, size_t iMaxSize )
@@ -709,36 +902,105 @@ size_t MIDI::ParseMIDICore( const unsigned char *pcData, size_t iMaxSize )
     if ( iTotal != 14 || m_Info.iFormatType < 0 || m_Info.iFormatType > 2 || m_Info.iDivision == 0 ) return 0;
 
     iTotal += iHdrSize - 6;
+    if ( iTotal > iMaxSize ) return 0; // bogus header size; also keeps (iMaxSize - iTotal) from wrapping
     size_t iRet = iTotal + ParseTracks( pcData + iTotal, iMaxSize - iTotal );
     // bytes; free the owned copy now so the merged list doesn't share the load
-    if ( m_pcOwnedData )
-    {
-        delete[] m_pcOwnedData;
-        m_pcOwnedData = nullptr;
-    }
+    ReleaseOwnedData();
     LogLoadStage("ParseTracks end", this);
     return iRet;
 }
 
 namespace
 {
+    // Pending note-on stacks for one (channel, key) pair each. The previous
+    // array<array<std::stack<..>>> default-constructed 2048 deques (one heap block each)
+    // per track per phase, which dominated load time on files with many tracks. These
+    // vectors allocate lazily and are reused across tracks by a worker thread.
+    // PGFA_NO_DEDUPE=1 disables duplicate folding (for testing).
+    bool g_bNoDedupe = GetEnvironmentVariableA( "PGFA_NO_DEDUPE", nullptr, 0 ) > 0;
+
+    // One note-on waiting for its note-off.
+    //
+    // Duplicate folding: identical notes (same track, channel, key, velocity, start tick and end tick)
+    // are stored as one row that carries a repeat count, and the player re-sends the note that many
+    // times. A note F that was pushed directly on top of an identical-start note E is folded into E
+    // when both end on the same tick. The counting pass decides this (it sees the note-offs) and
+    // records it as a bit per note; the write pass replays the same stacks and obeys the bits.
+    struct Pending
+    {
+        uint32_t tick;          // start tick
+        uint32_t seq;           // index among this track's note-ons
+        uint32_t rowId;         // write pass: pool row this note is stored in (its folded-into row if dup)
+        uint32_t childSeq;      // counting pass: the last same-start note popped off directly above this one
+        uint32_t childOffTick;
+        uint8_t vel;
+        uint8_t key;            // full data byte (stacks are indexed by key & 0x7F, so malformed >=128 keys can share one)
+        uint8_t run;            // notes represented by this entry (itself + folded ones above it)
+        uint8_t childRun;
+        bool sameAsPred;        // pushed on an entry with the same start tick and velocity
+        bool childValid;
+        bool dup;               // write pass: folded into an earlier row, owns no row of its own
+    };
+
+    struct NoteStacks
+    {
+        vector< Pending > v[ 16 * 128 ];
+        uint16_t touched[ 16 * 128 ];
+        bool isTouched[ 16 * 128 ] = {};
+        size_t nTouched = 0;
+
+        vector< Pending >& At( size_t idx )
+        {
+            if ( !isTouched[idx] )
+            {
+                isTouched[idx] = true;
+                touched[nTouched++] = (uint16_t)idx;
+            }
+            return v[idx];
+        }
+        void Reset()
+        {
+            for ( size_t i = 0; i < nTouched; i++ )
+            {
+                v[ touched[i] ].clear();
+                isTouched[ touched[i] ] = false;
+            }
+            nTouched = 0;
+        }
+    };
+
     // nothing row-sized; phase 2 (pMIDI != nullptr) runs the identical walk and
     size_t ParseTrackChunk( const unsigned char *pcData, size_t iMaxSize, size_t iTrack, size_t iRowBase,
                             MIDI *pMIDI, MIDITrack::MIDITrackInfo &ti, vector< MIDIEvent* > &vMetas,
-                            size_t iThinBase, size_t &iThinOut )
+                            size_t iThinBase, size_t &iThinOut, NoteStacks &stacks, MetaArena *pArena,
+                            vector< uint64_t > &vDupBits, size_t iPoolLimit, size_t iThinLimit,
+                            size_t iEscBase = 0, size_t iEscLimit = 0 )
 {
+        // Returns the number of pool rows this track keeps (after duplicate folding); iThinOut gets
+        // the number of folded note-off rows. In the write pass iPoolLimit/iThinLimit are the counts
+        // the counting pass promised: writing past them would corrupt the heap, so exceeding them
+        // throws and the load fails cleanly instead.
         ti.iSequenceNumber = (uint32_t)iTrack;
         int iPrevEventCode = 0;
         uint32_t iAbsTicks = 0;
-        size_t iTotal = 0, nRows = 0, nThin = 0;
+        size_t iTotal = 0, nPool = 0, nThin = 0;
+        size_t nPoolAll = 0, nThinAll = 0, nDup = 0; // counting pass bookkeeping
+        size_t iEscNext = iEscBase, iEscEnd = iEscBase + iEscLimit;
+        uint32_t iNoteSeq = 0;
+        auto fnWritePool = [&]( uint32_t uPack ) -> uint32_t {
+            if ( nPool >= iPoolLimit ) throw std::runtime_error( "MIDI parse: pool row overflow" );
+            const uint32_t iRow = (uint32_t)( iRowBase + nPool++ );
+            pMIDI->SetPoolRow( iRow, iAbsTicks, 0, UINT32_MAX, 0, (uint16_t)iTrack, uPack );
+            return iRow;
+        };
         int iCount = 0;
-        MIDIEvent *pEvent = NULL;
+        bool bEndOfTrack = false;
+        stacks.Reset();
         // row is written; phase 2 writes each kept row at its compacted id and
-        array< array< stack< MIDIChannelEvent >, 128 >, 16 > vStacks;
         do
         {
             iCount = 0;
-            pEvent = NULL;
+            bEndOfTrack = false;
             uint32_t iDT;
             uint32_t iVarlen = MIDI::ParseVarNum( pcData + iTotal, iMaxSize - iTotal, &iDT );
             if ( iVarlen == 0 || iMaxSize - iTotal - iVarlen < 1 ) break;
@@ -767,51 +1029,118 @@ namespace
                         if ( iNumParams > 1 )
                             uPack |= (uint32_t)pcData[ iTotal + iDTCode + 1 ] << 16;
                     }
-                    nRows++;
-                    MIDIChannelEvent iKeepId = (MIDIChannelEvent)( iRowBase + nRows - nThin - 1 );
                     MIDI::ChannelEventType eType = (MIDI::ChannelEventType)( ( uPack >> 4 ) & 0xF );
                     int iChannel = (int)( uPack & 0xF );
                     int iParam1 = (int)( ( uPack >> 8 ) & 0xFF );
                     int iParam2 = (int)( ( uPack >> 16 ) & 0xFF );
-                    auto &sStack = vStacks[ iChannel ][ iParam1 ];
-                    if ( eType == MIDI::NoteOn && iParam2 > 0 )
+                    // data bytes >= 0x80 only occur in malformed files; mask so the index stays in range
+                    const size_t iStackIdx = ( (size_t)iChannel << 7 ) | ( (size_t)iParam1 & 0x7F );
+                    const bool bIsOn = eType == MIDI::NoteOn && iParam2 > 0;
+                    const bool bIsOff = !bIsOn && ( eType == MIDI::NoteOff || eType == MIDI::NoteOn );
+                    if ( !pMIDI )
                     {
-                        if ( pMIDI )
+                        // Counting pass.
+                        if ( bIsOn )
                         {
-                            pMIDI->SetPoolRow( iKeepId, iAbsTicks, 0, UINT32_MAX, 0, (uint16_t)iTrack, uPack );
-                            sStack.push( iKeepId );
+                            auto &sStack = stacks.At( iStackIdx );
+                            Pending p = {};
+                            p.tick = iAbsTicks;
+                            p.vel = (uint8_t)iParam2;
+                            p.key = (uint8_t)iParam1;
+                            p.run = 1;
+                            p.seq = iNoteSeq++;
+                            p.sameAsPred = !sStack.empty() && sStack.back().tick == iAbsTicks && sStack.back().vel == p.vel &&
+                                           sStack.back().key == p.key;
+                            sStack.push_back( p );
+                            nPoolAll++;
+                        }
+                        else if ( bIsOff )
+                        {
+                            auto &sStack = stacks.At( iStackIdx );
+                            if ( !sStack.empty() )
+                            {
+                                Pending e = sStack.back();
+                                sStack.pop_back();
+                                if ( iAbsTicks - e.tick >= MIDI::THIN_DELTA_ESC ) ti.iEscCount++;
+                                nThinAll++;
+                                // The last identical-start note popped off directly above this one ends on the
+                                // same tick: fold it into this note.
+                                if ( e.childValid && e.childOffTick == iAbsTicks && (unsigned)e.run + e.childRun <= 128 && !g_bNoDedupe )
+                                {
+                                    const size_t iWord = e.childSeq >> 6;
+                                    if ( iWord >= vDupBits.size() )
+                                        vDupBits.resize( (std::max)( iWord + 1, vDupBits.size() + vDupBits.size() / 2 + 16 ), 0 );
+                                    vDupBits[iWord] |= 1ull << ( e.childSeq & 63 );
+                                    e.run = (uint8_t)( e.run + e.childRun );
+                                    nDup++;
+                                }
+                                if ( e.sameAsPred && !sStack.empty() )
+                                {
+                                    Pending &pr = sStack.back();
+                                    pr.childValid = true;
+                                    pr.childSeq = e.seq;
+                                    pr.childOffTick = iAbsTicks;
+                                    pr.childRun = e.run;
+                                }
+                            }
+                            else
+                                nPoolAll++;
                         }
                         else
-                            sStack.push( 0 );
+                            nPoolAll++;
                     }
-                    else if ( eType == MIDI::NoteOff || eType == MIDI::NoteOn )
+                    else
                     {
-                        if ( !sStack.empty() )
+                        // Write pass: same walk, obeying the counting pass's duplicate bits.
+                        if ( bIsOn )
                         {
-                            MIDIChannelEvent iOwner = sStack.top();
-                            sStack.pop();
-                            if ( pMIDI )
+                            auto &sStack = stacks.At( iStackIdx );
+                            const uint32_t iSeq = iNoteSeq++;
+                            const size_t iWord = iSeq >> 6;
+                            const bool bDup = iWord < vDupBits.size() && ( ( vDupBits[iWord] >> ( iSeq & 63 ) ) & 1 ) != 0;
+                            Pending p = {};
+                            p.tick = iAbsTicks;
+                            p.vel = (uint8_t)iParam2;
+                            p.seq = iSeq;
+                            if ( bDup )
                             {
-                                pMIDI->SetThinRow( iThinBase + nThin, iAbsTicks,
-                                    (uint32_t)iOwner | ( ( eType == MIDI::NoteOn ) ? MIDI::THIN_OWNER_NOTEON_FLAG : 0 ),
-                                    UINT32_MAX, 0 );
+                                if ( sStack.empty() ) throw std::runtime_error( "MIDI parse: duplicate note without a base note" );
+                                p.dup = true;
+                                p.rowId = sStack.back().rowId;
+                                pMIDI->AddRowRepeat( p.rowId );
                             }
-                            nThin++;
+                            else
+                                p.rowId = fnWritePool( uPack );
+                            sStack.push_back( p );
                         }
-                        else if ( pMIDI )
+                        else if ( bIsOff )
                         {
-                            pMIDI->SetPoolRow( iKeepId, iAbsTicks, 0, UINT32_MAX, 0, (uint16_t)iTrack, uPack );
+                            auto &sStack = stacks.At( iStackIdx );
+                            if ( !sStack.empty() )
+                            {
+                                const Pending e = sStack.back();
+                                sStack.pop_back();
+                                if ( !e.dup )
+                                {
+                                    if ( nThin >= iThinLimit ) throw std::runtime_error( "MIDI parse: thin row overflow" );
+                                    pMIDI->SetThinRow( iThinBase + nThin, iAbsTicks,
+                                        e.rowId | ( ( eType == MIDI::NoteOn ) ? MIDI::THIN_OWNER_NOTEON_FLAG : 0 ),
+                                        UINT32_MAX, iEscNext, iEscEnd );
+                                    nThin++;
+                                }
+                            }
+                            else
+                                fnWritePool( uPack );
                         }
-                    }
-                    else if ( pMIDI )
-                    {
-                        pMIDI->SetPoolRow( iKeepId, iAbsTicks, 0, UINT32_MAX, 0, (uint16_t)iTrack, uPack );
+                        else
+                            fnWritePool( uPack );
                     }
 
                     if ( !bParams ) break;
                     iTotal += iDTCode + iNumParams;
                     iCount = iNumParams;
 
+                    if ( pMIDI ) break; // track info comes from the counting pass; the write pass needs none of it
                     ti.iEventCount++;
                     ti.iTotalTicks = max( ti.iTotalTicks, (int)iAbsTicks );
                     switch ( eType )
@@ -854,7 +1183,20 @@ namespace
                 case MIDIEvent::MetaEvent:
                 case MIDIEvent::SysExEvent:
                 {
-                    pEvent = ( eEventType == MIDIEvent::MetaEvent ) ? (MIDIEvent*)new MIDIMetaEvent() : (MIDIEvent*)new MIDISysExEvent();
+                    // Phase 1 only needs the event for track info, so parse into stack
+                    // objects instead of a new/delete per meta event. Phase 2 keeps the
+                    // heap events, which the tracks own afterwards.
+                    MIDIMetaEvent localMeta;
+                    MIDISysExEvent localSysEx;
+                    MIDIEvent *pEvent;
+                    const size_t iEventBytes = ( eEventType == MIDIEvent::MetaEvent ) ? sizeof( MIDIMetaEvent ) : sizeof( MIDISysExEvent );
+                    if ( pMIDI )
+                    {
+                        void *pMem = pArena->Alloc( iEventBytes );
+                        pEvent = ( eEventType == MIDIEvent::MetaEvent ) ? (MIDIEvent*)new ( pMem ) MIDIMetaEvent() : (MIDIEvent*)new ( pMem ) MIDISysExEvent();
+                    }
+                    else
+                        pEvent = ( eEventType == MIDIEvent::MetaEvent ) ? (MIDIEvent*)&localMeta : (MIDIEvent*)&localSysEx;
                     pEvent->m_eEventType = (char)eEventType;
                     pEvent->m_iEventCode = (unsigned char)iEventCode;
                     pEvent->m_iTrack = (unsigned short)iTrack;
@@ -865,14 +1207,19 @@ namespace
                     if ( iCount > 0 )
                     {
                         iTotal += iDTCode + iCount;
-                        ti.AddEventInfo( *pEvent );
+                        if ( !pMIDI ) ti.AddEventInfo( *pEvent );
+                        // Decide here: the old loop condition dereferenced pEvent after it
+                        // had been deleted (use-after-free; result depended on the heap).
+                        bEndOfTrack = eEventType == MIDIEvent::MetaEvent &&
+                            ( (MIDIMetaEvent*)pEvent )->GetMetaEventType() == MIDIMetaEvent::EndOfTrack;
                         if ( pMIDI )
                             vMetas.push_back( pEvent );
-                        else
-                            delete pEvent;
                     }
-                    else
-                        delete pEvent;
+                    else if ( pMIDI )
+                    {
+                        MIDIEvent::DestroyInPlace( pEvent );
+                        pArena->Unalloc( pEvent, iEventBytes );
+                    }
                     break;
                 }
                 default:
@@ -881,11 +1228,15 @@ namespace
             if ( eEventType == MIDIEvent::ChannelEvent )
                 iPrevEventCode = iEventCode;
         }
-        while ( iMaxSize - iTotal > 0 && iCount > 0 &&
-                ( !pEvent || pEvent->GetEventType() != MIDIEvent::MetaEvent ||
-                  reinterpret_cast< MIDIMetaEvent* >( pEvent )->GetMetaEventType() != MIDIMetaEvent::EndOfTrack ) );
+        while ( iMaxSize - iTotal > 0 && iCount > 0 && !bEndOfTrack );
+        if ( !pMIDI )
+        {
+            // each folded note drops one pool row and one note-off row
+            nPool = nPoolAll - nDup;
+            nThin = nThinAll - nDup;
+        }
         iThinOut = nThin;
-        return nRows;
+        return nPool;
     }
 }
 
@@ -893,7 +1244,7 @@ namespace
 void MIDI::SetPoolRow( size_t iRow, uint32_t iTicks, uint32_t iLengths, uint32_t iSisters,
                        uint32_t iSimult, uint16_t iEventTrack, uint32_t iPack )
 {
-    m_vTimes[iRow] = 0;
+    if ( !m_bComputedTimes ) m_vTimes[iRow] = 0;
     m_vTicks[iRow] = iTicks;
     m_vLengths[iRow] = iLengths;
     m_vSisters[iRow] = iSisters;
@@ -902,13 +1253,54 @@ void MIDI::SetPoolRow( size_t iRow, uint32_t iTicks, uint32_t iLengths, uint32_t
     m_vPack[iRow] = iPack;
 }
 
-void MIDI::SetThinRow( size_t iThin, uint32_t iTicks, uint32_t iOwners, uint32_t iSisters,
-                       uint32_t iLengths )
+void MIDI::SetThinRow( size_t iThin, uint32_t iTicks, uint32_t iOwners, uint32_t iSisters, size_t &iEscNext, size_t iEscEnd )
 {
-    m_vThinTicks[iThin] = iTicks;
+    if ( m_bThinWide )
+        m_vThinTicks[iThin] = iTicks;
+    else
+    {
+        const uint32_t d = iTicks - m_vTicks[ iOwners & ~THIN_OWNER_NOTEON_FLAG ];
+        if ( d < THIN_DELTA_ESC )
+            m_vThinDelta[iThin] = (uint16_t)d;
+        else
+        {
+            if ( iEscNext >= iEscEnd ) throw std::runtime_error( "MIDI parse: escape table overflow" );
+            m_vThinEsc[iEscNext++] = ThinEsc{ (uint32_t)iThin, iTicks };
+            m_vThinDelta[iThin] = THIN_DELTA_ESC;
+        }
+    }
     m_vThinOwners[iThin] = iOwners;
     m_vThinSisters[iThin] = iSisters;
-    m_vThinLengths[iThin] = iLengths;
+}
+
+uint32_t MIDI::ThinEscTick( size_t thin ) const
+{
+    size_t lo = 0, hi = m_vThinEsc.size();
+    while ( lo < hi )
+    {
+        const size_t mid = lo + ( hi - lo ) / 2;
+        if ( m_vThinEsc[mid].thin < thin ) lo = mid + 1; else hi = mid;
+    }
+    return ( lo < m_vThinEsc.size() && m_vThinEsc[lo].thin == thin ) ? m_vThinEsc[lo].tick : 0;
+}
+
+// Runs fn on up to nThreads threads, the calling thread being one of them. If the OS refuses
+// to create a thread (low memory / handle exhaustion) the remaining work still gets done by
+// the threads that did start; an uncaught std::system_error here used to terminate the app.
+template< typename Fn >
+static void RunPool( unsigned nThreads, Fn &&fn )
+{
+    vector< thread > vThreads;
+    try
+    {
+        vThreads.reserve( nThreads );
+        for ( unsigned t = 1; t < nThreads; t++ )
+            vThreads.emplace_back( fn );
+    }
+    catch ( ... ) {}
+    fn();
+    for ( auto &th : vThreads )
+        th.join();
 }
 
 size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
@@ -931,13 +1323,27 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
         iTotal += 8 + iTrkSize;
         iCount = (int)( 8 + iTrkSize );
     }
-    while ( iMaxSize - iTotal > 0 && iCount > 0 && m_Info.iFormatType != 2 );
+    // iTotal can overshoot iMaxSize on a truncated file; "iMaxSize - iTotal > 0" then wrapped
+    // and the next header read ran off the end of the buffer.
+    while ( iTotal < iMaxSize && iCount > 0 && m_Info.iFormatType != 2 );
 
     const size_t nChunks = vOffsets.size();
+    g_LoadingProgress.max = nChunks * 2; // two passes over every chunk
+    vector< size_t > vOrder( nChunks );
+    for ( size_t c = 0; c < nChunks; c++ ) vOrder[c] = c;
+    std::stable_sort( vOrder.begin(), vOrder.end(), [&]( size_t a, size_t b ) { return vSizes[a] > vSizes[b]; } );
     vector< MIDITrack::MIDITrackInfo > vTrackInfo( nChunks );
-    vector< size_t > vRows( nChunks );
+    vector< size_t > vRows( nChunks ); // pool rows each track keeps (after duplicate folding)
     vector< size_t > vThin( nChunks );
+    vector< vector< uint64_t > > vDupBits( nChunks ); // per track: bit per note-on, set if folded into an earlier note
     vector< exception_ptr > vErrors( nChunks );
+    // A mapped file view: once a track is parsed, drop its pages from the working set (they stay in the
+    // OS cache) so the file doesn't count against the process while the pool grows.
+    const bool bTrim = m_bOwnedMapped;
+    auto trimChunk = [&]( size_t c ) {
+        if ( bTrim )
+            VirtualUnlock( const_cast< unsigned char* >( pcData ) + vOffsets[c], min( (size_t)8 + vSizes[c], iMaxSize - vOffsets[c] ) );
+    };
     PRE_DbgLog("LOAD [ParseTracks chunks=%zu]", nChunks);
     unsigned int nThreads = std::thread::hardware_concurrency();
     if ( nThreads == 0 ) nThreads = 4;
@@ -946,19 +1352,20 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
     {
         atomic< size_t > iNext( 0 );
         atomic< size_t > iDone( 0 );
-        vector< thread > vThreads;
-        vThreads.reserve( nThreads );
-        for ( unsigned int t = 0; t < nThreads; t++ )
-            vThreads.emplace_back( [&]() {
-                size_t i;
-                while ( ( i = iNext.fetch_add( 1, memory_order_relaxed ) ) < nChunks )
+        RunPool( nThreads, [&]() {
+                size_t i, k;
+                unique_ptr< NoteStacks > pStacks;
+                // biggest tracks first, so no worker starts a huge one last and leaves the rest idle
+                while ( ( i = ( ( k = iNext.fetch_add( 1, memory_order_relaxed ) ) < nChunks ) ? vOrder[k] : nChunks ) < nChunks )
                 {
                     vector< MIDIEvent* > scratch;
-                    scratch.reserve( 64 );
                     try
                     {
+                        if ( !pStacks ) pStacks.reset( new NoteStacks() );
                         vRows[i] = ParseTrackChunk( pcData + vOffsets[i] + 8, iMaxSize - vOffsets[i] - 8,
-                                                    i, 0, nullptr, vTrackInfo[i], scratch, 0, vThin[i] );
+                                                    i, 0, nullptr, vTrackInfo[i], scratch, 0, vThin[i], *pStacks, nullptr,
+                                                    vDupBits[i], 0, 0 );
+                        trimChunk( i );
                     }
                     catch ( ... )
                     {
@@ -967,8 +1374,6 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
                     g_LoadingProgress.progress = min( (uint64_t)iDone.fetch_add( 1, memory_order_relaxed ) + 1, g_LoadingProgress.max );
                 }
             } );
-        for ( auto &th : vThreads )
-            th.join();
         for ( size_t c = 0; c < nChunks; c++ )
             if ( vErrors[c] )
                 rethrow_exception( vErrors[c] );
@@ -981,26 +1386,71 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
     for ( size_t c = 0; c < nChunks; c++ )
     {
         vFullBases[c] = iTotalRows;
-        iTotalRows += vRows[c] - vThin[c];
+        iTotalRows += vRows[c];
         vThinBases[c] = iThinTotal;
         iThinTotal += vThin[c];
     }
     m_iFullRows = (uint32_t)iTotalRows;
     PRE_DbgLog("LOAD [ParseTracks rows=%zu thin=%zu]", iTotalRows, iThinTotal);
 
+    // Note-off ticks are stored as 16-bit offsets from their note-on; notes longer than that go to a small
+    // sorted escape table. A file full of such notes would make the table cost more than the offsets save,
+    // so then the column stays a plain 32-bit tick (PGFA_THIN_WIDE=1 forces that, for testing).
+    vector< size_t > vEscBases( nChunks );
+    size_t iEscTotal = 0;
+    for ( size_t c = 0; c < nChunks; c++ )
+    {
+        vEscBases[c] = iEscTotal;
+        iEscTotal += vTrackInfo[c].iEscCount;
+    }
+    m_bThinWide = iEscTotal * 4 > iThinTotal;
+    {
+        char aEnv[8] = {};
+        if ( GetEnvironmentVariableA( "PGFA_THIN_WIDE", aEnv, sizeof( aEnv ) ) > 0 )
+            m_bThinWide = aEnv[0] != '0';
+    }
+    PRE_DbgLog("LOAD [ParseTracks thin ticks %s, escapes<=%zu]", m_bThinWide ? "wide" : "delta16", iEscTotal);
+
+    // With only a handful of tempo events the 8-byte time column is redundant: a row's time is a
+    // pure function of its tick, so skip storing it (see MIDI::TimeFromTick).
+    size_t iTempoTotal = 0;
+    for ( size_t c = 0; c < nChunks; c++ )
+        iTempoTotal += vTrackInfo[c].iTempoCount;
+    // Computing a time costs a few ns more than loading it, so only files big enough for the saved
+    // 8 bytes/row to matter use it (PGFA_COMPUTED_TIMES_MIN overrides the row threshold, for testing).
+    size_t iComputedMinRows = (size_t)16 << 20;
+    {
+        char aEnv[32] = {};
+        if ( GetEnvironmentVariableA( "PGFA_COMPUTED_TIMES_MIN", aEnv, sizeof( aEnv ) ) > 0 )
+            iComputedMinRows = (size_t)_strtoui64( aEnv, nullptr, 10 );
+    }
+    m_bComputedTimes = iTempoTotal + 1 <= MaxComputedAnchors && iTotalRows + iThinTotal >= iComputedMinRows;
+    if ( m_bComputedTimes )
+    {
+        // Provisional map (default tempo); PostProcess installs the real one.
+        m_bTimeStandard = !( m_Info.iDivision & 0x8000 );
+        m_iTimeTicksPerBeat = m_bTimeStandard ? (int)m_Info.iDivision : 0;
+        m_iTimeTicksPerSecond = 0;
+        SetTimeDivisor( m_iTimeTicksPerBeat );
+        const int iTick0 = 0;
+        const int64_t iTime0 = 0;
+        const uint32_t iMpb0 = 500000;
+        SetTimeAnchors( 1, &iTick0, &iTime0, &iMpb0 );
+    }
+
     try
     {
-        m_vTimes.reserve( iTotalRows );
+        if ( !m_bComputedTimes ) m_vTimes.reserve( iTotalRows );
         m_vTicks.reserve( iTotalRows );
         m_vLengths.reserve( iTotalRows );
         m_vSisters.reserve( iTotalRows );
         m_vSimult.reserve( iTotalRows );
         m_vEventTrack.reserve( iTotalRows );
         m_vPack.reserve( iTotalRows );
-        m_vThinTicks.reserve( iThinTotal );
+        if ( m_bThinWide ) m_vThinTicks.reserve( iThinTotal );
+        else { m_vThinDelta.reserve( iThinTotal ); m_vThinEsc.reserve( iEscTotal ); }
         m_vThinOwners.reserve( iThinTotal );
         m_vThinSisters.reserve( iThinTotal );
-        m_vThinLengths.reserve( iThinTotal );
         PRE_DbgLog("LOAD [ParseTracks reserve done]");
     }
     catch ( const std::exception &e )
@@ -1009,43 +1459,55 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
         throw;
     }
 
-    m_vTimes.resize( iTotalRows );
+    if ( !m_bComputedTimes ) m_vTimes.resize( iTotalRows );
     m_vTicks.resize( iTotalRows );
     m_vLengths.resize( iTotalRows );
     m_vSisters.resize( iTotalRows );
     m_vSimult.resize( iTotalRows );
     m_vEventTrack.resize( iTotalRows );
     m_vPack.resize( iTotalRows );
-    m_vThinTicks.resize( iThinTotal );
+    if ( m_bThinWide ) m_vThinTicks.resize( iThinTotal );
+    else
+    {
+        m_vThinDelta.resize( iThinTotal );
+        m_vThinEsc.resize( iEscTotal );
+        for ( size_t e = 0; e < iEscTotal; e++ ) m_vThinEsc[e] = ThinEsc{ UINT32_MAX, 0 };
+    }
     m_vThinOwners.resize( iThinTotal );
     m_vThinSisters.resize( iThinTotal );
-    m_vThinLengths.resize( iThinTotal );
+    PRE_DbgLog("LOAD [ParseTracks resized]");
 
     // worker owns a disjoint full and thin range, so no locks are needed; the
     vector< vector< MIDIEvent* > > vMetasAll( nChunks );
+    vector< MetaArena > vArenas( nChunks );
     {
         atomic< size_t > iNext( 0 );
         atomic< size_t > iDone2( 0 );
-        vector< thread > vThreads;
-        vThreads.reserve( nThreads );
-        for ( unsigned int t = 0; t < nThreads; t++ )
-            vThreads.emplace_back( [&]() {
-                size_t i;
-                while ( ( i = iNext.fetch_add( 1, memory_order_relaxed ) ) < nChunks )
+        RunPool( nThreads, [&]() {
+                size_t i, k;
+                unique_ptr< NoteStacks > pStacks;
+                // biggest tracks first, so no worker starts a huge one last and leaves the rest idle
+                while ( ( i = ( ( k = iNext.fetch_add( 1, memory_order_relaxed ) ) < nChunks ) ? vOrder[k] : nChunks ) < nChunks )
                 {
                     vector< MIDIEvent* > metas;
-                    metas.reserve( 64 );
                     MIDITrack::MIDITrackInfo tiThrowaway;
                     size_t iThinDummy = 0;
                     try
                     {
+                        if ( !pStacks ) pStacks.reset( new NoteStacks() );
                         size_t n = ParseTrackChunk( pcData + vOffsets[i] + 8, iMaxSize - vOffsets[i] - 8,
                                                     i, vFullBases[i], this, tiThrowaway, metas,
-                                                    vThinBases[i], iThinDummy );
-                        if ( n != vRows[i] )
-                            PRE_DbgLog("LOAD [ParseTracks count mismatch track=%zu: %zu vs %zu]", i, n, vRows[i]);
-                        if ( iThinDummy != vThin[i] )
-                            PRE_DbgLog("LOAD [ParseTracks thin mismatch track=%zu: %zu vs %zu]", i, iThinDummy, vThin[i]);
+                                                    vThinBases[i], iThinDummy, *pStacks, &vArenas[i],
+                                                    vDupBits[i], vRows[i], vThin[i], vEscBases[i], vTrackInfo[i].iEscCount );
+                        // The rows were sized from the counting pass; the write pass must land exactly on them.
+                        if ( n != vRows[i] || iThinDummy != vThin[i] )
+                        {
+                            PRE_DbgLog("LOAD [ParseTracks count mismatch track=%zu: rows %zu vs %zu, thin %zu vs %zu]",
+                                i, n, vRows[i], iThinDummy, vThin[i]);
+                            throw std::runtime_error( "MIDI parse: counting and write passes disagree" );
+                        }
+                        vector< uint64_t >().swap( vDupBits[i] );
+                        trimChunk( i );
                         vMetasAll[i].swap( metas );
                     }
                     catch ( ... )
@@ -1055,22 +1517,33 @@ size_t MIDI::ParseTracks( const unsigned char *pcData, size_t iMaxSize )
                     g_LoadingProgress.progress = min( nChunks + (uint64_t)iDone2.fetch_add( 1, memory_order_relaxed ) + 1, g_LoadingProgress.max );
                 }
             } );
-        for ( auto &th : vThreads )
-            th.join();
         for ( size_t c = 0; c < nChunks; c++ )
             if ( vErrors[c] )
                 rethrow_exception( vErrors[c] );
     }
 
+    PRE_DbgLog("LOAD [ParseTracks phase 2 done]");
+    if ( !m_bThinWide )
+    {
+        // drop the unused escape slots (the counting pass over-counts folded notes); order stays sorted
+        // because tracks and their thin ranges are both laid out in track order
+        size_t n = 0;
+        for ( size_t e = 0; e < m_vThinEsc.size(); e++ )
+            if ( m_vThinEsc[e].thin != UINT32_MAX )
+                m_vThinEsc[n++] = m_vThinEsc[e];
+        m_vThinEsc.resize( n );
+    }
     for ( size_t c = 0; c < nChunks; c++ )
     {
         MIDITrack *track = new MIDITrack( *this );
         track->m_iRowStart = vFullBases[c];
-        track->m_iRowEnd = vFullBases[c] + vRows[c] - vThin[c];
+        track->m_iRowEnd = vFullBases[c] + vRows[c];
         track->m_iThinStart = vThinBases[c];
         track->m_iThinEnd = vThinBases[c] + vThin[c];
         track->m_TrackInfo = std::move( vTrackInfo[c] );
         track->m_vMetas = std::move( vMetasAll[c] );
+        track->m_Arena = std::move( vArenas[c] );
+        track->m_bArenaMetas = true;
         m_vTracks.push_back( track );
         m_Info.AddTrackInfo( *track );
     }
@@ -1214,7 +1687,7 @@ void MIDI::PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vPr
                 if ( GetEventTicks(iRow) == GetEventTicks(iOwner) )
                     SetEventLength(iRow, 0);
                 else
-                    SetEventLength(iRow, (uint32_t)max(0LL, llTime - m_vTimes[iOwner]));
+                    SetEventLength(iRow, (uint32_t)max(0LL, llTime - GetEventTime(iOwner)));
             }
 
             SetEventSimult(iRow, iSimultaneous);
@@ -1331,18 +1804,29 @@ void MIDI::ConnectNotes()
 
     g_LoadingProgress.stage = MIDILoadingProgress::Stage::ConnectNotes;
     g_LoadingProgress.progress = 0;
-    g_LoadingProgress.max = m_vTracks.size();
-
-    // Connect just links both directions on the row ids; PostProcess later
-    concurrency::parallel_for(size_t(0), m_vTracks.size(), [&](int track) {
-        MIDITrack* pTrack = m_vTracks[track];
-        for (size_t t = pTrack->GetThinStart(); t < pTrack->GetThinEnd(); t++) {
-            MIDIChannelEvent iThin = (MIDIChannelEvent)(m_iFullRows + t);
-            MIDIChannelEvent iOwner = GetThinOwner(iThin);
-            SetEventSisterIdx(iThin, iOwner);
-            SetEventSisterIdx(iOwner, iThin);
+    // Connect just links both directions on the row ids; PostProcess later.
+    // Split evenly over the thin rows rather than per track (tracks are wildly uneven) and
+    // use plain threads instead of PPL: the ConcRT scheduler is a known source of stalls.
+    // Every thin row has a unique owner, so all writes are disjoint.
+    const size_t nThin = m_vThinOwners.size();
+    unsigned nWorkers = PGFAParallelPostProcess::PhysicalCoreCount();
+    nWorkers = (std::min)( nWorkers, (unsigned)(std::min<size_t>)( nThin / 65536 + 1, 64 ) );
+    nWorkers = (std::max)( nWorkers, 1u );
+    g_LoadingProgress.max = nWorkers;
+    atomic< unsigned > iNextWorker( 0 );
+    RunPool( nWorkers, [&]() {
+        unsigned w;
+        while ( ( w = iNextWorker.fetch_add( 1, memory_order_relaxed ) ) < nWorkers )
+        {
+            const size_t begin = nThin * w / nWorkers, end = nThin * ( w + 1 ) / nWorkers;
+            for (size_t t = begin; t < end; t++) {
+                MIDIChannelEvent iThin = (MIDIChannelEvent)(m_iFullRows + t);
+                MIDIChannelEvent iOwner = GetThinOwner(iThin);
+                SetEventSisterIdx(iThin, iOwner);
+                SetEventSisterIdx(iOwner, iThin);
+            }
+            g_LoadingProgress.progress++;
         }
-        g_LoadingProgress.progress++;
     });
     LogLoadStage("ConnectNotes end", this);
 }
@@ -1359,8 +1843,15 @@ MIDITrack::~MIDITrack( void )
 void MIDITrack::clear( void )
 {
     for (auto it = m_vMetas.begin(); it != m_vMetas.end(); ++it)
-        delete* it;
+    {
+        if ( m_bArenaMetas )
+            MIDIEvent::DestroyInPlace( *it );
+        else
+            MIDIEvent::DestroyHeap( *it );
+    }
     m_vMetas.clear();
+    m_Arena.Release();
+    m_bArenaMetas = false;
     m_iRowStart = m_iRowEnd = 0;
     m_TrackInfo.clear();
 }
@@ -1420,7 +1911,7 @@ size_t MIDITrack::ParseEvents( const unsigned char *pcData, size_t iMaxSize, siz
                     m_TrackInfo.AddEventInfo( *pEvent );
                 }
                 else
-                    delete pEvent;
+                    MIDIEvent::DestroyHeap( pEvent );
             }
             else
             {
@@ -1499,6 +1990,9 @@ void MIDITrack::MIDITrackInfo::AddEventInfo( const MIDIEvent &mEvent )
             MIDIMetaEvent::MetaEventType eMetaEventType = mMetaEvent.GetMetaEventType();
             switch ( eMetaEventType )
             {
+                case MIDIMetaEvent::SetTempo:
+                    this->iTempoCount++;
+                    break;
                 case MIDIMetaEvent::SequenceName:
                     this->sSequenceName.assign( reinterpret_cast< char* >( mMetaEvent.GetData() ), mMetaEvent.GetDataLen() );
                     break;
@@ -1518,6 +2012,20 @@ void MIDITrack::MIDITrackInfo::AddEventInfo( const MIDIEvent &mEvent )
     }
 }
 
+
+void MIDIEvent::DestroyInPlace( MIDIEvent *pEvent )
+{
+    if ( !pEvent ) return;
+    if ( pEvent->GetEventType() == MetaEvent ) static_cast< MIDIMetaEvent* >( pEvent )->~MIDIMetaEvent();
+    else static_cast< MIDISysExEvent* >( pEvent )->~MIDISysExEvent();
+}
+
+void MIDIEvent::DestroyHeap( MIDIEvent *pEvent )
+{
+    if ( !pEvent ) return;
+    if ( pEvent->GetEventType() == MetaEvent ) delete static_cast< MIDIMetaEvent* >( pEvent );
+    else delete static_cast< MIDISysExEvent* >( pEvent );
+}
 
 MIDIEvent::EventType MIDIEvent::DecodeEventType( int iEventCode )
 {

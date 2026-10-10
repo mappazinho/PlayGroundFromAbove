@@ -234,6 +234,19 @@ bool InitEmbeddedDLLs(HINSTANCE hInstance)
 
 void FreeEmbeddedDLLs()
 {
+    // Stop the DLLs' own worker threads before unmapping them. SDL's audio thread and BASS's update
+    // thread otherwise keep running inside code that FreeLibrary has just unloaded, which is an
+    // access violation in an <unknown module> on the way out.
+    if (s_hSDL2)
+    {
+        if (auto pSDL_CloseAudio = (void (*)())GetProcAddress(s_hSDL2, "SDL_CloseAudio")) pSDL_CloseAudio();
+        if (auto pSDL_Quit = (void (*)())GetProcAddress(s_hSDL2, "SDL_Quit")) pSDL_Quit();
+    }
+    if (s_hBass)
+    {
+        if (auto pBASS_Free = (BOOL (WINAPI *)())GetProcAddress(s_hBass, "BASS_Free")) pBASS_Free();
+    }
+
     if (s_hSDL2)     { FreeLibrary(s_hSDL2);     s_hSDL2     = NULL; }
     if (s_hBassMidi)  { FreeLibrary(s_hBassMidi);  s_hBassMidi  = NULL; }
     if (s_hBass)      { FreeLibrary(s_hBass);      s_hBass      = NULL; }

@@ -15,6 +15,10 @@
 #include <map>
 #include <atomic>
 #include <stdint.h>
+#include <climits>
+#include <stdexcept>
+#include <intrin.h>
+#include <memory>
 using namespace std;
 
 #include "Misc.h"
@@ -27,6 +31,7 @@ class MIDIMetaEvent;
 class MIDISysExEvent;
 class MIDIPos;
 class ParallelMIDIPos;
+namespace PGFAPacked { struct PackedSong; }
 
 // the MIDI object (SoA). The handle itself is 4 bytes; before this change every
 typedef uint32_t MIDIChannelEvent;
@@ -69,6 +74,20 @@ private:
 
 typedef vector< pair< long long, int > > eventvec_t;
 
+// std::vector whose resize() leaves new elements uninitialized. The event pool columns are
+// filled in full by the parallel parse, so zeroing hundreds of MB on one thread first (and
+// touching every page from that thread) was pure overhead.
+template< typename T >
+struct DefaultInitAllocator : std::allocator< T >
+{
+    template< typename U > struct rebind { using other = DefaultInitAllocator< U >; };
+    DefaultInitAllocator() = default;
+    template< typename U > DefaultInitAllocator( const DefaultInitAllocator< U >& ) noexcept {}
+    template< typename U > void construct( U *p ) noexcept { ::new ( (void*)p ) U; }
+    template< typename U, typename... Args > void construct( U *p, Args&&... args ) { ::new ( (void*)p ) U( std::forward< Args >( args )... ); }
+};
+template< typename T > using PoolVec = std::vector< T, DefaultInitAllocator< T > >;
+
 class MIDI
 {
 public:
@@ -107,29 +126,125 @@ public:
     enum ChannelEventType { NoteOff = 0x8, NoteOn, NoteAftertouch, Controller, ProgramChange, ChannelAftertouch, PitchBend };
     static const uint32_t THIN_OWNER_NOTEON_FLAG = 0x80000000u;
     static const uint32_t THIN_SISTER_PASS_FLAG = 0x80000000u;
+    static const uint16_t THIN_DELTA_ESC = 0xFFFF;
     inline bool IsThinRow(MIDIChannelEvent row) const
     {
-        return row >= m_iFullRows && row < (MIDIChannelEvent)(m_iFullRows + m_vThinTicks.size());
+        return row >= m_iFullRows && row < (MIDIChannelEvent)(m_iFullRows + m_vThinOwners.size());
     }
+    // A folded note-off's absolute tick. Stored as a 16-bit offset from its note-on's tick (0xFFFF =
+    // longer note: exact tick in the sorted escape table); in "wide" mode (files full of very long
+    // notes, where the table would cost more than it saves) it is a plain 32-bit column instead.
+    inline uint32_t GetThinTick(size_t thin) const
+    {
+        if ( m_bThinWide ) return m_vThinTicks[thin];
+        const uint16_t d = m_vThinDelta[thin];
+        if ( d != THIN_DELTA_ESC )
+            return m_vTicks[ m_vThinOwners[thin] & ~THIN_OWNER_NOTEON_FLAG ] + d;
+        return ThinEscTick( thin );
+    }
+    uint32_t ThinEscTick(size_t thin) const;
     inline MIDIChannelEvent GetThinOwner(MIDIChannelEvent row) const
     {
         return (MIDIChannelEvent)(m_vThinOwners[row - m_iFullRows] & ~THIN_OWNER_NOTEON_FLAG);
     }
+    // Tempo map used to derive row times from ticks when there are only a few tempo events (the
+    // common case for huge files): the 8-byte per-row time column then isn't stored at all.
+    static const size_t MaxComputedAnchors = 7; // slot 7 is always an INT_MAX sentinel
+    __forceinline int64_t TimeFromTick( uint32_t iTicks ) const
+    {
+        const int iTick = (int)iTicks;
+        // Index of the last anchor whose tick <= iTick. The lookup keys are sorted (slot 0 is INT_MIN,
+        // unused slots INT_MAX), so the keys greater than iTick form a suffix that always includes the
+        // sentinel; its first slot is the answer + 1.
+        const __m128i vTick = _mm_set1_epi32( iTick == INT_MAX ? INT_MAX - 1 : iTick );
+        const unsigned uGt = (unsigned)_mm_movemask_ps( _mm_castsi128_ps( _mm_cmpgt_epi32( _mm_loadu_si128( (const __m128i*)&m_aAnchorKey[0] ), vTick ) ) ) |
+                             ( (unsigned)_mm_movemask_ps( _mm_castsi128_ps( _mm_cmpgt_epi32( _mm_loadu_si128( (const __m128i*)&m_aAnchorKey[4] ), vTick ) ) ) << 4 );
+        unsigned long iFirstGt;
+        _BitScanForward( &iFirstGt, uGt );
+        const size_t a = iFirstGt - 1;
+
+        const int64_t iNum = m_aAnchorMul[a] * ( (int64_t)iTick - m_aAnchorTick[a] );
+        // Numerators outside [0, 2^57) (negative ticks, or no usable magic: m_uNumLimit == 0) take the
+        // plain divide, which truncates exactly like the stored-time path did.
+        if ( (unsigned __int64)iNum >= m_uNumLimit )
+            return m_iTimeDivisor ? m_aAnchorTime[a] + iNum / m_iTimeDivisor : m_aAnchorTime[a];
+        // Exactly iNum / divisor without a hardware divide (~40 cycles, and this runs per event in the
+        // hot loops): multiply by a precomputed magic number and shift (Granlund-Montgomery).
+        unsigned __int64 iHi;
+        _umul128( (unsigned __int64)iNum, m_uTimeMagic, &iHi );
+        return m_aAnchorTime[a] + (int64_t)( iHi >> m_iTimeShift );
+    }
+    // Picks the magic number/shift for dividing numerators < 2^57 by iDiv: with 2^L >= iDiv and
+    // m = ceil(2^(57+L) / iDiv), floor(x / iDiv) == (x * m) >> (57 + L) for every x < 2^57.
+    // L is at least 7 so the shift is >= 64 (just the high word of the product); iDiv == 1 would
+    // need a 65-bit m and uses the plain divide instead (m == 0).
+    void SetTimeDivisor( int iDiv )
+    {
+        m_uTimeMagic = 0;
+        m_iTimeShift = 0;
+        m_uNumLimit = 0;
+        m_iTimeDivisor = iDiv > 0 ? iDiv : 0;
+        if ( iDiv <= 1 ) return;
+        unsigned L = 7;
+        while ( ( 1u << L ) < (unsigned)iDiv ) L++;
+        const unsigned k = 57 + L;
+        unsigned __int64 q = 0, r = 1;
+        for ( unsigned i = 0; i < k; i++ )
+        {
+            r <<= 1; q <<= 1;
+            if ( r >= (unsigned)iDiv ) { r -= iDiv; q |= 1; }
+        }
+        if ( r != 0 ) q++;
+        m_uTimeMagic = q;
+        m_iTimeShift = k - 64;
+        m_uNumLimit = 1ull << 57;
+    }
+    // iStandard: numerators are microSecsPerBeat * dTicks (divided by ticks per beat); otherwise
+    // 1000000 * dTicks (divided by ticks per second).
+    void SetTimeAnchors( size_t n, const int *pTicks, const int64_t *pTimes, const uint32_t *pMicroSecsPerBeat )
+    {
+        for ( size_t i = 0; i <= MaxComputedAnchors; i++ )
+        {
+            const bool bUsed = i < n && i < MaxComputedAnchors;
+            m_aAnchorKey[i] = i == 0 ? INT_MIN : ( bUsed ? pTicks[i] : INT_MAX );
+            m_aAnchorTick[i] = bUsed ? pTicks[i] : 0;
+            m_aAnchorTime[i] = bUsed ? pTimes[i] : 0;
+            m_aAnchorMul[i] = m_bTimeStandard ? (int64_t)( bUsed ? pMicroSecsPerBeat[i] : 500000 ) : 1000000LL;
+        }
+        m_nAnchors = n;
+    }
+    // Identical notes (same track, channel, key, velocity, start and end tick) are stored as one row
+    // that carries a repeat count in the top 7 bits of its pack word. A folded note-off reports its
+    // note-on's count. Anything that sends or counts notes must honour it; visuals draw the row once.
+    static const unsigned REPEAT_SHIFT = 25;
+    static const unsigned MAX_REPEAT = 128;
+    inline unsigned GetEventRepeat(MIDIChannelEvent row) const
+    {
+        return ( ( m_vPack[ IsThinRow(row) ? GetThinOwner(row) : row ] >> REPEAT_SHIFT ) & 0x7Fu ) + 1;
+    }
+    inline void AddRowRepeat(MIDIChannelEvent row)
+    {
+        if ( ( ( m_vPack[row] >> REPEAT_SHIFT ) & 0x7Fu ) == 0x7Fu ) throw std::runtime_error( "MIDI repeat count overflow" );
+        m_vPack[row] += 1u << REPEAT_SHIFT;
+    }
+    inline int64_t GetPoolTime(MIDIChannelEvent row) const { return m_bComputedTimes ? TimeFromTick( m_vTicks[row] ) : m_vTimes[row]; }
     inline int64_t GetEventTime(MIDIChannelEvent row) const
     {
         if ( IsThinRow(row) )
         {
-            size_t t = row - m_iFullRows;
-            return m_vTimes[m_vThinOwners[t] & ~THIN_OWNER_NOTEON_FLAG] + m_vThinLengths[t];
+            // A folded note-off ends its note-on's length after the note-on.
+            size_t owner = m_vThinOwners[row - m_iFullRows] & ~THIN_OWNER_NOTEON_FLAG;
+            return GetPoolTime( (MIDIChannelEvent)owner ) + m_vLengths[owner];
         }
-        return m_vTimes[row];
+        return GetPoolTime( row );
     }
-    inline void SetEventTime(MIDIChannelEvent row, int64_t iTime) { if ( !IsThinRow(row) ) m_vTimes[row] = iTime; }
-    inline int GetEventAbsT(MIDIChannelEvent row) const { return IsThinRow(row) ? (int)m_vThinTicks[row - m_iFullRows] : (int)m_vTicks[row]; }
-    inline uint32_t GetEventTicks(MIDIChannelEvent row) const { return IsThinRow(row) ? m_vThinTicks[row - m_iFullRows] : m_vTicks[row]; }
+    inline void SetEventTime(MIDIChannelEvent row, int64_t iTime) { if ( !IsThinRow(row) && !m_bComputedTimes ) m_vTimes[row] = iTime; }
+    inline int GetEventAbsT(MIDIChannelEvent row) const { return IsThinRow(row) ? (int)GetThinTick(row - m_iFullRows) : (int)m_vTicks[row]; }
+    inline uint32_t GetEventTicks(MIDIChannelEvent row) const { return IsThinRow(row) ? GetThinTick(row - m_iFullRows) : m_vTicks[row]; }
     inline void SetEventTicks(MIDIChannelEvent row, uint32_t iTicks) { if ( !IsThinRow(row) ) m_vTicks[row] = iTicks; }
-    inline uint32_t GetEventLength(MIDIChannelEvent row) const { return IsThinRow(row) ? m_vThinLengths[row - m_iFullRows] : m_vLengths[row]; }
-    inline void SetEventLength(MIDIChannelEvent row, uint32_t iLength) { if ( IsThinRow(row) ) m_vThinLengths[row - m_iFullRows] = iLength; else m_vLengths[row] = iLength; }
+    // A folded note-off has the same length as its note-on, so it is stored once, on the note-on.
+    inline uint32_t GetEventLength(MIDIChannelEvent row) const { return IsThinRow(row) ? m_vLengths[GetThinOwner(row)] : m_vLengths[row]; }
+    inline void SetEventLength(MIDIChannelEvent row, uint32_t iLength) { if ( IsThinRow(row) ) m_vLengths[GetThinOwner(row)] = iLength; else m_vLengths[row] = iLength; }
     inline unsigned GetEventSisterIdx(MIDIChannelEvent row) const { return IsThinRow(row) ? (m_vThinSisters[row - m_iFullRows] & ~THIN_SISTER_PASS_FLAG) : m_vSisters[row]; }
     inline void SetEventSisterIdx(MIDIChannelEvent row, unsigned iSister)
     {
@@ -188,10 +303,9 @@ public:
     void SetPoolRow( size_t iRow, uint32_t iTicks, uint32_t iLengths, uint32_t iSisters,
                      uint32_t iSimult, uint16_t iEventTrack, uint32_t iPack );
     // walk; each worker owns a disjoint thin range, so no locking). The full row id is iThin + m_iFullRows; the owner references a compacted full row.
-    void SetThinRow( size_t iThin, uint32_t iTicks, uint32_t iOwners, uint32_t iSisters,
-                     uint32_t iLengths );
+    void SetThinRow( size_t iThin, uint32_t iTicks, uint32_t iOwners, uint32_t iSisters, size_t &iEscNext, size_t iEscEnd );
     size_t ParseEvents( const unsigned char *pcData, size_t iMaxSize );
-    bool IsValid() const { return ( m_vTracks.size() > 0 && m_Info.iNoteCount > 0 && m_Info.iDivision > 0 ); }
+    bool IsValid() const { return ( m_vTracks.size() > 0 && ( m_Info.iNoteCount > 0 || m_pPacked ) && m_Info.iDivision > 0 ); } // a packed song may have a note-free window
 
     void PostProcess(vector<MIDIChannelEvent>& vChannelEvents, eventvec_t* vProgramChanges = nullptr,
         vector<MIDIMetaEvent*>* vMetaEvents = nullptr, eventvec_t* vTempo = nullptr, eventvec_t* vSignature = nullptr, eventvec_t* vMarkers = nullptr);
@@ -200,6 +314,19 @@ public:
     void ConnectNotes();
     void clear( void );
     void ReleaseOwnedData( void );
+
+    // --- packed mode (prototype): the song lives in a compact packed store and only a window of it
+    // is expanded into the normal row pool (see PackedMIDI.h). Enabled with PGFA_PACKED=1.
+    bool IsPackedPending() const { return m_bPackedPending; }
+    bool IsPacked() const { return (bool)m_pPacked; }
+    void SetPackedSong( std::shared_ptr<PGFAPacked::PackedSong> p ) { m_pPacked = std::move( p ); }
+    std::shared_ptr<PGFAPacked::PackedSong> GetPackedSong() const { return m_pPacked; }
+    long long PackedSongEndUs() const { return m_llPackedSongEndUs; }
+    bool LoadPackedWindow( long long llStartUs, uint64_t iMaxNotes, long long llMinSpanUs );
+    void ReleasePacked();
+    void ApplyPackedSongInfo(); // after PostProcess: first-note time and length are the whole song's, not the window's
+    long long PackedWindowStartUs() const { return m_llPackedStartUs; }
+    long long PackedWindowEndUs() const { return m_llPackedEndUs; }
 
     friend class MIDIPos;
     friend class ParallelMIDIPos;
@@ -237,23 +364,103 @@ private:
     static int aWhiteCount[KEYS + 1];
 
     unsigned char *m_pcOwnedData = nullptr;
+    bool m_bOwnedMapped = false; // m_pcOwnedData is a mapped file view (UnmapViewOfFile), not a new[] block
+    std::shared_ptr<PGFAPacked::PackedSong> m_pPacked;
+    std::wstring m_sPackedPath;
+    bool m_bPackedPending = false;
+    long long m_llPackedStartUs = 0, m_llPackedEndUs = 0, m_llPackedSongEndUs = 0;
 
     MIDIInfo m_Info;
     vector< MIDITrack* > m_vTracks;
 
     // are full 30-byte+2 rows; note-offs (and vel-0 NoteOns) that got paired in
-    vector<int64_t>  m_vTimes;   // absolute microsecond time
-    vector<uint32_t> m_vTicks;   // absolute tick time
-    vector<uint32_t> m_vLengths; // note length in microseconds
-    vector<uint32_t> m_vSisters; // merged-list position of the sister; the actual row can be resolved through the game's merged list. UINT32_MAX = none
-    vector<uint16_t> m_vSimult;  // simultaneous notes (uint16: clamped; only ever read on note-on rows)
-    vector<uint16_t> m_vEventTrack; // owning track
-    vector<uint32_t> m_vPack;       // code | param1 << 8 | param2 << 16 | flags << 24
-    vector<uint32_t> m_vThinTicks;   // absolute ticks (needed by the merge walk and GetEventAbsT)
-    vector<uint32_t> m_vThinOwners;  // full row id of the note-on + THIN_OWNER_NOTEON_FLAG
-    vector<uint32_t> m_vThinSisters; // merged-list pos of the sister + THIN_SISTER_PASS_FLAG during PostProcess
-    vector<uint32_t> m_vThinLengths; // note length in microseconds
+    PoolVec<int64_t> m_vTimes;   // absolute microsecond time
+    PoolVec<uint32_t> m_vTicks;   // absolute tick time
+    PoolVec<uint32_t> m_vLengths; // note length in microseconds
+    PoolVec<uint32_t> m_vSisters; // merged-list position of the sister; the actual row can be resolved through the game's merged list. UINT32_MAX = none
+    PoolVec<uint16_t> m_vSimult;  // simultaneous notes (uint16: clamped; only ever read on note-on rows)
+    PoolVec<uint16_t> m_vEventTrack; // owning track
+    PoolVec<uint32_t> m_vPack;       // code | param1 << 8 | param2 << 16 | flags << 24
+    PoolVec<uint32_t> m_vThinTicks;   // absolute ticks; wide mode only (empty otherwise)
+    PoolVec<uint16_t> m_vThinDelta;   // narrow mode: tick - owner tick, THIN_DELTA_ESC = see m_vThinEsc
+    struct ThinEsc { uint32_t thin; uint32_t tick; };
+    PoolVec<ThinEsc> m_vThinEsc;      // sorted by thin index
+    bool m_bThinWide = false;
+    PoolVec<uint32_t> m_vThinOwners;  // full row id of the note-on + THIN_OWNER_NOTEON_FLAG
+    PoolVec<uint32_t> m_vThinSisters; // merged-list pos of the sister + THIN_SISTER_PASS_FLAG during PostProcess
     uint32_t m_iFullRows = 0;        // full row count after the fold = thin zone base
+
+    bool m_bComputedTimes = false;   // m_vTimes is empty; times come from m_aAnchors + ticks
+    bool m_bTimeStandard = true;
+    int m_iTimeTicksPerBeat = 0, m_iTimeTicksPerSecond = 0;
+    unsigned __int64 m_uTimeMagic = 0; // see SetTimeDivisor
+    unsigned m_iTimeShift = 0;
+    int m_aAnchorKey[8] = { INT_MIN, INT_MAX, INT_MAX, INT_MAX, INT_MAX, INT_MAX, INT_MAX, INT_MAX };
+    int m_aAnchorTick[8] = {};
+    int64_t m_aAnchorTime[8] = {};
+    int64_t m_aAnchorMul[8] = { 500000, 500000, 500000, 500000, 500000, 500000, 500000, 500000 };
+    int m_iTimeDivisor = 0;
+    unsigned __int64 m_uNumLimit = 0;
+    size_t m_nAnchors = 0;
+};
+
+// Bump allocator for a track's meta/sysex events: no per-event malloc header (16 bytes each, which
+// is a third of a tempo event) and far fewer allocator calls on files with millions of tempo events.
+// Blocks grow geometrically so tracks with only a handful of events stay small.
+class MetaArena
+{
+public:
+    MetaArena() {}
+    MetaArena( const MetaArena& ) = delete;
+    MetaArena& operator=( const MetaArena& ) = delete;
+    MetaArena( MetaArena&& o ) noexcept { Take( o ); }
+    MetaArena& operator=( MetaArena&& o ) noexcept { if ( this != &o ) { Release(); Take( o ); } return *this; }
+    ~MetaArena() { Release(); }
+
+    void* Alloc( size_t n )
+    {
+        n = ( n + 7 ) & ~(size_t)7;
+        if ( m_iLeft < n )
+        {
+            size_t iSize = m_iNextBlock;
+            while ( iSize < n ) iSize *= 2;
+            unsigned char *p = new unsigned char[iSize];
+            m_vBlocks.push_back( p );
+            m_pCur = p;
+            m_iLeft = iSize;
+            if ( m_iNextBlock < ( (size_t)256 << 10 ) ) m_iNextBlock *= 2;
+        }
+        void *p = m_pCur;
+        m_pCur += n;
+        m_iLeft -= n;
+        return p;
+    }
+    // Gives back the most recent allocation (an event that failed to parse).
+    void Unalloc( void *p, size_t n )
+    {
+        n = ( n + 7 ) & ~(size_t)7;
+        if ( m_pCur - n == p ) { m_pCur -= n; m_iLeft += n; }
+    }
+    void Release()
+    {
+        for ( unsigned char *p : m_vBlocks ) delete[] p;
+        m_vBlocks.clear();
+        m_pCur = nullptr;
+        m_iLeft = 0;
+        m_iNextBlock = 512;
+    }
+
+private:
+    void Take( MetaArena& o )
+    {
+        m_vBlocks = std::move( o.m_vBlocks );
+        m_pCur = o.m_pCur; m_iLeft = o.m_iLeft; m_iNextBlock = o.m_iNextBlock;
+        o.m_vBlocks.clear(); o.m_pCur = nullptr; o.m_iLeft = 0; o.m_iNextBlock = 512;
+    }
+    vector< unsigned char* > m_vBlocks;
+    unsigned char *m_pCur = nullptr;
+    size_t m_iLeft = 0;
+    size_t m_iNextBlock = 512;
 };
 
 class MIDITrack
@@ -273,9 +480,9 @@ public:
     struct MIDITrackInfo
     {
         MIDITrackInfo() { clear(); }
-        void clear() { llTotalMicroSecs = iSequenceNumber = iMinNote = iMaxNote = iNoteCount = 
-                       iEventCount = iMaxVolume = iVolumeSum = iTotalTicks = iNumChannels = 0;
-                       memset( aNoteCount, 0, sizeof( aNoteCount ) ),
+        void clear() { llTotalMicroSecs = iSequenceNumber = iMinNote = iMaxNote = iNoteCount =
+                       iEventCount = iMaxVolume = iVolumeSum = iTotalTicks = iNumChannels = iTempoCount = 0;
+                       iEscCount = 0, memset( aNoteCount, 0, sizeof( aNoteCount ) ),
                        memset( aProgram, 0, sizeof( aProgram ) ),
                        sSequenceName.clear(); }
         void AddEventInfo( const MIDIEvent &mTrack );
@@ -284,6 +491,8 @@ public:
         string sSequenceName;
         int iMinNote, iMaxNote;
         size_t iNoteCount, iEventCount;
+        size_t iTempoCount = 0; // SetTempo meta events in this track
+        size_t iEscCount = 0;   // notes longer than 0xFFFE ticks (upper bound; counting pass only)
         int iMaxVolume, iVolumeSum;
         int iTotalTicks;
         long long llTotalMicroSecs;
@@ -294,7 +503,9 @@ public:
 
 private:
     MIDITrackInfo m_TrackInfo;
-    vector< MIDIEvent* > m_vMetas;     // meta/sysex heap objects (parse order)
+    vector< MIDIEvent* > m_vMetas;     // meta/sysex objects (parse order); in m_Arena if m_bArenaMetas, else heap
+    MetaArena m_Arena;
+    bool m_bArenaMetas = false;
     MIDI& m_MIDI;
     int m_iCurrentEventPos;
 
@@ -317,6 +528,10 @@ class MIDIEvent
 public:
     enum EventType { ChannelEvent, MetaEvent, SysExEvent, RunningStatus };
     static EventType DecodeEventType( int iEventCode );
+    // Events have no virtual destructor (a vptr would add 8 bytes to every one of them), so they are
+    // destroyed by their type tag. DestroyInPlace is for arena storage, DestroyHeap for `new`ed events.
+    static void DestroyInPlace( MIDIEvent *pEvent );
+    static void DestroyHeap( MIDIEvent *pEvent );
 
     // delta; *piPrevEventCode is the running-status source and is updated to
     static int MakeNextEvent( MIDI& midi, const unsigned char *pcData, size_t iMaxSize, int iTrack,

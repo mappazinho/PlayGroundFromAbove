@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <queue>
 #include <thread>
+#include "PackedMIDI.h"
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -291,6 +292,8 @@ protected:
     void UpdateState(int key, const thread_work_t& work);
     void JumpTo(long long llStartTime, bool bUpdateGUI = true);
 
+    // packed-song prototype: slides the expanded window along the song (see PackedPump)
+    void PackedPump();
     void StartPlaybackAudioThread();
     void StopPlaybackAudioThread();
     void SyncPlaybackAudioThread(bool forceSeek = false);
@@ -379,6 +382,14 @@ void RenderText();
 
     // Independent live-MIDI clock/scheduler. The renderer only snapshots control changes; this
     // thread owns the output provider and advances from QPC even when Present/Render is blocked
+    std::thread m_PackedBuilder;
+    std::atomic<int> m_iPackedState{ 0 }; // 0 idle, 1 building, 2 next screen ready, 3 failed
+    MainScreen* m_pPackedNext = nullptr;
+    long long m_llPendingJumpUs = LLONG_MIN; // set on a continuation screen: seek here on its first frame
+    bool m_bPackedHold = false;              // playhead is outside the expanded window: time stands still until the next one is in
+    std::atomic<long long> m_llPackedBuildMs{ 1500 };
+    long long m_llPackedLastTriggerUs = LLONG_MIN;
+    unsigned long long m_ullPackedRetryAt = 0;
     std::thread m_PlaybackAudioThread;
     std::atomic<bool> m_bPlaybackAudioExit{ false };
     std::atomic<bool> m_bPlaybackAudioRunning{ false };

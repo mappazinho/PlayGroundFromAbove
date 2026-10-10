@@ -356,6 +356,10 @@ static long long PGFAClampSongTime(long long value, long long lo, long long hi)
 MainScreen::~MainScreen()
 {
     StopPlaybackAudioThread();
+    if (m_PackedBuilder.joinable())
+        m_PackedBuilder.join();
+    delete m_pPackedNext;
+    m_pPackedNext = nullptr;
 }
 
 void MainScreen::StartPlaybackAudioThread()
@@ -872,7 +876,10 @@ void MainScreen::PlaybackAudioThreadMain()
                     const double qpcAbsolute = (double)anchorQpc + qpcDelta;
                     eventQpc = qpcAbsolute > 0.0 ? (uint64_t)(qpcAbsolute + 0.5) : nowQpc;
                 }
-                eventBatch.push_back({ eventQpc, packed, 0u });
+                // A folded row stands for several identical notes: send each of them.
+                const unsigned repeats = (type == MIDI::NoteOn || type == MIDI::NoteOff) ? m_MIDI.GetEventRepeat(event) : 1u;
+                for (unsigned r = 0; r < repeats; ++r)
+                    eventBatch.push_back({ eventQpc, packed, 0u });
             }
             ++eventPos;
             ++processed;
@@ -939,10 +946,127 @@ GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
     return result;
 }
 
+// Packed-song prototype. The song lives in a compact packed store and only a window of it is
+// expanded into the row pool the renderer and audio read. When the playhead nears the end of the
+// window (or is moved outside it), the next window is built as a complete MainScreen on a worker
+// thread - exactly what loading a file does - and swapped in through the normal state change.
+void MainScreen::PackedPump()
+{
+    if (!m_MIDI.IsPacked() || IsFreePlay())
+        return;
+
+    {
+        // test hook: PGFA_PACKED_TESTSEEK="atWallSec:toSongSec[,atWallSec:toSongSec...]" seeks once per entry
+        static const auto s_t0 = std::chrono::steady_clock::now();
+        static int s_done = 0;
+        char aEnv[96] = {};
+        if (GetEnvironmentVariableA("PGFA_PACKED_TESTSEEK", aEnv, sizeof(aEnv)) > 0) {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
+            int idx = 0;
+            for (char* p = aEnv; *p; ++idx) {
+                double at = atof(p); char* c = strchr(p, ':'); if (!c) break;
+                double to = atof(c + 1); char* n = strchr(c, ','); 
+                if (idx == s_done && now >= at) { s_done++; HeartbeatLog("packed:testseek"); JumpTo((long long)(to * 1e6), false); StartPlaybackAudioThread(); PlaybackAudioSeek(m_llStartTime); break; }
+                if (!n) break; p = n + 1;
+            }
+        }
+    }
+    const int st = m_iPackedState.load(std::memory_order_acquire);
+    if (st == 2 || st == 3) {
+        if (m_PackedBuilder.joinable())
+            m_PackedBuilder.join();
+        m_iPackedState.store(0, std::memory_order_release);
+        if (st == 2 && m_pPackedNext) {
+            MainScreen* next = m_pPackedNext;
+            m_pPackedNext = nullptr;
+            next->m_llPendingJumpUs = m_llStartTime;
+            next->m_fKeysTransition = m_fKeysTransition;
+            if (next->m_vTrackSettings.size() == m_vTrackSettings.size())
+                next->m_vTrackSettings = m_vTrackSettings;
+            m_bPackedHold = false;
+            m_pNextState = next;
+            char b[128];
+            sprintf_s(b, "packed:swap at %.3fs", (double)m_llStartTime / 1e6);
+            HeartbeatLog(b);
+        } else {
+            HeartbeatLog("packed:build failed");
+            m_ullPackedRetryAt = GetTickCount64() + 1000; // back off for a moment
+        }
+        return;
+    }
+    if (st == 1)
+        return;
+
+    const long long songEnd = m_MIDI.PackedSongEndUs();
+    const long long wStart = m_MIDI.PackedWindowStartUs();
+    const long long wEnd = m_MIDI.PackedWindowEndUs();
+    const long long t = m_llStartTime;
+    const long long spanUs = (long long)(3.0 * Config::GetConfig().GetPlaybackSettings().GetNSpeed() * 1e6);
+    const long long aheadUs = 1500000 + 2 * 1000 * m_llPackedBuildMs.load(std::memory_order_relaxed);
+
+    const bool outside = (wStart > 0 && t < wStart) || (t >= wEnd && wEnd < songEnd);
+    const bool nearEnd = wEnd < songEnd && t + spanUs + aheadUs > wEnd;
+    m_bPackedHold = outside;
+    if (!outside && !nearEnd)
+        return;
+    if (GetTickCount64() < m_ullPackedRetryAt)
+        return; // a build just failed
+
+    PGFAPacked::Continuation cont;
+    cont.active = true;
+    cont.song = m_MIDI.GetPackedSong();
+    cont.startUs = (std::max)(0LL, t);
+    cont.minSpanUs = spanUs + 3 * aheadUs + 2000000;
+    {
+        char aEnv[32] = {};
+        if (GetEnvironmentVariableA("PGFA_PACKED_NOTES", aEnv, sizeof(aEnv)) > 0)
+            cont.maxNotes = (uint64_t)_strtoui64(aEnv, nullptr, 10);
+    }
+    const std::wstring path = m_MIDI.GetInfo().sFilename;
+    const State mode = m_eGameMode;
+    {
+        char b[160];
+        sprintf_s(b, "packed:build start t=%.3fs window=[%.3f,%.3f] outside=%d", (double)t / 1e6, (double)wStart / 1e6, (double)wEnd / 1e6, (int)outside);
+        HeartbeatLog(b);
+    }
+    m_iPackedState.store(1, std::memory_order_release);
+    try {
+        m_PackedBuilder = std::thread([this, cont, path, mode]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            PGFAPacked::g_Cont = cont;
+            MainScreen* next = nullptr;
+            try { next = new MainScreen(path, mode, NULL, NULL); } catch (...) { next = nullptr; }
+            PGFAPacked::g_Cont.active = false;
+            PGFAPacked::g_Cont.song.reset();
+            if (next && next->IsValid()) {
+                m_llPackedBuildMs.store((long long)std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+                m_pPackedNext = next;
+                m_iPackedState.store(2, std::memory_order_release);
+            } else {
+                delete next;
+                m_iPackedState.store(3, std::memory_order_release);
+            }
+        });
+    } catch (...) {
+        m_iPackedState.store(0, std::memory_order_release);
+    }
+}
+
 GameState::GameError MainScreen::Logic(void)
 {
     if (IsFreePlay())
         return LogicLegacy();
+
+    if (m_llPendingJumpUs != LLONG_MIN) {
+        // first frame of a continuation window: land on the playhead of the screen it replaces
+        const long long t = m_llPendingJumpUs;
+        m_llPendingJumpUs = LLONG_MIN;
+        JumpTo(t, false);
+        StartPlaybackAudioThread();
+        PlaybackAudioSeek(m_llStartTime);
+        m_Timer.Start();
+    }
+    PackedPump();
 
     const VizSettings& viz = Config::GetConfig().GetVizSettings();
     m_OutDevice.SetThreadOwned(true, viz.bKDMAPI);

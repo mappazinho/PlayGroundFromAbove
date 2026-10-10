@@ -595,6 +595,10 @@ void MIDIAudio::GeneratorFunc(double speed, double time, std::vector<MIDIChannel
 
 		auto tSend0 = clock_t::now();
 		int err = 1;
+		// A folded row stands for several identical notes (see MIDI::GetEventRepeat): send each one.
+		const unsigned iRepeats = ((ev[0] >> 4) == 0x8 || (ev[0] >> 4) == 0x9) ? m_pMIDI->GetEventRepeat(*e) : 1u;
+		for (unsigned r = 1; r < iRepeats; ++r)
+			bass->SendEventRaw(ev, 3);
 		err = bass->SendEventRaw(ev, 3);
 		if (err <= 0)
 		{

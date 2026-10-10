@@ -833,6 +833,7 @@ GameState::GameError GameState::ChangeState( GameState *pNextState, GameState **
     {
         PRE_DbgLog("ChangeState: Stop prerender");
         PRE_MIDIAudio->Stop();
+        HeartbeatLog("changestate:prerender-stopped");
     }
     CustomAudioStop();
 
@@ -844,9 +845,11 @@ GameState::GameError GameState::ChangeState( GameState *pNextState, GameState **
         sprintf_s(buf, "ChangeState: %s -> %s", ( *pDestObj )->DebugName(), pNextState->DebugName());
         HeartbeatLog(buf);
         delete *pDestObj;
+        HeartbeatLog("changestate:old-deleted");
     }
     *pDestObj = pNextState;
     GameError iResult = pNextState->Init();
+    HeartbeatLog("changestate:init-done");
     if ( iResult )
     {
         *pDestObj = new IntroScreen( pNextState->m_hWnd, pNextState->m_pRenderer );
@@ -2052,7 +2055,20 @@ void SplashScreen::RenderOverlay()
         ImVec2(panelRight + 2.0f * scale, panelBottom + 6.0f * scale),
         IM_COL32(0, 0, 0, 80), rounding);
 
-    // 2. Translucent glass body with low color opacity (frosted dark acrylic glass)
+    // 2. Frosted glass: the blurred scene behind the card (the same texture the toolbar capsule samples),
+    // clipped to the card's rounded corners, then a dark tint on top. Falls back to the tint alone when
+    // blur is disabled or unavailable.
+    {
+        const ImTextureID blurTexture = (ImTextureID)m_pRenderer->GetBlurTextureID();
+        const float bw = (float)m_pRenderer->GetBufferWidth();
+        const float bh = (float)m_pRenderer->GetBufferHeight();
+        if (!g_bDisableBlur && blurTexture && bw > 0.0f && bh > 0.0f)
+        {
+            draw->AddImageRounded(blurTexture, ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
+                ImVec2(panelLeft / bw, panelTop / bh), ImVec2(panelRight / bw, panelBottom / bh),
+                IM_COL32(255, 255, 255, 255), rounding);
+        }
+    }
     draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
         IM_COL32(10, 16, 26, 115), rounding);
     draw->AddRectFilled(ImVec2(panelLeft, panelTop), ImVec2(panelRight, panelBottom),
@@ -2075,32 +2091,28 @@ void SplashScreen::RenderOverlay()
     // Header title & count badge
     const float titleX = panelLeft + 16.0f * scale;
     const float titleY = panelTop + 13.0f * scale;
-    draw->AddText(font, 14.0f * scale, ImVec2(titleX + 1.0f * scale, titleY + 1.0f * scale),
-        IM_COL32(0, 0, 0, 160), "Recent Files");
+    // Text is drawn at the sizes the font atlas was baked at (14px UI font, 12px small font) and without
+    // the old 1px drop-shadow copy: scaled glyphs and doubled strokes are what made it look soft. The
+    // blurred card behind the text already provides the contrast the shadow was faking.
+    ImFont* smallFont = m_pRenderer->GetSmallFont() ? m_pRenderer->GetSmallFont() : font;
     draw->AddText(font, 14.0f * scale, ImVec2(titleX, titleY),
-        IM_COL32(245, 250, 255, 255), "Recent Files");
+        IM_COL32(245, 250, 255, 255), "Recent files");
 
+    // The file count sits right-aligned as plain muted text; the old pill badge and numbered row boxes
+    // carried no information.
     char count[24] = {};
-    sprintf_s(count, "%zu %s", recentMIDIs.size(), recentMIDIs.size() == 1 ? "MIDI" : "MIDIS");
-    const ImVec2 countSize = font->CalcTextSizeA(10.0f * scale, 10000.0f, 0.0f, count);
-    const float badgeW = countSize.x + 14.0f * scale;
-    const float badgeH = 18.0f * scale;
-    const float badgeX = panelRight - badgeW - 14.0f * scale;
-    const float badgeY = panelTop + 12.0f * scale;
-    draw->AddRectFilled(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH),
-        accentColor(0.45f, 45), 9.0f * scale);
-    draw->AddRect(ImVec2(badgeX, badgeY), ImVec2(badgeX + badgeW, badgeY + badgeH),
-        accentColor(0.90f, 100), 9.0f * scale, 0, 1.0f * scale);
-    draw->AddText(font, 10.0f * scale,
-        ImVec2(badgeX + 7.0f * scale, badgeY + 2.0f * scale),
-        IM_COL32(225, 240, 255, 235), count);
+    sprintf_s(count, "%zu %s", recentMIDIs.size(), recentMIDIs.size() == 1 ? "file" : "files");
+    const ImVec2 countSize = smallFont->CalcTextSizeA(12.0f * scale, 10000.0f, 0.0f, count);
+    draw->AddText(smallFont, 12.0f * scale,
+        ImVec2(panelRight - countSize.x - 16.0f * scale, panelTop + 14.0f * scale),
+        IM_COL32(165, 192, 215, 235), count);
 
     const float rowLeft = layout.rowLeft;
     const float rowRight = layout.rowRight;
     draw->PushClipRect(ImVec2(rowLeft, panelTop + headerH), ImVec2(rowRight, panelBottom), true);
     if (recentMIDIs.empty()) {
-        draw->AddText(font, 12.0f * scale, ImVec2(rowLeft + 10.0f * scale, layout.rowTop + 10.0f * scale),
-            IM_COL32(193, 215, 230, 210), "Open a MIDI file to build your recent list.");
+        draw->AddText(smallFont, 12.0f * scale, ImVec2(rowLeft + 10.0f * scale, layout.rowTop + 10.0f * scale),
+            IM_COL32(205, 225, 240, 235), "Open a MIDI file to build your recent list.");
     } else {
         const ImVec2 mouse = ImGui::GetIO().MousePos;
         for (size_t index = 0; index < layout.visibleRows; ++index) {
@@ -2127,27 +2139,11 @@ void SplashScreen::RenderOverlay()
 
             const SplashRecentMIDIInfo midiInfo = GetSplashRecentMIDIInfo(recentMIDIs[index]);
 
-            // Index box
-            char numBuf[8];
-            sprintf_s(numBuf, "%02zu", index + 1);
-            const float indexBoxW = 20.0f * scale;
-            const float indexBoxH = 20.0f * scale;
-            const float indexX = rowLeft + 8.0f * scale;
-            const float indexY = rowTop + (layout.rowH - 4.0f * scale - indexBoxH) * 0.5f;
-            draw->AddRectFilled(ImVec2(indexX, indexY), ImVec2(indexX + indexBoxW, indexY + indexBoxH),
-                hovered ? accentColor(0.70f, 65) : IM_COL32(255, 255, 255, 14), 4.0f * scale);
-            const ImVec2 numSize = font->CalcTextSizeA(9.5f * scale, 100.0f, 0.0f, numBuf);
-            draw->AddText(font, 9.5f * scale,
-                ImVec2(indexX + (indexBoxW - numSize.x) * 0.5f, indexY + (indexBoxH - numSize.y) * 0.5f),
-                hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(180, 205, 225, 200), numBuf);
-
             // Filename (Top line)
-            const float textLeft = rowLeft + 35.0f * scale;
+            const float textLeft = rowLeft + 14.0f * scale;
             const float nameY = rowTop + 4.0f * scale;
-            draw->AddText(font, 13.0f * scale, ImVec2(textLeft + 1.0f * scale, nameY + 1.0f * scale),
-                IM_COL32(0, 0, 0, 180), midiInfo.displayName.c_str());
-            draw->AddText(font, 13.0f * scale, ImVec2(textLeft, nameY),
-                hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(238, 246, 255, 245), midiInfo.displayName.c_str());
+            draw->AddText(font, 14.0f * scale, ImVec2(textLeft, nameY),
+                hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(242, 248, 255, 255), midiInfo.displayName.c_str());
 
             // Metadata info (Bottom line)
             std::string metaStr;
@@ -2163,19 +2159,19 @@ void SplashScreen::RenderOverlay()
                 metaStr += midiInfo.sizeStr;
             }
             const float metaY = rowTop + 23.0f * scale;
-            draw->AddText(font, 10.5f * scale, ImVec2(textLeft, metaY),
-                hovered ? accentColor(0.85f, 245) : IM_COL32(150, 180, 205, 210), metaStr.c_str());
+            draw->AddText(smallFont, 12.0f * scale, ImVec2(textLeft, metaY),
+                hovered ? accentColor(0.85f, 255) : IM_COL32(165, 192, 215, 235), metaStr.c_str());
 
             // Play pill on hover
             if (hovered) {
-                const float playBtnW = 46.0f * scale;
+                const float playBtnW = 50.0f * scale;
                 const float playBtnH = 22.0f * scale;
                 const float playBtnX = rowRight - playBtnW - 8.0f * scale;
                 const float playBtnY = rowTop + (layout.rowH - 4.0f * scale - playBtnH) * 0.5f;
                 draw->AddRectFilled(ImVec2(playBtnX, playBtnY), ImVec2(playBtnX + playBtnW, playBtnY + playBtnH),
                     accentColor(0.80f, 215), 11.0f * scale);
-                const ImVec2 playTextSize = font->CalcTextSizeA(10.0f * scale, 100.0f, 0.0f, "Play");
-                draw->AddText(font, 10.0f * scale,
+                const ImVec2 playTextSize = smallFont->CalcTextSizeA(12.0f * scale, 100.0f, 0.0f, "Play");
+                draw->AddText(smallFont, 12.0f * scale,
                     ImVec2(playBtnX + (playBtnW - playTextSize.x) * 0.5f, playBtnY + (playBtnH - playTextSize.y) * 0.5f),
                     IM_COL32(255, 255, 255, 255), "Play");
             }
@@ -2309,19 +2305,45 @@ float SplashScreen::GetNoteX(int iNote) {
 MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer *pRenderer ) :
     GameState( hWnd, pRenderer ), m_MIDI( sMIDIFile ), m_eGameMode( eGameMode )
 {
-    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio && !PGFAPacked::g_Cont.active)
     {
         PRE_DbgLog("MainScreen ctor: Stop");
         PRE_MIDIAudio->Stop();
         m_bAudioStarted = false;
     }
 
+    if ( m_MIDI.IsPackedPending() )
+    {
+        if ( PGFAPacked::g_Cont.active )
+        {
+            m_MIDI.SetPackedSong( PGFAPacked::g_Cont.song );
+            m_MIDI.LoadPackedWindow( PGFAPacked::g_Cont.startUs, PGFAPacked::g_Cont.maxNotes, PGFAPacked::g_Cont.minSpanUs );
+        }
+        else
+        {
+        // Packed mode: pack the whole file (a few hundred MB at most), then expand just a window of it
+        // into the normal row pool. Everything below (renderer, audio, ...) sees an ordinary song.
+        char aEnv[32] = {};
+        long long llStartUs = 0;
+        uint64_t iNotes = 12000000;
+        if ( GetEnvironmentVariableA( "PGFA_PACKED_START_SEC", aEnv, sizeof( aEnv ) ) > 0 ) llStartUs = (long long)( atof( aEnv ) * 1e6 );
+        if ( GetEnvironmentVariableA( "PGFA_PACKED_NOTES", aEnv, sizeof( aEnv ) ) > 0 ) iNotes = (uint64_t)_strtoui64( aEnv, nullptr, 10 );
+        m_MIDI.LoadPackedWindow( llStartUs, iNotes, 8000000 );
+        }
+    }
+
     if ( !m_MIDI.IsValid() ) return;
+
+    // The loading overlay only goes away on Stage::Done. Every exit from here on, including
+    // an exception, must reach it or the UI sits on the last stage forever.
+    struct LoadingDoneGuard { ~LoadingDoneGuard() { g_LoadingProgress.stage = MIDILoadingProgress::Stage::Done; } } loadingDoneGuard;
+
     try
     {
         m_MIDI.ConnectNotes(); // Order's important here
         // the memory peak and throws bad_alloc; PostProcess's push_back doubling
         m_MIDI.PostProcess(m_vEvents, &m_vProgramChange, &m_vMetaEvents, &m_vTempo, &m_vSignature, &m_vMarkers);
+        m_MIDI.ApplyPackedSongInfo();
         if (!m_vEvents.empty())
         {
             size_t aProbe[] = { 0, 1, 10, 100, 1000, 10000, 100000, 1000000, (size_t)m_vEvents.size() / 16,
@@ -2358,7 +2380,6 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
 
             // Precompute maximum Notes-Per-Second for the song
             m_llMaxNPS = 1;
-            deque<long long> npsWindow;
             const size_t imageBufferBlocks =
                 (m_vEvents.size() + ImageBufferHugeBlockEvents - 1) / ImageBufferHugeBlockEvents;
             const long long imageBufferMinEnd = (std::numeric_limits<long long>::min)();
@@ -2368,39 +2389,131 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
             m_vImageBufferPrefixEndTick.resize(imageBufferBlocks);
             m_llMaxNoteLen = 0;
             m_llMaxNoteLenTicks = 0;
-            for (size_t i = 0; i < m_vEvents.size(); i++)
+            // Single-threaded this was one of the slowest steps of loading a big file (random
+            // reads over the whole event list), so the events are split into ranges. Each
+            // range owns private results that are merged afterwards. The 1s NPS window is
+            // exact: a range first replays the notes within 1s before its start.
             {
-                const MIDIChannelEvent event = m_vEvents[i];
-                if (m_MIDI.GetEventChannelEventType(event) != MIDI::NoteOn ||
-                    m_MIDI.GetEventParam2(event) <= 0)
-                    continue;
+                struct ScanPart
+                {
+                    long long nps = 1, len = 0, lenTicks = 0;
+                    vector<long long> maxEndTime, maxEndTick;
+                    std::exception_ptr err;
+                };
+                const size_t eventCount = m_vEvents.size();
+                unsigned scanWorkers = std::thread::hardware_concurrency();
+                if (scanWorkers == 0) scanWorkers = 4;
+                scanWorkers = (std::min)(scanWorkers, 32u);
+                scanWorkers = (unsigned)(std::min<size_t>)(scanWorkers, eventCount / (1u << 20) + 1);
+                vector<ScanPart> parts(scanWorkers);
+                for (auto& part : parts)
+                {
+                    part.maxEndTime.assign(imageBufferBlocks, imageBufferMinEnd);
+                    part.maxEndTick.assign(imageBufferBlocks, imageBufferMinEnd);
+                }
 
-                const long long noteTime = m_MIDI.GetEventTime(event);
-                npsWindow.push_back(noteTime);
-                while (!npsWindow.empty() && noteTime - npsWindow.front() > 1000000)
-                    npsWindow.pop_front();
-                m_llMaxNPS = (std::max)(m_llMaxNPS, (long long)npsWindow.size());
+                auto scanRange = [&](unsigned w) {
+                    ScanPart& part = parts[w];
+                    try
+                    {
+                        const size_t begin = eventCount * w / scanWorkers;
+                        const size_t end = eventCount * (w + 1) / scanWorkers;
+                        if (begin >= end) return;
+                        size_t from = begin;
+                        if (begin > 0)
+                        {
+                            // first index whose time is within 1s of this range's first event
+                            const long long horizon = m_MIDI.GetEventTime(m_vEvents[begin]) - 1000000;
+                            size_t lo = 0, hi = begin;
+                            while (lo < hi)
+                            {
+                                const size_t mid = lo + (hi - lo) / 2;
+                                if (m_MIDI.GetEventTime(m_vEvents[mid]) < horizon) lo = mid + 1;
+                                else hi = mid;
+                            }
+                            from = lo;
+                        }
+                        vector<long long> npsWindow; // note-on times; live part is [head, size)
+                        vector<unsigned> npsWeight;  // notes each entry stands for (folded duplicates)
+                        long long npsSum = 0;        // total weight of the live part
+                        size_t head = 0;
+                        for (size_t i = from; i < end; i++)
+                        {
+                            const MIDIChannelEvent event = m_vEvents[i];
+                            if (m_MIDI.GetEventChannelEventType(event) != MIDI::NoteOn ||
+                                m_MIDI.GetEventParam2(event) <= 0)
+                                continue;
 
-                if (!m_MIDI.EventHasSister(event))
-                    continue;
-                const unsigned sisterIndex = m_MIDI.GetEventSisterIdx(event);
-                if (sisterIndex >= m_vEvents.size())
-                    continue;
-                const MIDIChannelEvent sister = m_vEvents[sisterIndex];
-                const long long lengthTime = (std::max)(0LL, (long long)m_MIDI.GetEventLength(event));
-                const long long startTick = m_MIDI.GetEventAbsT(event);
-                const long long lengthTick = (std::max)(0LL,
-                    (long long)m_MIDI.GetEventAbsT(sister) - startTick);
-                m_llMaxNoteLen = (std::max)(m_llMaxNoteLen, lengthTime);
-                m_llMaxNoteLenTicks = (std::max)(m_llMaxNoteLenTicks, lengthTick);
+                            const long long noteTime = m_MIDI.GetEventTime(event);
+                            const unsigned repeats = m_MIDI.GetEventRepeat(event);
+                            npsWindow.push_back(noteTime);
+                            npsWeight.push_back(repeats);
+                            npsSum += repeats;
+                            while (head < npsWindow.size() && noteTime - npsWindow[head] > 1000000)
+                                npsSum -= npsWeight[head++];
+                            if (head >= 65536 && head * 2 > npsWindow.size())
+                            {
+                                npsWindow.erase(npsWindow.begin(), npsWindow.begin() + head);
+                                npsWeight.erase(npsWeight.begin(), npsWeight.begin() + head);
+                                head = 0;
+                            }
+                            if (i < begin)
+                                continue; // warm-up only
+                            part.nps = (std::max)(part.nps, npsSum);
 
-                const size_t block = i / ImageBufferHugeBlockEvents;
-                const long long endTime = ImageBufferOverlapWorstEnd(noteTime, lengthTime);
-                const long long endTick = ImageBufferOverlapWorstEnd(startTick, lengthTick);
-                m_vImageBufferMaxEndTime[block] =
-                    (std::max)(m_vImageBufferMaxEndTime[block], endTime);
-                m_vImageBufferMaxEndTick[block] =
-                    (std::max)(m_vImageBufferMaxEndTick[block], endTick);
+                            if (!m_MIDI.EventHasSister(event))
+                                continue;
+                            const unsigned sisterIndex = m_MIDI.GetEventSisterIdx(event);
+                            if (sisterIndex >= eventCount)
+                                continue;
+                            const MIDIChannelEvent sister = m_vEvents[sisterIndex];
+                            const long long lengthTime = (std::max)(0LL, (long long)m_MIDI.GetEventLength(event));
+                            const long long startTick = m_MIDI.GetEventAbsT(event);
+                            const long long lengthTick = (std::max)(0LL,
+                                (long long)m_MIDI.GetEventAbsT(sister) - startTick);
+                            part.len = (std::max)(part.len, lengthTime);
+                            part.lenTicks = (std::max)(part.lenTicks, lengthTick);
+
+                            const size_t block = i / ImageBufferHugeBlockEvents;
+                            part.maxEndTime[block] = (std::max)(part.maxEndTime[block],
+                                ImageBufferOverlapWorstEnd(noteTime, lengthTime));
+                            part.maxEndTick[block] = (std::max)(part.maxEndTick[block],
+                                ImageBufferOverlapWorstEnd(startTick, lengthTick));
+                        }
+                    }
+                    catch (...)
+                    {
+                        part.err = std::current_exception();
+                    }
+                };
+
+                vector<std::thread> scanThreads;
+                try
+                {
+                    scanThreads.reserve(scanWorkers);
+                    for (unsigned w = 1; w < scanWorkers; w++)
+                        scanThreads.emplace_back(scanRange, w);
+                }
+                catch (...) {}
+                const unsigned spawned = (unsigned)scanThreads.size() + 1;
+                scanRange(0);
+                for (unsigned w = spawned; w < scanWorkers; w++) // threads that could not be created
+                    scanRange(w);
+                for (auto& th : scanThreads)
+                    th.join();
+
+                for (auto& part : parts)
+                {
+                    if (part.err) std::rethrow_exception(part.err);
+                    m_llMaxNPS = (std::max)(m_llMaxNPS, part.nps);
+                    m_llMaxNoteLen = (std::max)(m_llMaxNoteLen, part.len);
+                    m_llMaxNoteLenTicks = (std::max)(m_llMaxNoteLenTicks, part.lenTicks);
+                    for (size_t b = 0; b < imageBufferBlocks; b++)
+                    {
+                        m_vImageBufferMaxEndTime[b] = (std::max)(m_vImageBufferMaxEndTime[b], part.maxEndTime[b]);
+                        m_vImageBufferMaxEndTick[b] = (std::max)(m_vImageBufferMaxEndTick[b], part.maxEndTick[b]);
+                    }
+                }
             }
 
             long long prefixTime = imageBufferMinEnd;
@@ -2416,6 +2529,9 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
     catch (const std::exception& e)
     {
         PRE_DbgLog("MainScreen load failed: %s", e.what());
+        // A half-built song must not be handed to the game thread: dropping the tracks makes
+        // IsValid() false so PlayFile reports the failure instead of switching to it.
+        m_MIDI.clear();
         return;
     }
 
@@ -2443,6 +2559,7 @@ void MainScreen::Discard()
     PRE_DbgLog("Discard: freeing song data (events=%zu)", m_vEvents.size());
     m_MIDI.clear();
     m_MIDI.ReleaseOwnedData();
+    m_MIDI.ReleasePacked();
     vector<MIDIChannelEvent>().swap(m_vEvents);
     vector<MIDIMetaEvent*>().swap(m_vMetaEvents);
     eventvec_t().swap(m_vNoteOns);
@@ -2483,9 +2600,12 @@ void MainScreen::InitColors()
 
 void MainScreen::InitState()
 {
-    s_iPreRestarts = 0;
-    s_bPreFailed = false;
-    g_bGenDead = false;
+    if ( !PGFAPacked::g_Cont.active ) // a continuation is built while the previous window is still playing: leave shared state alone
+    {
+        s_iPreRestarts = 0;
+        s_bPreFailed = false;
+        g_bGenDead = false;
+    }
 
     static Config &config = Config::GetConfig();
     static const PlaybackSettings &cPlayback = config.GetPlaybackSettings();
@@ -2498,10 +2618,13 @@ void MainScreen::InitState()
     m_llStartTime = GetMinTime();
     m_llDisplayTime = m_llStartTime;
     m_fKeysTransition = 0.0f;
-    s_fTransitionPhase = 0.0f;
-    s_iTransitionScanPos = -1;
-    s_bTransitionOutOfRange = false;
-    s_LastTransitionFrame = std::chrono::steady_clock::now();
+    if ( !PGFAPacked::g_Cont.active )
+    {
+        s_fTransitionPhase = 0.0f;
+        s_iTransitionScanPos = -1;
+        s_bTransitionOutOfRange = false;
+        s_LastTransitionFrame = std::chrono::steady_clock::now();
+    }
     m_bTrackPos = m_bTrackZoom = false;
     m_fTempZoomX = 1.0f;
     m_fTempOffsetX = m_fTempOffsetY = 0.0f;
@@ -2589,7 +2712,7 @@ GameState::GameError MainScreen::Init()
     }
 
     for (auto& work : m_vThreadWork)
-        work.reserve(262144); // Should be plenty for most MIDIs
+        work.reserve(8192); // 262144 here committed ~268MB up front (8B x 262144 x 128 keys); grows on demand, and Logic() only clear()s so capacity sticks
 
     return Success;
 }
@@ -3072,6 +3195,8 @@ GameState::GameError MainScreen::Logic( void )
         llNextStartTime = m_llStartTime + static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
     else
         llNextStartTime = m_llStartTime + static_cast< long long >( min( llElapsed * m_dSpeed, 100000.0 ) + 0.5 );
+    if ( m_bPackedHold )
+        llNextStartTime = m_llStartTime; // outside the expanded window: wait for the next one
 
     if ( !m_bPaused && m_llStartTime < llMaxTime )
     {
@@ -3112,7 +3237,7 @@ GameState::GameError MainScreen::Logic( void )
         }
     }
     if ( !m_bPaused && m_llStartTime < llMaxTime
-         && bPreAudio )
+         && bPreAudio && !m_bPackedHold )
         m_llDisplayTime += static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
     else
         m_llDisplayTime = m_llStartTime;
@@ -3200,13 +3325,20 @@ GameState::GameError MainScreen::Logic( void )
                         m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptValue & 0x7F, iCorruptValue >> 7);
                 }
                 else if (bLiveAudio || s_bPreFailed)
-                    m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch, iCorruptValue);
+                {
+                    // a folded row stands for several identical notes: a note-off is sent once per note
+                    const unsigned iRepeats = m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOff ? m_MIDI.GetEventRepeat(pEvent) : 1u;
+                    for (unsigned r = 0; r < iRepeats; ++r)
+                        m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch, iCorruptValue);
+                }
             }
             else if (!m_bMute && (!m_bAnyChannelMuted || !m_vTrackSettings[m_MIDI.GetEventTrack(pEvent)].aChannels[m_MIDI.GetEventChannel(pEvent)].bMuted)) {
+                const unsigned iRepeats = m_MIDI.GetEventRepeat(pEvent); // identical notes folded into this row
                 if (bLiveAudio || s_bPreFailed)
-                    m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch,
-                        static_cast<int>(CorruptVelocity(fCorruptor, hCorrupt, m_MIDI.GetEventParam2(pEvent)) * dVolumeCorrect + 0.5));
-                notes_played++;
+                    for (unsigned r = 0; r < iRepeats; ++r)
+                        m_OutDevice.PlayEvent(m_MIDI.GetEventCode(pEvent), iCorruptPitch,
+                            static_cast<int>(CorruptVelocity(fCorruptor, hCorrupt, m_MIDI.GetEventParam2(pEvent)) * dVolumeCorrect + 0.5));
+                notes_played += iRepeats;
             }
             if ((m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn || m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOff)
                 && iCorruptPitch < 128 && m_MIDI.EventHasSister(pEvent))
@@ -3763,7 +3895,9 @@ GameState::GameError MainScreen::Render()
         DWORD ribbonColors[128] = {};
         for (int i = 0; i < 128; i++) {
             if (m_pNoteState[i] != -1) {
-                MIDIChannelEvent pEvent = (m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX);
+                // bounds-checked on both ends: a stale or corrupted index must not read outside m_vEvents
+                MIDIChannelEvent pEvent = (m_pNoteState[i] >= 0 && (size_t)m_pNoteState[i] < m_vEvents.size()
+                                           ? m_vEvents[m_pNoteState[i]] : UINT32_MAX);
                 if (pEvent != UINT32_MAX) {
                     const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
                     const int iChannel = m_MIDI.GetEventChannel(pEvent);
@@ -4447,6 +4581,19 @@ float MainScreen::GetNoteX(int iNote) {
 
 void MainScreen::RenderKeys()
 {
+    // Work from a sanitized copy of the per-key "last note on" indices. Anything outside the event list is
+    // treated as "key up": the old code only special-cased -1, so any other negative or stale index ended
+    // in m_vEvents[idx] / GetEventTrack(UINT32_MAX) reading far outside the arrays and crashing mid-playback.
+    int noteState[128];
+    {
+        const size_t iEventCount = m_vEvents.size();
+        for (int k = 0; k < 128; k++)
+        {
+            const int s = m_pNoteState[k];
+            noteState[k] = (s >= 0 && (size_t)s < iEventCount) ? s : -1;
+        }
+    }
+
     float fKeysY = m_fNotesY + m_fNotesCY;
     float fKeysCY = m_pRenderer->GetBufferHeight() - m_fNotesCY;
 
@@ -4515,12 +4662,12 @@ void MainScreen::RenderKeys()
         for ( int i = 0; i <= 127; i++ )
             if ( !MIDI::IsSharp( i ) )
             {
-                if ( m_pNoteState[i] != -1 )
+                if ( noteState[i] != -1 )
                 {
                     float fRibX = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - m_fViewStartX) * m_fWhiteCX;
                     if ( fRibX + m_fWhiteCX >= m_fNotesX && fRibX <= m_fNotesX + m_fNotesCX )
                     {
-                        MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                        MIDIChannelEvent pEvent = ( noteState[i] >= 0 ? m_vEvents[noteState[i]] : UINT32_MAX );
                         const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
                         const int iChannel = m_MIDI.GetEventChannel(pEvent);
                         const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
@@ -4531,7 +4678,7 @@ void MainScreen::RenderKeys()
         for ( int i = 0; i <= 127; i++ )
             if ( MIDI::IsSharp( i ) )
             {
-                if ( m_pNoteState[i] != -1 )
+                if ( noteState[i] != -1 )
                 {
                     float fNudgeX = 0.0;
                     MIDI::Note eNote = MIDI::NoteVal( i );
@@ -4541,7 +4688,7 @@ void MainScreen::RenderKeys()
                     const float x = m_fNotesX + ((float)MIDI::WhiteCount(0, i) - SharpRatio / 2.0f + fNudgeX - m_fViewStartX) * m_fWhiteCX;
                     if ( x + cx >= m_fNotesX && x <= m_fNotesX + m_fNotesCX )
                     {
-                        MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                        MIDIChannelEvent pEvent = ( noteState[i] >= 0 ? m_vEvents[noteState[i]] : UINT32_MAX );
                         const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
                         const int iChannel = m_MIDI.GetEventChannel(pEvent);
                         const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
@@ -4559,7 +4706,7 @@ void MainScreen::RenderKeys()
             if ( fCurX + m_fWhiteCX < m_fNotesX - 10.0f || fCurX > m_fNotesX + m_fNotesCX + 10.0f )
                 continue;
 
-            if ( m_pNoteState[i] == -1 )
+            if ( noteState[i] == -1 )
             {
                 DWORD kbPrimary = darken32(m_csKBWhite.iPrimaryRGB, kb);
                 DWORD kbDark = darken32(m_csKBWhite.iDarkRGB, kb);
@@ -4581,7 +4728,7 @@ void MainScreen::RenderKeys()
             }
             else
             {
-                MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                MIDIChannelEvent pEvent = ( noteState[i] >= 0 ? m_vEvents[noteState[i]] : UINT32_MAX );
                 const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
                 const int iChannel = m_MIDI.GetEventChannel(pEvent);
 
@@ -4620,7 +4767,7 @@ void MainScreen::RenderKeys()
             const float fSharpTopX1 = x + m_fWhiteCX * ( SharpRatio - fSharpTop ) / 2.0f;
             const float fSharpTopX2 = fSharpTopX1 + m_fWhiteCX * fSharpTop;
 
-            if ( m_pNoteState[i] == -1 )
+            if ( noteState[i] == -1 )
             {
                 DWORD ksPrimary = darken32(m_csKBSharp.iPrimaryRGB, kb);
                 DWORD ksDark = darken32(m_csKBSharp.iDarkRGB, kb);
@@ -4651,7 +4798,7 @@ void MainScreen::RenderKeys()
             }
             else
             {
-                MIDIChannelEvent pEvent = ( m_pNoteState[i] >= 0 ? m_vEvents[m_pNoteState[i]] : UINT32_MAX );
+                MIDIChannelEvent pEvent = ( noteState[i] >= 0 ? m_vEvents[noteState[i]] : UINT32_MAX );
                 const int iTrack = m_MIDI.GetEventTrack(pEvent) % MaxTrackColors;
                 const int iChannel = m_MIDI.GetEventChannel(pEvent);
 
@@ -5235,10 +5382,17 @@ void MainScreen::RenderMarker(const char* str) {
     size.x += 12 * scale;
     size.y += 6 * scale;
 
+    // Captions sit just above the keyboard, centered. At the top they covered the menu and toolbar.
+    const float margin = 8 * scale;
+    const float bufW = (float)m_pRenderer->GetBufferWidth();
+    ImVec2 pos((bufW - size.x) * 0.5f, m_fNotesCY - size.y - margin);
+    pos.x = (std::max)(0.0f, pos.x);
+    pos.y = (std::max)(0.0f, pos.y);
+
     auto draw_list = m_pRenderer->GetDrawList();
-    draw_list->AddRectFilled(ImVec2(0, 0), size, 0x80000000);
-    draw_list->AddText(ImVec2((6 + 2) * scale, (3 + 1) * scale), 0xFF404040, str);
-    draw_list->AddText(ImVec2(6 * scale, 3 * scale), 0xFFFFFFFF, str);
+    draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), 0x80000000, 4 * scale);
+    draw_list->AddText(ImVec2(pos.x + (6 + 2) * scale, pos.y + (3 + 1) * scale), 0xFF404040, str);
+    draw_list->AddText(ImVec2(pos.x + 6 * scale, pos.y + 3 * scale), 0xFFFFFFFF, str);
 }
 
 void MainScreen::RenderMessage(LPRECT prcMsg, TCHAR* sMsg)

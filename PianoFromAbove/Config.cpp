@@ -96,7 +96,8 @@ void Config::LoadConfigValues()
         return;
 
     m_VizSettings.LoadConfigValues(txRoot);
-    g_bLoggingEnabled.store(m_VizSettings.bEnableLogging, std::memory_order_relaxed);
+    m_VizSettings.bEnableLogging = true; /* PGFA_FORCE_LOGGING */
+    g_bLoggingEnabled.store(true, std::memory_order_relaxed);
 }
 
 void Config::LoadConfigValues( TiXmlElement *txRoot )
@@ -267,7 +268,7 @@ void VizSettings::LoadDefaultValues() {
     this->bRibbonCustomColor = false;
     this->dwRibbonBaseColor = 0xFFFFFFFF;
     this->bDumpFrames = false;
-    this->bEnableLogging = false;
+    this->bEnableLogging = true; // PGFA_FORCE_LOGGING
     this->iBarColor = 0x00FF0080;
     this->sBackground = L"";
     this->fBGBlur = 0.0f;
@@ -583,7 +584,7 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         dwRibbonBaseColor = (DWORD)iAttrVal;
     bDumpFrames = false;
     if (txViz->QueryIntAttribute("EnableLogging", &iAttrVal) == TIXML_SUCCESS)
-        bEnableLogging = (iAttrVal != 0);
+        bEnableLogging = true; // PGFA_FORCE_LOGGING (saved value ignored)
     if (txViz->QueryIntAttribute("ColorLoop", &iAttrVal) == TIXML_SUCCESS)
         bColorLoop = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("KDMAPI", &iAttrVal) == TIXML_SUCCESS)

@@ -89,12 +89,17 @@ HRESULT Renderer::RecoverDevice(HWND hWnd, bool bLimitFPS) {
     m_vChunkNotes.clear();
     m_vChunkBuilds.clear();
     m_vChunkQuads.clear();
-    ImGuiBackendShutdown();
-    ImGui_ImplWin32_Shutdown();
+    // A previous failed recovery already destroyed the context (Init never got far
+    // enough to create a new one): tearing down a null context crashes inside
+    // ImGui::Shutdown, so only do it when one exists.
+    if (ImGui::GetCurrentContext()) {
+        ImGuiBackendShutdown();
+        ImGui_ImplWin32_Shutdown();
     // Tear the ImGui context down too: Init() calls CreateContext(), and this
     // ImGui version keeps the previous context current when one already exists,
     // so skipping this would leave recovery running on a stale leaked context.
-    ImGui::DestroyContext();
+        ImGui::DestroyContext();
+    }
     ReleaseDeviceResources();
     m_bDeviceLost = false;
     g_bInRecovery = true;
@@ -137,7 +142,8 @@ bool Renderer::PresentPrelude() {
     HeartbeatLog("present:start");
     auto& runtimeViz = Config::GetConfig().GetVizSettings();
     g_bDisableBlur = runtimeViz.bDisableBlurs;
-    g_bLoggingEnabled.store(runtimeViz.bEnableLogging, std::memory_order_relaxed);
+    runtimeViz.bEnableLogging = true; /* PGFA_FORCE_LOGGING */
+    g_bLoggingEnabled.store(true, std::memory_order_relaxed);
     if (runtimeViz.bImageBufferNotes) {
         runtimeViz.bDualPianoRoll = false;
         m_bOverclockArtifacts = false;
@@ -1292,7 +1298,8 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
                         ImGui::Unindent();
                     }
-                    if (ImGui::Checkbox("Enable logging", &viz.bEnableLogging))
+                    ImGui::BeginDisabled(); ImGui::Checkbox("Enable logging (forced on)", &viz.bEnableLogging); ImGui::EndDisabled(); viz.bEnableLogging = true;
+                    if (false)
                         g_bLoggingEnabled.store(viz.bEnableLogging, std::memory_order_relaxed);
                     ImGui::Checkbox("Disable UI (Reenable by pressing CTRL + ALT)", &viz.bDisableUI);
                     ImGui::Separator();
@@ -2023,10 +2030,30 @@ void Renderer::UpdateImGuiSettings() {
         }
     }
 
+    // Small UI font (metadata, counts, hints), baked at its real size. Added after the title font so the
+    // existing font indices stay put.
+    ImFontConfig small_font_config = {};
+    small_font_config.OversampleH = 3;
+    small_font_config.OversampleV = 2;
+    if (!viz.sUIFont.empty()) {
+        io.Fonts->AddFontFromFileTTF(Util::WstringToString(viz.sUIFont), 12.0f * scale, &small_font_config, io.Fonts->GetGlyphRangesDefault());
+    } else {
+        small_font_config.FontNo = 0;
+        io.Fonts->AddFontFromFileTTF((std::string(fonts_dir) + "\\Tahoma.ttf").c_str(), 12.0f * scale, &small_font_config, io.Fonts->GetGlyphRangesDefault());
+        small_font_config.FontNo = 1;
+        small_font_config.MergeMode = true;
+        io.Fonts->AddFontFromFileTTF((std::string(fonts_dir) + "\\msgothic.ttc").c_str(), 12.0f * scale, &small_font_config, io.Fonts->GetGlyphRangesJapanese());
+    }
+    const int iSmallFontIndex = io.Fonts->Fonts.Size - 1;
+
     io.IniFilename = nullptr;
+    m_pFontSmall = nullptr;
     if (!io.Fonts->Build()) {
         io.Fonts->Clear();
         io.Fonts->AddFontDefault();
+    } else if (iSmallFontIndex >= 2 && io.Fonts->Fonts.Size > iSmallFontIndex) {
+        // Fonts[0] is the UI font, Fonts[1] the wordmark; the merged Japanese pass does not add a font entry.
+        m_pFontSmall = io.Fonts->Fonts[iSmallFontIndex];
     }
     ImGuiBackendCreateDeviceObjects();
 

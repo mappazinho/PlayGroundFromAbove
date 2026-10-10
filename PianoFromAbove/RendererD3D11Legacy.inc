@@ -468,7 +468,23 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
             .Flags = (UINT)(m_bAllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0),
         };
         ComPtr<IDXGISwapChain1> temp_swapchain;
-        res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+        // DXGI releases a destroyed swap chain's hold on the window asynchronously, so right after a device
+        // reset the window can still report E_ACCESSDENIED for a moment: retry that case briefly.
+        auto createSwapChain = [&]() {
+            HRESULT hr = S_OK;
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                temp_swapchain.Reset();
+                hr = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+                if (hr != E_ACCESSDENIED && hr != DXGI_ERROR_ACCESS_DENIED && !(hr == DXGI_ERROR_INVALID_CALL && attempt < 3))
+                    break;
+                char ebuf[64];
+                sprintf_s(ebuf, "swapchain(d3d11):accessdenied retry %d", attempt + 1);
+                HeartbeatLog(ebuf);
+                Sleep(100);
+            }
+            return hr;
+        };
+        res = createSwapChain();
         if (FAILED(res)) {
             char ebuf[96];
             sprintf_s(ebuf, "swapchain(d3d11):flipfailed hr=0x%08X - trying bitblt", (unsigned)res);
@@ -477,7 +493,7 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
             swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
             swap_chain_desc.Scaling = DXGI_SCALING_STRETCH;
             swap_chain_desc.Flags = 0;
-            res = m_pFactory->CreateSwapChainForHwnd(m_pDevice.Get(), hWnd, &swap_chain_desc, nullptr, nullptr, &temp_swapchain);
+            res = createSwapChain();
         }
         if (FAILED(res)) {
             char ebuf[96];
@@ -593,6 +609,7 @@ std::tuple<HRESULT, const char*> D3D11Renderer::CreateWindowDependentObjects(HWN
 }
 
 HRESULT D3D11Renderer::ResetDevice() {
+    if (m_bDeviceLost || !m_pDevice) { HeartbeatLog("reset(d3d11):skipped-no-device"); return DXGI_ERROR_DEVICE_REMOVED; }
     HeartbeatLog("reset(d3d11):start");
     DestroyBlurResources();
     HeartbeatLog("reset(d3d11):destroyblur");
@@ -628,6 +645,13 @@ void D3D11Renderer::ReleaseDeviceResources() {
 
     for (uint32_t i = 0; i < FrameCount; i++)
         m_pRTVs[i].Reset();
+    if (m_pSwapChain) {
+        // Leave any (implicit) fullscreen state first; a swap chain released while
+        // fullscreen can keep the window bound and break the next CreateSwapChainForHwnd.
+        BOOL fs = FALSE;
+        if (SUCCEEDED(m_pSwapChain->GetFullscreenState(&fs, nullptr)) && fs)
+            m_pSwapChain->SetFullscreenState(FALSE, nullptr);
+    }
     m_pSwapChain.Reset();
     m_pDepthBuffer.Reset();
     m_pDSV.Reset();

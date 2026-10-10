@@ -36,7 +36,8 @@ bool g_bSysResize = false;
 bool g_bInRenderResize = false;
 bool g_bSkipGPUWait = false;
 bool g_bDisableBlur = false;
-std::atomic<bool> g_bLoggingEnabled{ false };
+// Logging is forced on for this diagnostic release (see PGFA_FORCE_LOGGING).
+std::atomic<bool> g_bLoggingEnabled{ true };
 bool g_bDisableGates = false; // Keep the size-move/reset gates ON: presenting through window animations stalls the flip queue on NVIDIA (2s+ fence waits -> TDR)
 bool g_bInRecovery = false;
 bool g_bD3D12Available = true;
@@ -518,6 +519,9 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
             HandOffMsg( WM_COMMAND, ID_VIEW_RESETDEVICE, 0 );
             g_bInSizeMove = false;
             return 0;
+        case ID_APPLY_FULLSCREEN:
+            SetFullScreen( (BOOL)wParam );
+            return 0;
         case WM_DEVICECHANGE:
             Sleep( 200 );
             Config::GetConfig().LoadMIDIDevices();
@@ -651,6 +655,32 @@ VOID SetFullScreen( BOOL bFullScreen )
     static const ViewSettings &cView = Config::GetConfig().GetViewSettings();
     static RECT rcOld = {};
 
+    // Window-size changes while frames are in flight hang some GPUs (seen on RTX
+    // 4070: DXGI_ERROR_DEVICE_HUNG in the frame submitted during the switch).
+    // The menu calls this from the game thread, which cannot drain itself, so
+    // bounce the request to the UI thread; there, hold rendering and drain the
+    // GPU before the window changes size.
+    if ( GetCurrentThreadId() == g_dwGameThreadId )
+    {
+        PostMessage( g_hWnd, ID_APPLY_FULLSCREEN, bFullScreen, 0 );
+        return;
+    }
+    if ( !g_bInRenderResize )
+    {
+        g_bInSizeMove = true;
+        g_bSysResize = true;
+        HANDLE hDrain = CreateEvent( NULL, TRUE, FALSE, NULL );
+        if ( hDrain )
+        {
+            MSG m = {};
+            m.message = WM_COMMAND;
+            m.wParam = ID_PRELOAD_DRAIN;
+            m.lParam = (LPARAM)hDrain;
+            g_MsgQueue.Push( m );
+            WaitForSingleObject( hDrain, 1500 );
+            CloseHandle( hDrain );
+        }
+    }
     if ( bFullScreen )
     {
         RECT rcDesktop;
@@ -691,6 +721,29 @@ VOID SetPlayMode( INT ePlayMode )
 }
 VOID SetPlayPauseStop( BOOL, BOOL, BOOL ) {}
 
+// Waits for hEvent while still servicing messages other threads send to this thread's
+// windows (posted messages are left alone, so no re-entrant UI handling). Returns true if
+// the event was signaled, false on timeout/failure.
+static bool WaitServicingSentMessages( HANDLE hEvent, DWORD dwTimeoutMs )
+{
+    const ULONGLONG llStart = GetTickCount64();
+    for (;;)
+    {
+        DWORD dwWait = INFINITE;
+        if ( dwTimeoutMs != INFINITE )
+        {
+            ULONGLONG llElapsed = GetTickCount64() - llStart;
+            if ( llElapsed >= dwTimeoutMs ) return false;
+            dwWait = (DWORD)( dwTimeoutMs - llElapsed );
+        }
+        DWORD dwRet = MsgWaitForMultipleObjects( 1, &hEvent, FALSE, dwWait, QS_SENDMESSAGE );
+        if ( dwRet == WAIT_OBJECT_0 ) return true;
+        if ( dwRet == WAIT_TIMEOUT || dwRet == WAIT_FAILED ) return false;
+        MSG msg;
+        PeekMessage( &msg, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+    }
+}
+
 BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
 {
     Config &config = Config::GetConfig();
@@ -719,13 +772,45 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
             m.wParam = ID_PRELOAD_DISCARD;
             m.lParam = (LPARAM)hDiscardDone;
             g_MsgQueue.Push(m);
-            WaitForSingleObject(hDiscardDone, 30000);
-            CloseHandle(hDiscardDone);
-            PRE_DbgLog("PlayFile: old state discarded (bCustomSettings=%d)", (int)bCustomSettings);
+            const bool bDiscarded = WaitServicingSentMessages(hDiscardDone, 30000);
+            // On timeout the game thread may still SetEvent later; closing the handle now
+            // could signal an unrelated handle that reused the value, so leak it instead.
+            if (bDiscarded)
+                CloseHandle(hDiscardDone);
+            PRE_DbgLog("PlayFile: old state discard %s (bCustomSettings=%d)", bDiscarded ? "done" : "TIMED OUT", (int)bCustomSettings);
         }
     }
-    MainScreen* pGameState = new MainScreen(sFile, ePlayMode, NULL, NULL);
-    if (!pGameState->IsValid())
+
+    // Parse on a worker thread while this (UI) thread keeps answering cross-thread sent
+    // messages. The game thread renders the loading screen and presents to windows owned
+    // by this thread; DXGI/SetWindowText send messages to the owner thread, so blocking
+    // here for the whole parse could stall the game thread (and the load) until it ended.
+    MainScreen* pGameState = nullptr;
+    {
+        HANDLE hLoaded = CreateEvent(NULL, TRUE, FALSE, NULL);
+        auto fnLoad = [&]() {
+            try { pGameState = new MainScreen(sFile, ePlayMode, NULL, NULL); }
+            catch (const std::exception& e) { PRE_DbgLog("PlayFile: load threw: %s", e.what()); pGameState = nullptr; }
+            catch (...) { PRE_DbgLog("PlayFile: load threw unknown exception"); pGameState = nullptr; }
+            if (hLoaded) SetEvent(hLoaded);
+        };
+        std::thread loader;
+        bool bThreaded = false;
+        if (hLoaded)
+        {
+            try { loader = std::thread(fnLoad); bThreaded = true; }
+            catch (...) { bThreaded = false; }
+        }
+        if (bThreaded)
+        {
+            WaitServicingSentMessages(hLoaded, INFINITE);
+            loader.join();
+        }
+        else
+            fnLoad();
+        if (hLoaded) CloseHandle(hLoaded);
+    }
+    if (!pGameState || !pGameState->IsValid())
     {
         g_bShowLoading = false;
         MessageBox(g_hWnd, (L"Was not able to load " + sFile).c_str(), TEXT("Error"), MB_OK | MB_ICONEXCLAMATION);

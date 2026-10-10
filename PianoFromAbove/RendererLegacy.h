@@ -154,6 +154,10 @@ public:
     // --- Shared (API-agnostic) implementation ---------------------------------
     HRESULT ResetDeviceIfNeeded();
     HRESULT RecoverDevice(HWND hWnd, bool bLimitFPS);
+    // Frees the swap chain and every device object so a replacement renderer can
+    // bind the same window (an old swap chain keeps the HWND and makes the new
+    // CreateSwapChainForHwnd fail with DXGI_ERROR_INVALID_CALL).
+    void ReleaseForReplacement() { ReleaseDeviceResources(); m_bDeviceLost = true; }
     HRESULT Present(); // PresentPrelude (throttle/minimize) + PresentBackend()
     bool DeviceLost() const { return m_bDeviceLost; }
     int GetBufferWidth() const { return m_iBufferWidth; }
@@ -218,6 +222,9 @@ public:
         memcpy(m_stripRibbonColors, ribbonColors, sizeof(m_stripRibbonColors));
     }
     ImTextureID GetBlurTextureID() const { return m_BlurTextureID; }
+    // 12px UI font baked at its own size. Text drawn at a size the atlas doesn't contain is a bilinearly
+    // scaled copy of the 14px glyphs, which is what looked soft at small window sizes.
+    ImFont* GetSmallFont() const { return m_pFontSmall; }
     void SetRibbonArea(float x, float y, float cx, float cy) {
         m_fRibbonX = x; m_fRibbonY = y; m_fRibbonCX = cx; m_fRibbonCY = cy;
     }
@@ -340,6 +347,7 @@ protected:
     ImDrawList* m_pDrawList = nullptr;
     float m_fLastUIScale = 1.0f;
     std::wstring m_sLastFont;
+    ImFont* m_pFontSmall = nullptr;
     bool m_bShowToolbar = true;
     int m_resWidth = 0;
     int m_resHeight = 0;
@@ -400,6 +408,7 @@ protected:
     void ImGuiBackendCreateDeviceObjects() override;
 
 private:
+    void LogDeviceRemoved(const char* where);
     ComPtr<IDXGIFactory2> m_pFactory;
     ComPtr<IDXGIAdapter2> m_pAdapter;
     ComPtr<ID3D12Device> m_pDevice;
