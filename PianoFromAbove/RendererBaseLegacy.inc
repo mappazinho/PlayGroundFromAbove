@@ -142,8 +142,10 @@ bool Renderer::PresentPrelude() {
     HeartbeatLog("present:start");
     auto& runtimeViz = Config::GetConfig().GetVizSettings();
     g_bDisableBlur = runtimeViz.bDisableBlurs;
-    runtimeViz.bEnableLogging = true; /* PGFA_FORCE_LOGGING */
-    g_bLoggingEnabled.store(true, std::memory_order_relaxed);
+#ifdef PGFA_FORCE_LOGGING
+    runtimeViz.bEnableLogging = true;
+#endif
+    g_bLoggingEnabled.store(runtimeViz.bEnableLogging, std::memory_order_relaxed);
     if (runtimeViz.bImageBufferNotes) {
         runtimeViz.bDualPianoRoll = false;
         m_bOverclockArtifacts = false;
@@ -1298,9 +1300,12 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
                         ImGui::Unindent();
                     }
+#ifdef PGFA_FORCE_LOGGING
                     ImGui::BeginDisabled(); ImGui::Checkbox("Enable logging (forced on)", &viz.bEnableLogging); ImGui::EndDisabled(); viz.bEnableLogging = true;
-                    if (false)
+#else
+                    if (ImGui::Checkbox("Enable logging", &viz.bEnableLogging))
                         g_bLoggingEnabled.store(viz.bEnableLogging, std::memory_order_relaxed);
+#endif
                     ImGui::Checkbox("Disable UI (Reenable by pressing CTRL + ALT)", &viz.bDisableUI);
                     ImGui::Separator();
                     std::string splashStr = Util::WstringToString(viz.sSplashMIDI);

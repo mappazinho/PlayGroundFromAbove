@@ -36,8 +36,12 @@ bool g_bSysResize = false;
 bool g_bInRenderResize = false;
 bool g_bSkipGPUWait = false;
 bool g_bDisableBlur = false;
-// Logging is forced on for this diagnostic release (see PGFA_FORCE_LOGGING).
+// Build with /DPGFA_FORCE_LOGGING=1 for a diagnostic build that always logs (the setting is locked on).
+#ifdef PGFA_FORCE_LOGGING
 std::atomic<bool> g_bLoggingEnabled{ true };
+#else
+std::atomic<bool> g_bLoggingEnabled{ false };
+#endif
 bool g_bDisableGates = false; // Keep the size-move/reset gates ON: presenting through window animations stalls the flip queue on NVIDIA (2s+ fence waits -> TDR)
 bool g_bInRecovery = false;
 bool g_bD3D12Available = true;

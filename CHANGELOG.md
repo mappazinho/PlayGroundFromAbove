@@ -27,6 +27,7 @@ What's new since v0.9.0:
 * Fixed a crash when the GPU upload buffer could not be mapped while loading a very large MIDI
 * Fixed stale blur and bloom texture states after a resize or fullscreen switch
 * Device-removed reasons and the GPU operation that hung are now written to the log
+* New build option `PGFA_FORCE_LOGGING` makes a diagnostic build that always logs; the normal builds keep the "Enable logging" checkbox and leave it off by default
 
 **UI**
 * Redesigned start screen recent-files card with a blurred background
@@ -40,5 +41,4 @@ What's new since v0.9.0:
 Known issues:
 * Packed mode: the picture freezes for about 0.3 - 0.4 s each time the window moves to the next section, and the audio probably has a short gap there
 * Packed mode: markers, lyrics, track names and controller state from before a window are not carried over, and some statistics (notes played, etc.) restart per window
-* Logging is forced on in these builds (the heartbeat log is written to your temp folder) to help track down crashes
 * Visual buffer mode in DirectX11 corrupts each visual chunk
