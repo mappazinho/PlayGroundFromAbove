@@ -7,7 +7,8 @@ If you experience a crash or bug, and know how to replicate it then follow these
    * **pfa_heartbeat** - located in %temp%
    * **pfa_msgs** - located in %temp%
    * **pfa_prerender** - located in %temp%
-   * **crash_log** - located in root folder where PGFA lives
+   * **crash_log** - located in root folder where PGFA lives      
+*If you are unable to launch PGFA due to a startup crash, then you only need to include **startup_log**, which also exists in the root folder of PGFA.*
 
 # PlayGroundFromAbove
 *Absolutely diabolical.*
