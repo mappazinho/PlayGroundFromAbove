@@ -22,6 +22,7 @@
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
+#include <malloc.h>
 #include <vector>
 
 #include "MainProcs.h"
@@ -122,6 +123,7 @@ static HICON LoadApplicationIconFromPNG(HINSTANCE hInstance)
 }
 
 void HeartbeatLog(const char* tag) {
+    StartupLogMirror(tag);
     if (!g_bLoggingEnabled.load(std::memory_order_relaxed))
         return;
     static bool bInit = false;
@@ -160,181 +162,359 @@ static const wchar_t* ExceptionCodeString(DWORD code) {
     case EXCEPTION_INT_OVERFLOW:             return L"INT_OVERFLOW";
     case EXCEPTION_PRIV_INSTRUCTION:         return L"PRIV_INSTRUCTION";
     case EXCEPTION_STACK_OVERFLOW:           return L"STACK_OVERFLOW";
-    default:                                 return L"UNKNOWN";
+    case EXCEPTION_BREAKPOINT:               return L"BREAKPOINT";
+    default:                                return L"UNKNOWN";
     }
 }
 
-static int WriteCrashLog(EXCEPTION_POINTERS* ep) {
+static const wchar_t kIssuesUrl[] = L"https://github.com/mappazinho/PlayGroundFromAbove/issues";
+
+// ntdll keeps a ring buffer of the last 64 unloaded DLLs. A crash at an address that no loaded
+// module covers is usually a call into (or a vtable read from) one of these.
+struct PGFAUnloadEvent {
+    PVOID BaseAddress;
+    SIZE_T SizeOfImage;
+    ULONG Sequence;
+    ULONG TimeDateStamp;
+    ULONG CheckSum;
+    WCHAR ImageName[32];
+    ULONG Version[2];
+};
+typedef VOID(NTAPI* RtlGetUnloadEventTraceEx_t)(PULONG* ElementSize, PULONG* ElementCount, PVOID* EventTrace);
+
+static RtlGetUnloadEventTraceEx_t s_pGetUnloadTrace = (RtlGetUnloadEventTraceEx_t)
+    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetUnloadEventTraceEx");
+
+static const PGFAUnloadEvent* UnloadEventAt(ULONG index, ULONG* pCount) {
+    *pCount = 0;
+    if (!s_pGetUnloadTrace)
+        return nullptr;
+    __try {
+        PULONG pSize = nullptr, pNum = nullptr;
+        PVOID* pTrace = nullptr;
+        s_pGetUnloadTrace(&pSize, &pNum, (PVOID*)&pTrace);
+        if (!pSize || !pNum || !pTrace || !*pTrace || *pSize < sizeof(PGFAUnloadEvent))
+            return nullptr;
+        *pCount = *pNum;
+        if (index >= *pNum)
+            return nullptr;
+        const PGFAUnloadEvent* ev = (const PGFAUnloadEvent*)((const BYTE*)*pTrace + (SIZE_T)index * *pSize);
+        return ev->BaseAddress ? ev : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *pCount = 0;
+        return nullptr;
+    }
+}
+
+// "Module+0xOff", "UNLOADED Module+0xOff", or "" when the address is in no image.
+static void DescribeAddress(DWORD64 addr, wchar_t* out, size_t cch) {
+    out[0] = L'\0';
+    if (addr < 0x10000)
+        return;
+    HMODULE hMod = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &hMod)) {
+        wchar_t path[MAX_PATH] = L"";
+        GetModuleFileNameW(hMod, path, MAX_PATH);
+        const wchar_t* name = wcsrchr(path, L'\\');
+        _snwprintf_s(out, cch, _TRUNCATE, L"%s+0x%llX", name ? name + 1 : path,
+                     addr - (DWORD64)(DWORD_PTR)hMod);
+        return;
+    }
+    ULONG count = 0;
+    UnloadEventAt(0, &count);
+    for (ULONG i = 0; i < count; i++) {
+        const PGFAUnloadEvent* ev = UnloadEventAt(i, &count);
+        if (!ev)
+            continue;
+        const DWORD64 base = (DWORD64)(DWORD_PTR)ev->BaseAddress;
+        if (addr >= base && addr < base + ev->SizeOfImage) {
+            wchar_t name[33] = L"";
+            wmemcpy(name, ev->ImageName, 32);
+            _snwprintf_s(out, cch, _TRUNCATE, L"UNLOADED %s+0x%llX", name, addr - base);
+            return;
+        }
+    }
+}
+
+// Walks the faulting thread from its exception context with the x64 unwind tables. StackWalk64
+// without a function-table callback cannot unwind x64 frames and printed raw stack data instead.
+static int UnwindFromContext(const CONTEXT* start, DWORD64* frames, int maxFrames) {
+    CONTEXT c = *start;
+    ULONG_PTR stackLow = 0, stackHigh = 0;
+    GetCurrentThreadStackLimits(&stackLow, &stackHigh);
+    int n = 0;
+    __try {
+        while (n < maxFrames && c.Rip) {
+            frames[n++] = c.Rip;
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &imageBase, NULL);
+            if (fn) {
+                PVOID handlerData = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c, &handlerData, &establisher, NULL);
+            } else {
+                // Leaf function, or code with no unwind info (e.g. an unloaded module): the return
+                // address is on top of the stack.
+                if (c.Rsp < stackLow || c.Rsp + 8 > stackHigh)
+                    break;
+                c.Rip = *(DWORD64*)c.Rsp;
+                c.Rsp += 8;
+            }
+            if (c.Rsp < stackLow || c.Rsp >= stackHigh)
+                break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+// crash_log.txt next to the exe, or in %TEMP% when the exe folder is not writable.
+static bool OpenCrashLogFile(FILE** pf, wchar_t* path, size_t cch) {
+    *pf = nullptr;
+    if (GetModuleFileNameW(NULL, path, (DWORD)cch)) {
+        if (wchar_t* slash = wcsrchr(path, L'\\')) {
+            wcscpy_s(slash + 1, cch - (slash + 1 - path), L"crash_log.txt");
+            if (_wfopen_s(pf, path, L"wb, ccs=UTF-16LE") == 0 && *pf)
+                return true;
+        }
+    }
+    if (GetTempPathW((DWORD)cch, path)) {
+        wcscat_s(path, cch, L"PGFA_crash_log.txt");
+        if (_wfopen_s(pf, path, L"wb, ccs=UTF-16LE") == 0 && *pf)
+            return true;
+    }
+    path[0] = L'\0';
+    return false;
+}
+
+#define CRASH_APPEND(buf, len, ...) \
+    do { if ((len) < _countof(buf)) { int _n = _snwprintf_s((buf) + (len), _countof(buf) - (len), _TRUNCATE, __VA_ARGS__); \
+         (len) = _n < 0 ? _countof(buf) - 1 : (len) + (size_t)_n; } } while (0)
+
+// What "Try to continue" can do on the crashing thread.
+enum class CrashContinue {
+    None,        // UI thread, or no safe way out: Quit only
+    GameThread,  // Unwind to GameThread's __except and restart it on the start screen
+    OtherThread, // End only the crashing thread
+};
+
+static HRESULT CALLBACK CrashDialogCallback(HWND hwnd, UINT msg, WPARAM, LPARAM lParam, LONG_PTR) {
+    if (msg == TDN_CREATED) {
+        // Task dialogs have no topmost flag; without this a fullscreen window can hide it.
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(hwnd);
+    } else if (msg == TDN_HYPERLINK_CLICKED) {
+        ShellExecuteW(hwnd, L"open", (LPCWSTR)lParam, NULL, NULL, SW_SHOWNORMAL);
+    }
+    return S_OK;
+}
+
+// Shows the crash summary with a "Quit" button and, when bCanContinue, a "Try to continue" button.
+// brief holds the summary with the issues link to be inserted at headLen. Returns true to continue.
+static bool ShowCrashDialog(const wchar_t* brief, size_t headLen, bool bCanContinue, wchar_t* content, size_t cch) {
+    typedef HRESULT(WINAPI* TaskDialogIndirect_t)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+    HMODULE hComctl = GetModuleHandleW(L"comctl32.dll");
+    if (!hComctl)
+        hComctl = LoadLibraryW(L"comctl32.dll");
+    // Only comctl32 v6 (the exe's manifest asks for it) exports TaskDialogIndirect.
+    auto pTaskDialogIndirect = hComctl ? (TaskDialogIndirect_t)GetProcAddress(hComctl, "TaskDialogIndirect") : nullptr;
+
+    enum { kQuit = 100, kContinue = 101 };
+    if (pTaskDialogIndirect) {
+        _snwprintf_s(content, cch, _TRUNCATE, L"%.*s<a href=\"%s\">%s</a>%s",
+                     (int)headLen, brief, kIssuesUrl, kIssuesUrl, brief + headLen);
+        const TASKDIALOG_BUTTON buttons[] = { { kQuit, L"Quit" }, { kContinue, L"Try to continue" } };
+        TASKDIALOGCONFIG cfg = {};
+        cfg.cbSize = sizeof(cfg);
+        cfg.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_ALLOW_DIALOG_CANCELLATION;
+        cfg.pszWindowTitle = L"PlayGroundFromAbove - Crash";
+        cfg.pszMainIcon = TD_ERROR_ICON;
+        cfg.pszMainInstruction = L"PlayGroundFromAbove has crashed.";
+        cfg.pszContent = content;
+        cfg.cButtons = bCanContinue ? 2 : 1;
+        cfg.pButtons = buttons;
+        cfg.nDefaultButton = kQuit;
+        cfg.pfCallback = CrashDialogCallback;
+        int button = 0;
+        if (SUCCEEDED(pTaskDialogIndirect(&cfg, &button, NULL, NULL)))
+            return bCanContinue && button == kContinue; // Closing the dialog (IDCANCEL) quits
+    }
+
+    _snwprintf_s(content, cch, _TRUNCATE, L"PlayGroundFromAbove has crashed.\n\n%.*s%s%s%s",
+                 (int)headLen, brief, kIssuesUrl, brief + headLen,
+                 bCanContinue ? L"\n\nQuit PlayGroundFromAbove? (No = Try to continue)" : L"");
+    const int result = MessageBoxW(NULL, content, L"PlayGroundFromAbove - Crash",
+        MB_ICONERROR | (bCanContinue ? MB_YESNO : MB_OK) | MB_TOPMOST | MB_SETFOREGROUND);
+    return bCanContinue && result == IDNO;
+}
+
+// The full report (registers, both stacks, unloaded and loaded modules) goes to crash_log.txt; the
+// dialog only shows the summary, the top frames, where the files are and where to report.
+// Returns true when the user chose "Try to continue" (only offered when mode allows it).
+static bool WriteCrashLog(EXCEPTION_POINTERS* ep, CrashContinue mode) {
+    // One report at a time; a second thread crashing meanwhile waits for the first to finish.
+    static volatile LONG s_bBusy = 0;
+    if (InterlockedExchange(&s_bBusy, 1)) {
+        Sleep(INFINITE);
+        return false;
+    }
+    // Static so a stack overflow crash still has room to format the report.
+    static wchar_t full[65536];
+    static wchar_t brief[4096];
+    size_t fl = 0, bl = 0;
+    full[0] = brief[0] = L'\0';
+
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     CONTEXT* ctx = ep->ContextRecord;
+    wchar_t where[160], tmp[160];
+    DescribeAddress(ctx->Rip, where, _countof(where));
+    if (!where[0])
+        wcscpy_s(where, L"<unknown module>");
+    const bool bGameThread = GetCurrentThreadId() == g_dwGameThreadId;
 
-    wchar_t modulePath[MAX_PATH] = L"<unknown>";
-    HMODULE hMod = NULL;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)ctx->Rip, &hMod)) {
-        GetModuleFileNameW(hMod, modulePath, MAX_PATH);
-        wchar_t* slash = wcsrchr(modulePath, L'\\');
-        if (slash) wmemmove(modulePath, slash + 1, wcslen(slash + 1) + 1);
+    CRASH_APPEND(full, fl, L"PlayGroundFromAbove crash report\n\n");
+    CRASH_APPEND(full, fl, L"Exception:  0x%08X (%s)\nAddress:    0x%016llX  %s\nThread:     %lu (%s)\n",
+                 er->ExceptionCode, ExceptionCodeString(er->ExceptionCode), (unsigned long long)ctx->Rip,
+                 where, GetCurrentThreadId(), bGameThread ? L"game thread" : L"not the game thread");
+    CRASH_APPEND(brief, bl, L"%s (0x%08X) in %s\nThread %lu (%s)\n",
+                 ExceptionCodeString(er->ExceptionCode), er->ExceptionCode, where, GetCurrentThreadId(),
+                 bGameThread ? L"game thread" : L"not the game thread");
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        er->NumberParameters >= 2) {
+        const ULONG_PTR op = er->ExceptionInformation[0];
+        const wchar_t* opName = op == 0 ? L"read of" : op == 1 ? L"write to" : op == 8 ? L"execute at" : L"access to";
+        DescribeAddress(er->ExceptionInformation[1], tmp, _countof(tmp));
+        CRASH_APPEND(full, fl, L"Fault:      %s 0x%016llX%s%s\n", opName,
+                     (unsigned long long)er->ExceptionInformation[1], tmp[0] ? L"  " : L"", tmp);
+        CRASH_APPEND(brief, bl, L"Bad %s 0x%llX%s%s\n", opName,
+                     (unsigned long long)er->ExceptionInformation[1], tmp[0] ? L"  " : L"", tmp);
     }
-    const unsigned long long llModBase = hMod ? (unsigned long long)(DWORD_PTR)hMod : 0;
-    const unsigned long long llFaultOffset = ctx->Rip - (DWORD64)hMod;
 
-    typedef USHORT(WINAPI* RtlCaptureStackBackTrace_t)(ULONG, ULONG, PVOID*, PULONG);
-    static RtlCaptureStackBackTrace_t pCaptureStackBackTrace = (RtlCaptureStackBackTrace_t)
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlCaptureStackBackTrace");
-    PVOID pFrames[64] = {};
-    USHORT nFrames = pCaptureStackBackTrace ? pCaptureStackBackTrace(0, 64, pFrames, NULL) : 0;
-    wchar_t stackBuf[8192] = L"";
-    size_t stackLen = 0;
-    for (USHORT i = 0; i < nFrames && stackLen < _countof(stackBuf) - 128; i++) {
-        HMODULE hFrameMod = NULL;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCWSTR)pFrames[i], &hFrameMod)) {
-            wchar_t frameMod[MAX_PATH] = L"";
-            GetModuleFileNameW(hFrameMod, frameMod, MAX_PATH);
-            wchar_t* fs = wcsrchr(frameMod, L'\\');
-            if (fs) wmemmove(frameMod, fs + 1, wcslen(fs + 1) + 1);
-            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
-                L"  0x%016llX  %s+0x%llX\n",
-                (unsigned long long)(DWORD_PTR)pFrames[i], frameMod,
-                (unsigned long long)(DWORD_PTR)pFrames[i] - (unsigned long long)(DWORD_PTR)hFrameMod);
-        } else {
-            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
-                L"  0x%016llX  <unknown module>\n", (unsigned long long)(DWORD_PTR)pFrames[i]);
+    CRASH_APPEND(full, fl, L"\nRegisters:\n");
+    const struct { const wchar_t* name; DWORD64 value; } regs[] = {
+        { L"RAX", ctx->Rax }, { L"RBX", ctx->Rbx }, { L"RCX", ctx->Rcx }, { L"RDX", ctx->Rdx },
+        { L"RSI", ctx->Rsi }, { L"RDI", ctx->Rdi }, { L"RBP", ctx->Rbp }, { L"RSP", ctx->Rsp },
+        { L"R8 ", ctx->R8 },  { L"R9 ", ctx->R9 },  { L"R10", ctx->R10 }, { L"R11", ctx->R11 },
+        { L"R12", ctx->R12 }, { L"R13", ctx->R13 }, { L"R14", ctx->R14 }, { L"R15", ctx->R15 },
+        { L"RIP", ctx->Rip },
+    };
+    for (const auto& r : regs) {
+        DescribeAddress(r.value, tmp, _countof(tmp));
+        CRASH_APPEND(full, fl, L"  %s=%016llX  %s\n", r.name, (unsigned long long)r.value, tmp);
+    }
+    CRASH_APPEND(full, fl, L"  EFLAGS=%08X\n", ctx->EFlags);
+
+    DWORD64 frames[48];
+    const int nFrames = UnwindFromContext(ctx, frames, _countof(frames));
+    CRASH_APPEND(full, fl, L"\nCrashing thread stack:\n");
+    CRASH_APPEND(brief, bl, L"\nCrashing thread stack:\n");
+    for (int i = 0; i < nFrames; i++) {
+        DescribeAddress(frames[i], tmp, _countof(tmp));
+        CRASH_APPEND(full, fl, L"  0x%016llX  %s\n", (unsigned long long)frames[i], tmp[0] ? tmp : L"<unknown module>");
+        if (i < 8)
+            CRASH_APPEND(brief, bl, L"  %s\n", tmp[0] ? tmp : L"<unknown module>");
+    }
+    if (nFrames > 8)
+        CRASH_APPEND(brief, bl, L"  ... %d more in the log\n", nFrames - 8);
+
+    {
+        PVOID handlerFrames[64] = {};
+        const USHORT n = RtlCaptureStackBackTrace(0, 64, handlerFrames, NULL);
+        CRASH_APPEND(full, fl, L"\nHandler stack (includes the exception dispatch):\n");
+        for (USHORT i = 0; i < n; i++) {
+            DescribeAddress((DWORD64)(DWORD_PTR)handlerFrames[i], tmp, _countof(tmp));
+            CRASH_APPEND(full, fl, L"  0x%016llX  %s\n", (unsigned long long)(DWORD_PTR)handlerFrames[i],
+                         tmp[0] ? tmp : L"<unknown module>");
         }
     }
 
     {
-        wchar_t ctxStack[8192] = L"";
-        size_t ctxLen = 0;
-        CONTEXT walkCtx = *ctx;
-        STACKFRAME64 sf = {};
-        sf.AddrPC.Offset = walkCtx.Rip;
-        sf.AddrPC.Mode = AddrModeFlat;
-        sf.AddrStack.Offset = walkCtx.Rsp;
-        sf.AddrStack.Mode = AddrModeFlat;
-        sf.AddrFrame.Offset = walkCtx.Rbp;
-        sf.AddrFrame.Mode = AddrModeFlat;
-        for (int i = 0; i < 40 && ctxLen < _countof(ctxStack) - 128; i++)
-        {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), GetCurrentThread(),
-                             &sf, &walkCtx, NULL, NULL, NULL, NULL))
-                break;
-            if (sf.AddrPC.Offset == 0) break;
-            HMODULE hFrameMod = NULL;
-            wchar_t fname[MAX_PATH] = L"";
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCWSTR)sf.AddrPC.Offset, &hFrameMod))
-            {
-                wchar_t fp[MAX_PATH] = L"";
-                GetModuleFileNameW(hFrameMod, fp, MAX_PATH);
-                wchar_t* fs = wcsrchr(fp, L'\\');
-                if (fs) wmemmove(fname, fs + 1, wcslen(fs + 1) + 1);
-                ctxLen += _snwprintf_s(ctxStack + ctxLen, _countof(ctxStack) - ctxLen, _TRUNCATE,
-                    L"  0x%016llX  %s+0x%llX\n",
-                    (unsigned long long)sf.AddrPC.Offset, fname,
-                    (unsigned long long)sf.AddrPC.Offset - (unsigned long long)(DWORD_PTR)hFrameMod);
-            }
-            else
-            {
-                ctxLen += _snwprintf_s(ctxStack + ctxLen, _countof(ctxStack) - ctxLen, _TRUNCATE,
-                    L"  0x%016llX  <unknown module>\n", (unsigned long long)sf.AddrPC.Offset);
-            }
+        ULONG count = 0;
+        UnloadEventAt(0, &count);
+        CRASH_APPEND(full, fl, L"\nRecently unloaded modules:\n");
+        bool any = false;
+        for (ULONG i = 0; i < count; i++) {
+            const PGFAUnloadEvent* ev = UnloadEventAt(i, &count);
+            if (!ev)
+                continue;
+            wchar_t name[33] = L"";
+            wmemcpy(name, ev->ImageName, 32);
+            CRASH_APPEND(full, fl, L"  0x%016llX-0x%016llX  %s (seq %lu)\n",
+                         (unsigned long long)(DWORD_PTR)ev->BaseAddress,
+                         (unsigned long long)(DWORD_PTR)ev->BaseAddress + ev->SizeOfImage, name, ev->Sequence);
+            any = true;
         }
-        if (ctxLen > 0)
-        {
-            stackLen += _snwprintf_s(stackBuf + stackLen, _countof(stackBuf) - stackLen, _TRUNCATE,
-                L"\nFaulting thread stack (from context):\n%ls", ctxStack);
-        }
+        if (!any)
+            CRASH_APPEND(full, fl, L"  (none)\n");
     }
 
-    wchar_t msg[65536];
-    _snwprintf_s(msg, _countof(msg), _TRUNCATE,
-        L"PlayGroundFromAbove has crashed.\n\n"
-        L"Exception:  0x%08X  (%s)\n"
-        L"Address:    0x%016llX\n"
-        L"Module:     %s\n"
-        L"Module Base: 0x%016llX\n"
-        L"Fault Offset: 0x%08llX\n"
-        L"Thread:     %lu\n\n"
-        L"Registers:\n"
-        L"  RAX=%016llX  RBX=%016llX\n"
-        L"  RCX=%016llX  RDX=%016llX\n"
-        L"  RSI=%016llX  RDI=%016llX\n"
-        L"  RSP=%016llX  RBP=%016llX\n"
-        L"  RIP=%016llX  EFLAGS=%08X\n\n"
-        L"Call stack:\n"
-        L"%s"
-        L"\nLoaded modules:\n",
-        er->ExceptionCode,
-        ExceptionCodeString(er->ExceptionCode),
-        (unsigned long long)ctx->Rip,
-        modulePath,
-        llModBase,
-        llFaultOffset,
-        GetCurrentThreadId(),
-        (unsigned long long)ctx->Rax,
-        (unsigned long long)ctx->Rbx,
-        (unsigned long long)ctx->Rcx,
-        (unsigned long long)ctx->Rdx,
-        (unsigned long long)ctx->Rsi,
-        (unsigned long long)ctx->Rdi,
-        (unsigned long long)ctx->Rsp,
-        (unsigned long long)ctx->Rbp,
-        (unsigned long long)ctx->Rip,
-        ctx->EFlags,
-        stackBuf);
-
     {
-        size_t len = wcslen(msg);
         MEMORY_BASIC_INFORMATION mbi = {};
         if (VirtualQuery((LPCVOID)ctx->Rip, &mbi, sizeof(mbi)))
-        {
-            len += _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE,
-                L"\nRIP region: Base=0x%016llX Size=0x%llX State=0x%X Protect=0x%X Type=0x%X\n",
-                (unsigned long long)(DWORD_PTR)mbi.BaseAddress,
-                (unsigned long long)mbi.RegionSize, (unsigned)mbi.State,
-                (unsigned)mbi.Protect, (unsigned)mbi.Type);
-        }
-        HMODULE hMods[256];
+            CRASH_APPEND(full, fl, L"\nRIP region: Base=0x%016llX Size=0x%llX State=0x%X Protect=0x%X Type=0x%X\n",
+                         (unsigned long long)(DWORD_PTR)mbi.BaseAddress, (unsigned long long)mbi.RegionSize,
+                         (unsigned)mbi.State, (unsigned)mbi.Protect, (unsigned)mbi.Type);
+        static HMODULE hMods[512];
         DWORD cbNeeded = 0;
-        if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded))
-        {
+        CRASH_APPEND(full, fl, L"\nLoaded modules:\n");
+        if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
             DWORD n = cbNeeded / sizeof(HMODULE);
-            if (n > 256) n = 256;
-            for (DWORD i = 0; i < n && len < _countof(msg) - 600; i++)
-            {
+            if (n > _countof(hMods)) n = _countof(hMods);
+            for (DWORD i = 0; i < n; i++) {
                 wchar_t mpath[MAX_PATH] = L"";
                 GetModuleFileNameW(hMods[i], mpath, MAX_PATH);
-                len += _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE,
-                    L"  0x%016llX  %ls\n", (unsigned long long)(DWORD_PTR)hMods[i], mpath);
+                MODULEINFO mi = {};
+                GetModuleInformation(GetCurrentProcess(), hMods[i], &mi, sizeof(mi));
+                CRASH_APPEND(full, fl, L"  0x%016llX-0x%016llX  %ls\n", (unsigned long long)(DWORD_PTR)hMods[i],
+                             (unsigned long long)(DWORD_PTR)hMods[i] + mi.SizeOfImage, mpath);
             }
         }
-        _snwprintf_s(msg + len, _countof(msg) - len, _TRUNCATE, L"\nAbort = Quit, Ignore = Try to continue.");
     }
 
-    wchar_t logPath[MAX_PATH];
-    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
-        wchar_t* slash = wcsrchr(logPath, L'\\');
-        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
-        FILE* f = NULL;
-        if (_wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE") == 0 && f) {
-            fwprintf(f, L"%s\n", msg);
-            fclose(f);
-        }
+    const bool bLogging = g_bLoggingEnabled.load(std::memory_order_relaxed);
+    CRASH_APPEND(full, fl, L"\nLogging enabled: %s\nStartup log: %s\n", bLogging ? L"yes" : L"no",
+                 StartupLog_Path()[0] ? StartupLog_Path() : L"(not created)");
+
+    wchar_t logPath[MAX_PATH] = L"";
+    FILE* f = nullptr;
+    if (OpenCrashLogFile(&f, logPath, _countof(logPath))) {
+        fwprintf(f, L"%s\n", full);
+        fclose(f);
+    }
+    {
+        char note[256];
+        _snprintf_s(note, _countof(note), _TRUNCATE, "CRASH: %ls 0x%08X in %ls (full report in crash_log.txt)",
+                    ExceptionCodeString(er->ExceptionCode), er->ExceptionCode, where);
+        StartupLog_CrashNote(note);
     }
 
-    int result = MessageBoxW(NULL, msg, L"PlayGroundFromAbove - Crash",
-        MB_ICONERROR | MB_ABORTRETRYIGNORE | MB_TOPMOST | MB_SETFOREGROUND);
-    return (result == IDIGNORE);
-}
+    CRASH_APPEND(brief, bl, L"\nFull report: %s\n", logPath[0] ? logPath : L"(could not be written)");
+    if (StartupLog_Path()[0])
+        CRASH_APPEND(brief, bl, L"Startup log: %s\n", StartupLog_Path());
+    // The report link is spliced in between briefHead and briefTail: a hyperlink in the task
+    // dialog, plain text in the MessageBox fallback.
+    CRASH_APPEND(brief, bl, L"\nPlease report this at:\n");
+    const size_t briefHeadLen = bl;
+    CRASH_APPEND(brief, bl, L"\nand attach crash_log.txt%s.\n", StartupLog_Path()[0] ? L" and startup_log.txt" : L"");
+    if (!bLogging)
+        CRASH_APPEND(brief, bl, L"\nLogging is turned off. If you can, turn on Preferences > Viz > \"Enable logging\", "
+                                L"make it crash again, and also attach pfa_heartbeat.log and pfa_prerender.log "
+                                L"from your %%TEMP%% folder.\n");
+    if (mode == CrashContinue::GameThread)
+        CRASH_APPEND(brief, bl, L"\n\"Try to continue\" closes the current song and goes back to the start screen. "
+                                L"PGFA may be unstable afterwards.\n");
+    else if (mode == CrashContinue::OtherThread)
+        CRASH_APPEND(brief, bl, L"\n\"Try to continue\" stops only the part that crashed. Audio, loading or other "
+                                L"features may stop working until PGFA is restarted.\n");
+    CRASH_APPEND(brief, bl, L"\nCtrl+C copies this message.");
 
-static DWORD WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
-    WriteCrashLog(ep);
-    return EXCEPTION_EXECUTE_HANDLER;
+    static wchar_t content[4096 + 256];
+    content[0] = L'\0';
+    const bool bContinue = ShowCrashDialog(brief, briefHeadLen, mode != CrashContinue::None, content, _countof(content));
+    StartupLog_CrashNote(bContinue ? "CRASH: user chose Try to continue" : "CRASH: user chose Quit");
+    InterlockedExchange(&s_bBusy, 0);
+    return bContinue;
 }
 
 DWORD g_dwGameThreadId = 0;
@@ -348,6 +528,18 @@ DWORD g_dwGameThreadId = 0;
 // only come from a foreign thread running in a DLL that is being unloaded; there is nothing left
 // to protect, so exit quietly instead of writing a crash log for a clean close.
 static volatile LONG g_bTeardown = 0;
+
+static DWORD g_dwMainThreadId = 0;
+static volatile LONG g_bGameCrashReported = 0;
+
+// A crash on any thread but the game thread. The UI thread cannot be continued (its message loop
+// is the app); any other thread is ended on "Try to continue" and the rest of the app keeps going.
+[[noreturn]] static void HandleForeignThreadCrash(EXCEPTION_POINTERS* ep) {
+    const bool bCanContinue = GetCurrentThreadId() != g_dwMainThreadId;
+    if (!WriteCrashLog(ep, bCanContinue ? CrashContinue::OtherThread : CrashContinue::None))
+        TerminateProcess(GetCurrentProcess(), 1);
+    ExitThread(0xDEAD);
+}
 
 static LONG WINAPI FinalCrashBackstop(EXCEPTION_POINTERS* ep) {
     switch (ep->ExceptionRecord->ExceptionCode) {
@@ -364,9 +556,15 @@ static LONG WINAPI FinalCrashBackstop(EXCEPTION_POINTERS* ep) {
     }
     if (g_bTeardown)
         TerminateProcess(GetCurrentProcess(), 0);
-    WriteCrashLog(ep);
-    TerminateProcess(GetCurrentProcess(), 1);
-    return EXCEPTION_EXECUTE_HANDLER;
+    if (GetCurrentThreadId() == g_dwGameThreadId) {
+        if (!WriteCrashLog(ep, CrashContinue::GameThread))
+            TerminateProcess(GetCurrentProcess(), 1);
+        // Let the exception reach GameThreadBody's __except, which restarts the game loop. The
+        // report is already written, so that handler must not show a second dialog.
+        InterlockedExchange(&g_bGameCrashReported, 1);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    HandleForeignThreadCrash(ep);
 }
 
 static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
@@ -384,36 +582,23 @@ static LONG WINAPI VectoredCrashHandler(EXCEPTION_POINTERS* ep) {
     if (GetCurrentThreadId() == g_dwGameThreadId)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    wchar_t logPath[MAX_PATH];
-    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
-        wchar_t* slash = wcsrchr(logPath, L'\\');
-        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
-        FILE* f = NULL;
-        if (_wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE") == 0 && f) {
-            fwprintf(f, L"Crash on non-game thread: 0x%08X at 0x%016llX\n",
-                ep->ExceptionRecord->ExceptionCode,
-                (unsigned long long)ep->ContextRecord->Rip);
-            fclose(f);
-        }
-    }
-    WriteCrashLog(ep);
-    TerminateProcess(GetCurrentProcess(), 1);
-    return EXCEPTION_EXECUTE_HANDLER;
+    HandleForeignThreadCrash(ep);
 }
 
 static void __cdecl TerminateHandler() {
-    wchar_t msg[512];
+    wchar_t msg[1024];
     _snwprintf_s(msg, _countof(msg), _TRUNCATE,
         L"PlayGroundFromAbove has encountered a fatal error.\n\n"
         L"std::terminate() was called (unhandled C++ exception, pure virtual call, etc.).\n"
-        L"The application will now exit.");
+        L"The application will now exit.\n\n"
+        L"Please report this at:\n%s\nand attach crash_log.txt%s.",
+        kIssuesUrl, StartupLog_Path()[0] ? L" and startup_log.txt" : L"");
+    StartupLog_CrashNote("CRASH: std::terminate() called");
     FILE* f = NULL;
     wchar_t logPath[MAX_PATH];
-    if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
-        wchar_t* slash = wcsrchr(logPath, L'\\');
-        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"crash_log.txt");
-        _wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE");
-        if (f) { fwprintf(f, L"%s\n", msg); fclose(f); }
+    if (OpenCrashLogFile(&f, logPath, _countof(logPath))) {
+        fwprintf(f, L"%s\n", msg);
+        fclose(f);
     }
     MessageBoxW(NULL, msg, L"Oh deer..", MB_ICONERROR | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
     TerminateProcess(GetCurrentProcess(), 1);
@@ -493,14 +678,20 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
 
 INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdShow )
 {
-    if (!InitEmbeddedDLLs(hInstance))
+    g_dwMainThreadId = GetCurrentThreadId();
+    StartupLog_Begin();
+    StartupLog("cmdline: %s", lpszCmdLine ? lpszCmdLine : "");
+    if (!InitEmbeddedDLLs(hInstance)) {
+        StartupLog_End("embedded DLL init failed");
         return 1;
+    }
+    StartupLog("embedded DLLs loaded");
 
     AddVectoredExceptionHandler(1, VectoredCrashHandler);
     AddVectoredExceptionHandler(0, FinalCrashBackstop); // registered last: runs when nothing else handled
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
-        WriteCrashLog(ep);
-        return EXCEPTION_EXECUTE_HANDLER;
+        // The game thread never gets here (GameThreadBody's __except catches everything).
+        HandleForeignThreadCrash(ep);
     });
     std::set_terminate(TerminateHandler);
 
@@ -545,9 +736,18 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     Config &config = Config::GetConfig();
     ViewSettings &cView = config.GetViewSettings();
     PlaybackSettings &cPlayback = config.GetPlaybackSettings();
+    {
+        const AudioSettings& cAudio = config.GetAudioSettings();
+        const wchar_t* outName = (cAudio.iOutDevice >= 0 && cAudio.iOutDevice < (int)cAudio.vMIDIOutDevices.size())
+            ? cAudio.vMIDIOutDevices[cAudio.iOutDevice].c_str() : L"(none)";
+        StartupLog("config: renderer=%s kdmapi=%d midiOut=%d '%ls' prerender=%d logging=%d",
+                   config.GetVideoSettings().eRenderer == VideoSettings::DirectX12 ? "DX12" : "DX11",
+                   (int)config.GetVizSettings().bKDMAPI, cAudio.iOutDevice, outName,
+                   (int)cAudio.bPreRenderAudio, (int)g_bLoggingEnabled.load(std::memory_order_relaxed));
+    }
 
     // Bug the user if WinMM isn't patched
-    if (!config.GetVizSettings().bKDMAPI || !LoadLibrary(L"OmniMIDI")) {
+    if (!config.GetVizSettings().bKDMAPI || !PGFALoadSynthModule(L"OmniMIDI")) {
         wchar_t winmm_path[1024] = {};
         wchar_t win_dir[MAX_PATH] = {};
         if (GetModuleFileName(GetModuleHandle(L"winmm.dll"), winmm_path, _countof(winmm_path)) &&
@@ -573,9 +773,12 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     HACCEL hAccel = LoadAccelerators( hInstance, MAKEINTRESOURCE( IDA_MAINMENU ) );
     if ( !hAccel ) return 1;
 
+    StartupLog("windows created");
+
     // Get the game going
     HANDLE hThread = CreateThread( NULL, 8 * 1024 * 1024, GameThread, new SplashScreen( NULL, NULL ), 0, NULL );
     if ( !hThread ) return 1;
+    StartupLog("game thread started");
 
     // Set up GUI and show
     SetPlayMode( GameState::Splash );
@@ -644,6 +847,7 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
         }
     }
 
+    StartupLog_End("app closed before a MIDI was loaded");
     g_MsgQueue.ForcePush( msg );
     WaitForSingleObject( hThread, INFINITE );
 
@@ -791,16 +995,59 @@ static void RecoverRenderer(Renderer*& pRenderer, GameState* pGameState) {
     g_bLoggingEnabled.store(wasLogging, std::memory_order_relaxed);
 }
 
+static const DWORD kGameThreadCrashed = 0xDEAD;
+static Renderer* s_pGameRenderer = nullptr; // Current renderer, for abandoning it after a crash
+
+// "Try to continue" after a game thread crash: the crashed state and renderer are leaked rather
+// than deleted (their destructors could crash again). The state's audio is silenced and the
+// renderer's swap chain released so a fresh renderer can bind to the same window.
+static void AbandonCrashedGame()
+{
+    __try {
+        if (g_pGameState)
+            g_pGameState->AbandonAfterCrash();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try {
+        if (s_pGameRenderer)
+            s_pGameRenderer->ReleaseForReplacement();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_pGameState = nullptr;
+    s_pGameRenderer = nullptr;
+    // A crash inside the cleanup above may have been reported and continued too.
+    InterlockedExchange(&g_bGameCrashReported, 0);
+}
+
+static DWORD GameThreadBody( LPVOID lpParameter );
+
 DWORD WINAPI GameThread( LPVOID lpParameter )
 {    if ( !g_hWndGfx ) { delete reinterpret_cast<GameState*>(lpParameter); return 0; }
     g_dwGameThreadId = GetCurrentThreadId();
 
+    for (;;)
+    {
+        const DWORD result = GameThreadBody( lpParameter );
+        if ( result != kGameThreadCrashed )
+            return result;
+        _resetstkoflw(); // Re-arm the guard page if the crash was a stack overflow
+        AbandonCrashedGame();
+        HeartbeatLog( "crash: game thread restarting on the start screen" );
+        lpParameter = new SplashScreen( NULL, NULL );
+        // Put the UI's play mode and toolbar back in their no-song state as well.
+        PostMessage( g_hWnd, WM_COMMAND, ID_CRASH_RECOVERED, 0 );
+    }
+}
+
+static DWORD GameThreadBody( LPVOID lpParameter )
+{
     __try {
 
     std::tuple<HRESULT, const char*> boot_fail = { S_OK, "" };
+    StartupLog("renderer init");
     Renderer *pRenderer = InitRendererLadder(&boot_fail);
+    s_pGameRenderer = pRenderer;
     if ( !pRenderer )
     {
+        StartupLog("renderer init failed: %s hr=0x%08X", std::get<1>(boot_fail), (unsigned)std::get<0>(boot_fail));
         wchar_t msg[1024] = {};
         _snwprintf_s(msg, 1024, L"Fatal error initializing the graphics device.\n%S failed with code 0x%x.", std::get<1>(boot_fail), std::get<0>(boot_fail));
         MessageBox( g_hWnd, msg, TEXT( "Error" ), MB_OK | MB_ICONEXCLAMATION );
@@ -818,6 +1065,8 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
 
     wchar_t buf[1024] = {};
     g_pwszRenderMode = pRenderer->GetModeName();
+    StartupLog("renderer ready: %ls on '%ls'%s", g_pwszRenderMode, pRenderer->GetAdapterName().c_str(),
+               g_bForceWARP ? " (WARP fallback)" : g_bBootedFallback ? " (DX12 -> DX11 fallback)" : "");
 #ifdef __AVX2__
     _snwprintf_s(buf, 1024, L"PlayGroundFromAbove %S (AVX2 build, Device: %s, Mode: %s)", __DATE__, pRenderer->GetAdapterName().c_str(), g_pwszRenderMode);
 #else
@@ -874,6 +1123,23 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
                     SetEvent((HANDLE)msg.lParam);
                 continue;
             }
+            if ( msg.message == WM_KEYDOWN && msg.wParam == VK_F12 )
+            {
+                // Test hotkey for the crash reporter. F12 crashes the game thread (SEH path);
+                // Shift+F12 crashes a separate thread (vectored handler path, like a crash inside a
+                // synth or audio driver thread).
+                StartupLog( "F12 test crash requested" );
+                if ( GetKeyState( VK_SHIFT ) < 0 )
+                {
+                    HANDLE hCrash = CreateThread( NULL, 0, []( LPVOID ) -> DWORD {
+                        *(volatile int*)nullptr = 0xF12;
+                        return 0;
+                    }, NULL, 0, NULL );
+                    if ( hCrash ) CloseHandle( hCrash );
+                    continue;
+                }
+                *(volatile int*)nullptr = 0xF12;
+            }
             if ( msg.message == WM_COMMAND && LOWORD( msg.wParam ) == ID_VIEW_RESETDEVICE )
             {
                 g_bResetPending = false;
@@ -902,6 +1168,8 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
         if ( ( ge = GameState::ChangeState( pGameState->NextState(), &pGameState ) ) != GameState::Success )
             PostMessage( g_hWnd, WM_COMMAND, ID_GAMEERROR, ge );
         g_pGameState = pGameState;
+        s_pGameRenderer = pRenderer; // RecoverRenderer may have swapped it
+        StartupLog_OnFrame( pGameState->DebugName() );
         {
             static auto s_tStateLog = std::chrono::steady_clock::now();
             auto tNowState = std::chrono::steady_clock::now();
@@ -943,10 +1211,17 @@ DWORD WINAPI GameThread( LPVOID lpParameter )
     delete pGameState;
     g_pGameState = nullptr;
     delete pRenderer;
+    s_pGameRenderer = nullptr;
 
     } __except([&]() -> int {
-        WriteCrashLog(GetExceptionInformation());
+        // Exceptions the vectored backstop already reported (the user chose to continue) skip the
+        // dialog; anything else (e.g. a C++ exception) is reported here.
+        if (!InterlockedExchange(&g_bGameCrashReported, 0) &&
+            !WriteCrashLog(GetExceptionInformation(), CrashContinue::GameThread))
+            TerminateProcess(GetCurrentProcess(), 1);
         return EXCEPTION_EXECUTE_HANDLER;
-    }()) {}
+    }()) {
+        return kGameThreadCrashed;
+    }
     return 0;
 }

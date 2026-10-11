@@ -37,8 +37,14 @@ What's new since v0.9.0:
 **Fixes**
 * Fixed an error shown in `crash_log.txt` on closing the player
 * Hardened key drawing against invalid per-key note indices (suspected cause of a rare crash during playback)
+* Synths (OmniMIDI, SVMS and other KDMAPI providers) are no longer unloaded once loaded. Unloading them could crash inside `MMDevAPI.dll` the next time an audio device changed
+* New always-on `startup_log.txt` next to the exe, covering launch up to the first MIDI loading and playing
+* The crash dialog is now a short summary; the full report (stack, registers, loaded and recently unloaded modules) stays in `crash_log.txt`. The dialog links to GitHub Issues and asks you to turn on logging if it is off
+* The crash dialog's buttons are now "Quit" and "Try to continue" (no more Retry). "Try to continue" actually continues: a crash in the player goes back to the start screen, and a crash on another thread stops only that thread
+* Fixed the DirectX 11 renderer failing to recreate its swap chain (E_ACCESSDENIED, falling back to the slower bitblt mode) after a device reset
+* Fixed the "Transition" keys mode stuttering on dense MIDIs with the visual (image) buffer on: every frame of the 88 -> 128 key animation threw away the prepared note data and restarted preparing the whole song in the background
+* Fixed notes being cut off diagonally in DirectX 11 with the visual (image) buffer on: the DirectX 11 chunk shader was an outdated build that drew each chunk as an oversized triangle over the chunk below it
 
 Known issues:
 * Packed mode: the picture freezes for about 0.3 - 0.4 s each time the window moves to the next section, and the audio probably has a short gap there
 * Packed mode: markers, lyrics, track names and controller state from before a window are not carried over, and some statistics (notes played, etc.) restart per window
-* Visual buffer mode in DirectX11 corrupts each visual chunk

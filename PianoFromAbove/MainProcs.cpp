@@ -332,6 +332,12 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )new IntroScreen( NULL, NULL ) );
                     return 0;
                 }
+                case ID_CRASH_RECOVERED:
+                    // Like closing the file, but the game thread already restarted on the splash screen.
+                    cPlayback.SetPlayMode( GameState::Intro, true );
+                    cPlayback.SetPlayable( false, true );
+                    cPlayback.SetPosition( 0 );
+                    return 0;
                 case ID_FILE_RENDERVIDEO:
                 {
                     // Toggles: starts a video render, or stops one in progress.
@@ -757,6 +763,7 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
 
     const GameState::State ePlayMode = GameState::Practice;
 
+    StartupLog("PlayFile: '%ls' (custom=%d)", sFile.c_str(), (int)bCustomSettings);
     g_LoadingProgress.stage = MIDILoadingProgress::Stage::CopyToMem;
     g_LoadingProgress.progress = 0;
     g_LoadingProgress.max = 0;
@@ -814,6 +821,7 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
             fnLoad();
         if (hLoaded) CloseHandle(hLoaded);
     }
+    StartupLog("PlayFile: parse %s", (pGameState && pGameState->IsValid()) ? "ok" : "FAILED");
     if (!pGameState || !pGameState->IsValid())
     {
         g_bShowLoading = false;
@@ -859,6 +867,7 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
     config.GetVizSettings().AddRecentMIDI(sFile);
     SetMainTitle( sFile.c_str() + ( sFile.find_last_of( L'\\' ) + 1 ) );
 
+    StartupLog("PlayFile: handing song to the game thread");
     HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )pGameState );
     return TRUE;
 }

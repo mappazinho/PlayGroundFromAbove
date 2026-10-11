@@ -372,6 +372,7 @@
     <ClInclude Include="MainProcs.h" />
     <ClInclude Include="MemoryModule.h" />
     <ClInclude Include="EmbeddedDLL.h" />
+    <ClInclude Include="StartupLog.h" />
     <ClInclude Include="MIDI.h" />
     <ClInclude Include="MIDIAudio.h" />
     <ClInclude Include="MIDIPreRenderPlayer.h" />
@@ -389,6 +390,7 @@
     <ClCompile Include="ConfigProcs.cpp" />
     <ClCompile Include="MemoryModule.cpp" />
     <ClCompile Include="EmbeddedDLL.cpp" />
+    <ClCompile Include="StartupLog.cpp" />
     <ClCompile Include="BASSMIDI.cpp" />
     <ClCompile Include="GameState.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />

@@ -8,6 +8,7 @@
 *
 *************************************************************************************************/
 #include "MIDI.h"
+#include "StartupLog.h"
 #include "ParallelMIDIPos.h"
 #include "ParallelPostProcess.h"
 #include "PackedMIDI.h"
@@ -2207,8 +2208,10 @@ bool MIDIOutDevice::Open( int iDev )
     m_sDevice = GetDevName( iDev );
     m_bIsKDMAPI = false;
 
+    StartupLog("midiOutOpen device %d '%ls'", iDev, m_sDevice.c_str());
     MMRESULT mmResult = midiOutOpen( &m_hMIDIOut, iDev, ( DWORD_PTR )MIDIOutProc, ( DWORD_PTR )this, CALLBACK_FUNCTION );
     m_bIsOpen = ( mmResult == MMSYSERR_NOERROR );
+    StartupLog("midiOutOpen device %d -> mmresult %u", iDev, (unsigned)mmResult);
     return m_bIsOpen;
 }
 
@@ -2219,9 +2222,12 @@ bool MIDIOutDevice::OpenKDMAPI() {
     m_sDevice = L"KDMAPI";
     m_bIsKDMAPI = true;
 
+    StartupLog("KDMAPI open (MIDIOutDevice)");
     auto InitializeKDMAPIStream = (int(WINAPI*)())GetOmniMIDIProc("InitializeKDMAPIStream");
     *(FARPROC*)&SendDirectData = GetOmniMIDIProc("SendDirectData");
-    return m_bIsOpen = (SendDirectData && InitializeKDMAPIStream && InitializeKDMAPIStream());
+    m_bIsOpen = (SendDirectData && InitializeKDMAPIStream && InitializeKDMAPIStream());
+    StartupLog("KDMAPI open (MIDIOutDevice) -> %s", m_bIsOpen ? "ok" : "failed");
+    return m_bIsOpen;
 }
 
 void MIDIOutDevice::Close()
@@ -2312,11 +2318,25 @@ bool MIDIOutDevice::PlayEvent( unsigned char cStatus, unsigned char cParam1, uns
     }
 }
 
+HMODULE PGFALoadSynthModule(const wchar_t* nameOrPath) {
+    HMODULE module = LoadLibraryW(nameOrPath);
+    if (!module)
+        return NULL;
+    HMODULE pinned = NULL;
+    const bool bPinned = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                            (LPCWSTR)module, &pinned) != FALSE;
+    wchar_t path[MAX_PATH] = L"";
+    GetModuleFileNameW(module, path, MAX_PATH);
+    StartupLog("synth module %ls -> %ls at %p (%s)", nameOrPath, path, (void*)module,
+               bPinned ? "pinned" : "PIN FAILED");
+    return module;
+}
+
 FARPROC MIDIOutDevice::GetOmniMIDIProc(const char* func) {
     auto dll = GetModuleHandle(L"OmniMIDI");
     if (!dll)
-        dll = LoadLibrary(L"OmniMIDI");
-    return GetProcAddress(dll, func);
+        dll = PGFALoadSynthModule(L"OmniMIDI");
+    return dll ? GetProcAddress(dll, func) : NULL;
 }
 
 void CALLBACK MIDIOutDevice::MIDIOutProc(HMIDIOUT, UINT wMsg, DWORD_PTR, DWORD_PTR, DWORD_PTR)

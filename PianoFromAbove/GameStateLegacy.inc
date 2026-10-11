@@ -4417,6 +4417,7 @@ void MainScreen::RenderNotesImageBuffer()
         (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
         (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
     if (m_bTrackZoom || m_bTrackPos || bKeysTransitionActive) {
+        m_bImageBufferDirectCollect = true;
         for (long long k = kFirst; k <= kLast; k++) {
             CollectChunk(k);
             for (NoteData data : chunkNotes) {
@@ -4424,6 +4425,7 @@ void MainScreen::RenderNotesImageBuffer()
                 m_pRenderer->PushNoteData(data);
             }
         }
+        m_bImageBufferDirectCollect = false;
         return;
     }
 
@@ -4494,6 +4496,11 @@ void MainScreen::RenderPianoRollStripImageBuffer()
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
             }
         };
+        if (m_bImageBufferDirectCollect) {
+            chunkNotes.clear();
+            exact(key);
+            return;
+        }
         ImageBufferMPCollectDispatch(m_pRenderer, chunkNotes, exact, key);
     };
 
@@ -4510,6 +4517,7 @@ void MainScreen::RenderPianoRollStripImageBuffer()
         (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
         (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
     if (m_bTrackZoom || m_bTrackPos || bKeysTransitionActive) {
+        m_bImageBufferDirectCollect = true;
         for (long long chunk = first; chunk <= last; ++chunk) {
             collect(chunk);
             for (NoteData data : chunkNotes) {
@@ -4517,6 +4525,7 @@ void MainScreen::RenderPianoRollStripImageBuffer()
                 fallback.push_back(data);
             }
         }
+        m_bImageBufferDirectCollect = false;
         for (const NoteData& data : fallback)
             m_pRenderer->PushPianoRollStripNoteData(data);
         return;
@@ -6256,4 +6265,26 @@ void FreePlayScreen::RenderNoteIdx(int idx)
             .length = static_cast<float>(llNoteLength),
         });
     }
+}
+
+// Crash recovery: silence the abandoned state. Only flags and output resets - the state itself is
+// leaked, and its playback thread exits on its own once it sees the exit flag.
+static void StopSharedAudioAfterCrash()
+{
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
+        PRE_MIDIAudio->Stop();
+    CustomAudioStop();
+}
+
+void SplashScreen::AbandonAfterCrash()
+{
+    StopSharedAudioAfterCrash();
+    m_OutDevice.AllNotesOff();
+}
+
+void MainScreen::AbandonAfterCrash()
+{
+    m_bPlaybackAudioExit.store(true, std::memory_order_release);
+    StopSharedAudioAfterCrash();
+    m_OutDevice.AllNotesOff();
 }

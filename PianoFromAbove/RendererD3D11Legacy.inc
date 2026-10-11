@@ -641,6 +641,13 @@ HRESULT D3D11Renderer::ResetDevice() {
 
 void D3D11Renderer::ReleaseDeviceResources() {
     HeartbeatLog("release(d3d11):start");
+    // D3D11 defers destruction: the back buffer stays bound to the pipeline (keeping the swap chain
+    // and its window binding alive) until the context state is cleared and flushed. Without this the
+    // next CreateSwapChainForHwnd on the same window fails with E_ACCESSDENIED.
+    if (m_pContext) {
+        m_pContext->ClearState();
+        m_pContext->Flush();
+    }
     DestroyBlurResources();
 
     for (uint32_t i = 0; i < FrameCount; i++)
@@ -708,6 +715,8 @@ void D3D11Renderer::ReleaseDeviceResources() {
     m_pSamplerPointWrap.Reset();
     m_pSamplerLinearClamp.Reset();
 
+    if (m_pContext)
+        m_pContext->Flush(); // Actually destroy what was released above, the swap chain included
     m_pContext.Reset();
     m_pContext4.Reset();
     m_pFence.Reset();

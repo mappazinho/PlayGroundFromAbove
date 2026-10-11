@@ -999,6 +999,13 @@ static void ImageBufferDriveHugePrewarm(
             } \
         } \
     }; \
+    /* Image buffer bypassed: the layout (notes_cy, so the prepared signature) changes every frame, and \
+       going through the prepared store would discard it and re-queue the whole song every frame. */ \
+    if (m_bImageBufferDirectCollect) { \
+        chunkNotes.clear(); \
+        ImageBufferExactCollector((k)); \
+        return; \
+    } \
     bool imageBufferAnyHidden = false; \
     for (const auto& imageBufferTrack : m_vTrackSettings) { \
         for (int imageBufferChannel = 0; imageBufferChannel < 16; ++imageBufferChannel) { \

@@ -593,6 +593,13 @@ private:
 };
 
 
+// Loads a synth DLL (OmniMIDI / SVMS / KDMAPI provider) and pins it for the rest of the process.
+// Synths start audio threads and register WASAPI device-notification callbacks that can outlive
+// TerminateKDMAPIStream; unloading the DLL leaves MMDevAPI calling into unmapped code the next
+// time an audio endpoint changes (an access violation inside MMDevAPI.dll on a thread-pool
+// thread). Never FreeLibrary a module returned from here.
+HMODULE PGFALoadSynthModule(const wchar_t* nameOrPath);
+
 class MIDIOutDevice
 {
 public:

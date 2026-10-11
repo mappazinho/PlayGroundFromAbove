@@ -78,6 +78,8 @@ using PGFATerminateKDMAPIFn = void (WINAPI*)();
 using PGFASendDirectDataFn = void (WINAPI*)(DWORD);
 using PGFAResetKDMAPIFn = void (WINAPI*)();
 
+// Every module loaded here is pinned (see PGFALoadSynthModule): synths are never unloaded, so the
+// provider below only ever calls the synth's own shutdown entry points, never FreeLibrary.
 static HMODULE PGFALoadSiblingModule(const wchar_t* name)
 {
     wchar_t path[MAX_PATH] = {};
@@ -88,12 +90,12 @@ static HMODULE PGFALoadSiblingModule(const wchar_t* name)
             *(slash + 1) = L'\0';
             if (wcslen(path) + wcslen(name) + 1 < MAX_PATH) {
                 wcscat_s(path, name);
-                if (HMODULE module = LoadLibraryW(path))
+                if (HMODULE module = PGFALoadSynthModule(path))
                     return module;
             }
         }
     }
-    return LoadLibraryW(name);
+    return PGFALoadSynthModule(name);
 }
 
 class PGFAPlaybackOutputProvider {
@@ -105,11 +107,17 @@ public:
         Close();
         m_wantKDMAPI = wantKDMAPI;
         m_deviceIndex = device;
+        StartupLog("playback output open: kdmapi=%d device=%d", (int)wantKDMAPI, device);
         if (wantKDMAPI) {
-            if (OpenSvmsNative())
+            if (OpenSvmsNative()) {
+                StartupLog("playback output: SVMS native session open");
                 return true;
-            if (OpenKDMAPI())
+            }
+            if (OpenKDMAPI()) {
+                StartupLog("playback output: KDMAPI stream open");
                 return true;
+            }
+            StartupLog("playback output: no KDMAPI provider could be opened");
             return false;
         }
         if (device < 0)
@@ -139,10 +147,7 @@ public:
         m_resetKDMAPI = nullptr;
         m_terminateKDMAPI = nullptr;
         memset(&m_svms, 0, sizeof(m_svms));
-        if (m_module) {
-            FreeLibrary(m_module);
-            m_module = nullptr;
-        }
+        m_module = nullptr; // Pinned: never unloaded
     }
 
     bool Matches(bool wantKDMAPI, int device) const
@@ -258,13 +263,13 @@ private:
             auto getInterface = reinterpret_cast<PGFASvmsGetInterfaceFn>(
                 GetProcAddress(module, "SVMS_GetInterface"));
             if (!getInterface) {
-                FreeLibrary(module);
+                StartupLog("%ls: no SVMS_GetInterface export", name);
                 continue;
             }
             PGFASvmsInterfacePrefix api = {};
             if (getInterface(PGFA_SVMS_ABI_V1, (uint32_t)sizeof(api), &api) != PGFA_SVMS_OK ||
                 api.abi_version != PGFA_SVMS_ABI_V1 || !api.create_session || !api.destroy_session || !api.send_short) {
-                FreeLibrary(module);
+                StartupLog("%ls: SVMS interface rejected (abi=%u)", name, api.abi_version);
                 continue;
             }
             PGFASvmsSessionConfig cfg = {};
@@ -272,7 +277,7 @@ private:
             cfg.struct_version = PGFA_SVMS_STRUCT_V1;
             PGFASvmsSession session = 0;
             if (api.create_session(&cfg, &session) != PGFA_SVMS_OK || session == 0) {
-                FreeLibrary(module);
+                StartupLog("%ls: SVMS create_session failed", name);
                 continue;
             }
             if ((api.capabilities & PGFA_SVMS_CAP_QUEUE_CONTROL) && api.set_ingress_mode)
@@ -288,23 +293,20 @@ private:
 
     bool OpenKDMAPI()
     {
-        HMODULE module = nullptr;
         static const wchar_t* names[] = { L"SVMS.dll", L"SVMSAPI.dll", L"OmniMIDI.dll", L"OmniMIDI" };
         for (const wchar_t* name : names) {
-            module = PGFALoadSiblingModule(name);
+            HMODULE module = PGFALoadSiblingModule(name);
             if (!module)
                 continue;
             auto initialize = reinterpret_cast<PGFAInitializeKDMAPIFn>(GetProcAddress(module, "InitializeKDMAPIStream"));
             auto terminate = reinterpret_cast<PGFATerminateKDMAPIFn>(GetProcAddress(module, "TerminateKDMAPIStream"));
             auto send = reinterpret_cast<PGFASendDirectDataFn>(GetProcAddress(module, "SendDirectData"));
             if (!initialize || !terminate || !send) {
-                FreeLibrary(module);
-                module = nullptr;
+                StartupLog("%ls: missing KDMAPI exports", name);
                 continue;
             }
             if (!initialize()) {
-                FreeLibrary(module);
-                module = nullptr;
+                StartupLog("%ls: InitializeKDMAPIStream failed", name);
                 continue;
             }
             m_module = module;

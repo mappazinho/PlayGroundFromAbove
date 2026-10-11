@@ -12,6 +12,7 @@
 #include <Windows.h>
 #include <atomic>
 #include "Misc.h"
+#include "StartupLog.h"
 
 extern HINSTANCE g_hInstance;
 extern HWND g_hWnd;
@@ -30,6 +31,7 @@ extern GameState* g_pGameState; // Current game state; game thread owns it
 #define ID_PRELOAD_DISCARD (WM_APP + 0x101)
 #define ID_PRELOAD_DRAIN (WM_APP + 0x102) // Drain the GPU queue before a window transition animates
 #define ID_APPLY_FULLSCREEN (WM_APP + 0x103) // UI thread applies a fullscreen toggle requested from the game thread
+#define ID_CRASH_RECOVERED (WM_APP + 0x104) // Game thread restarted on the start screen after a crash: reset the UI's song state
 extern DWORD g_dwGameThreadId;
 extern bool g_bSkipGPUWait; // Experiment: skip WaitForGPU fence waits entirely (default true)
 extern bool g_bDisableBlur; // Experiment: skip the per-frame blur compute passes

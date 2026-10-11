@@ -50,6 +50,10 @@ public:
     virtual const char* DebugName() const = 0;
     virtual bool IsFreePlay() const { return false; }
 
+    // Crash recovery ("Try to continue"): the crashed state is abandoned, never deleted, because its
+    // destructor could crash again. This only silences its audio so the leaked state stays quiet.
+    virtual void AbandonAfterCrash() {}
+
     virtual GameError Init() = 0;
 
     virtual GameError MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) = 0;
@@ -95,6 +99,7 @@ public:
     SplashScreen( HWND hWnd, Renderer *pRenderer );
 
     const char* DebugName() const override { return "SplashScreen"; }
+    void AbandonAfterCrash() override;
 
     GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
     GameError MsgProcLegacy( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam );
@@ -246,6 +251,7 @@ public:
     ~MainScreen() override;
 
     const char* DebugName() const override { return "MainScreen"; }
+    void AbandonAfterCrash() override;
     virtual bool IsFreePlay() const { return false; }
 
     GameError MsgProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam ) override;
@@ -449,6 +455,9 @@ void RenderText();
     vector<long long> m_vImageBufferPrefixEndTime;
     vector<long long> m_vImageBufferPrefixEndTick;
     bool m_bImageBufferNeedsInvalidate = true; // defer until renderer is attached
+    // Set while the image buffer is bypassed (key-range transition, zoom/position drag): chunk notes
+    // are collected exactly and drawn directly, without the prepared store or multipass staging.
+    bool m_bImageBufferDirectCollect = false;
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;
     float m_fLastBGBlur = -1.0f;
