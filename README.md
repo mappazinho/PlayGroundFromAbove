@@ -1,6 +1,17 @@
+## ⚠️ Note: Currently in BETA stage. You WILL experience bugs or crashes.
+If you experience a crash or bug, and know how to replicate it then follow these steps.
+1. Enable logging in Settings > Viz
+2. Restart PGFA
+3. Replicate bug
+4. Create a new issue in this repo, explain how it happened and include logs such as:
+   * **pfa_heartbeat** - located in %temp%
+   * **pfa_msgs** - located in %temp%
+   * **pfa_prerender** - located in %temp%
+   * **crash_log** - located in root folder where PGFA lives
+
 # PlayGroundFromAbove
 *Absolutely diabolical.*
-
+#
 A modification of PFAviz by khang06 which contains further fixes and additions, such as:
 * IMGUI UI for a simpler look
 * Visual Buffers
