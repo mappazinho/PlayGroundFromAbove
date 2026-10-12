@@ -8,6 +8,7 @@
 #include <new>
 #include <utility>
 #include <vector>
+#include "ImageBufferTrace.h"
 
 static constexpr size_t ImageBufferOverlapBlockEvents = 4096;
 static constexpr size_t ImageBufferOverlapSubBlockEvents = 64;
@@ -63,6 +64,15 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapIndexGet()
     return state;
 }
 
+// Set while collecting for a caller that only needs exact overlap queries (packed songs served by
+// the song-wide dense store): the index is then built without the per-note prepared source, which
+// costs 32 bytes per note and a long pass on the game thread.
+inline bool& ImageBufferOverlapSkipPrepared()
+{
+    static thread_local bool skip = false;
+    return skip;
+}
+
 inline long long ImageBufferOverlapSaturatingAdd(long long a, long long b)
 {
     if (b > 0 && a > (std::numeric_limits<long long>::max)() - b)
@@ -97,6 +107,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     const std::vector<MIDIChannelEvent>& events,
     MidiT& midi)
 {
+    IB_TRACE(IB_ENSUREINDEX);
     auto& state = ImageBufferOverlapIndexGet();
     const MIDIChannelEvent* const data = events.empty() ? nullptr : events.data();
     const size_t blockCount =
@@ -111,11 +122,12 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     // Include cheap content probes as well as owner/storage identity. An old and
     // new MainScreen can otherwise reuse the same allocator addresses and event
     // count, which would make a stale prepared source look current.
+    const bool wantPrepared = !ImageBufferOverlapSkipPrepared();
     if (state.owner == owner && state.eventData == data &&
         state.eventCount == events.size() && state.firstEvent == firstEvent &&
         state.lastEvent == lastEvent && state.firstTime == firstTime &&
         state.lastTime == lastTime && state.maxEndTime.size() == blockCount &&
-        state.subMaxEndTime.size() == subBlockCount && state.preparedAttempted)
+        state.subMaxEndTime.size() == subBlockCount && (state.preparedAttempted || !wantPrepared))
         return state;
 
     state.owner = owner;
@@ -135,7 +147,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     state.preparedAttempted = false;
 
     std::shared_ptr<ImageBufferPreparedSource> source;
-    try {
+    if (wantPrepared) try {
         source = std::make_shared<ImageBufferPreparedSource>();
         // NoteOn/NoteOff streams are commonly close to 50/50. Reserving once
         // avoids repeated 100+ MB reallocations on black MIDIs. If this reserve
@@ -262,7 +274,7 @@ inline ImageBufferOverlapIndexState& ImageBufferOverlapEnsureIndex(
     }
 
     state.preparedSource = std::move(source);
-    state.preparedAttempted = true;
+    state.preparedAttempted = wantPrepared;
     return state;
 }
 
@@ -352,6 +364,7 @@ inline void ImageBufferOverlapCollect(
     bool tickMode,
     BuildFn&& buildNote)
 {
+    IB_TRACE(IB_EXACT);
     out.clear();
     ImageBufferOverlapVisit(owner, events, midi, chunk, timeSpan, corruptionMargin,
         tickMode, std::forward<BuildFn>(buildNote),

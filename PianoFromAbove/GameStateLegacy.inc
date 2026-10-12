@@ -824,6 +824,7 @@ static void CustomAudioStop();
 
 GameState::GameError GameState::ChangeState( GameState *pNextState, GameState **pDestObj )
 {
+    IB_TRACE(IB_CHANGESTATE);
     if ( !pNextState )
         return Success;
     if (!pDestObj )
@@ -2565,6 +2566,9 @@ void MainScreen::Discard()
     eventvec_t().swap(m_vNoteOns);
     eventvec_t().swap(m_vNonNotes);
     eventvec_t().swap(m_vProgramChange);
+    for (auto& timeline : m_vBendTimeline)
+        vector<BendPoint>().swap(timeline);
+    m_uBendTimelineKey = SIZE_MAX;
     eventvec_t().swap(m_vTempo);
     eventvec_t().swap(m_vSignature);
     eventvec_t().swap(m_vMarkers);
@@ -2682,6 +2686,7 @@ void MainScreen::InitState()
 // Called immediately before changing to this state
 GameState::GameError MainScreen::Init()
 {
+    IB_TRACE(IB_SCREENINIT);
     static Config& config = Config::GetConfig();
     static const AudioSettings &cAudio = config.GetAudioSettings();
     static const VizSettings &cViz = config.GetVizSettings();
@@ -3418,10 +3423,9 @@ GameState::GameError MainScreen::Logic( void )
 
     auto& fixed_consts = m_pRenderer->GetFixedSizeConstants();
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
-    if (cViz.bVisualizePitchBends)
-        memcpy(&fixed_consts.bends, &m_pBends, sizeof(float) * 16);
-    else
-        memset(&fixed_consts.bends, 0, sizeof(float) * 16);
+    // Bends are no longer a rigid per-channel slide: RenderNotes() bends each note itself (see
+    // BuildBendCurves), so the shared offset stays zero.
+    memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
     SyncTrackColors(m_pRenderer, m_vTrackSettings);
 
@@ -3448,6 +3452,7 @@ void MainScreen::UpdateState(int key, const thread_work_t& work)
 
 void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
 {
+    IB_TRACE(IB_JUMPTO);
     {
         char b[128];
         sprintf_s(b, "seek:jumpto %.3fs (from %.3fs) gui=%d",
@@ -3561,12 +3566,17 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
     // Any seek/skip restarts dense-buffer preparation around the new position.
     // Skipped while paused so scrubbing does not thrash preparation; the next
     // Play re-arms fresh regardless.
-    if (!Config::GetConfig().GetPlaybackSettings().GetPausedRaw())
+    // Not for the seek a packed continuation window makes on its first frame (playback just carries
+    // on), nor when the song-wide dense store serves the song: it is not tied to the position.
+    if (m_bDenseStoreServes)
+        PGFADense::Store::Get().SetPlayhead(m_llStartTime);
+    else if (!m_bContinuationLanding && !Config::GetConfig().GetPlaybackSettings().GetPausedRaw())
         ImageBufferPrewarmRestartAfterSeek(FALSE);
 }
 
 void MainScreen::PlaySkippedEvents(eventvec_t::const_iterator itOldProgramChange)
 {
+    IB_TRACE(IB_SKIPPED);
     if (itOldProgramChange == m_itNextProgramChange)
         return;
 
@@ -3662,6 +3672,7 @@ void MainScreen::ApplyMarker(unsigned char* data, size_t size) {
 
 void MainScreen::AdvanceIterators( long long llTime, bool bIsJump )
 {
+    IB_TRACE(IB_ADVANCE);
     if ( bIsJump )
     {
         m_itNextProgramChange = upper_bound( m_vProgramChange.begin(), m_vProgramChange.end(), pair< long long, int >( llTime, m_vEvents.size() ) );
@@ -3993,6 +4004,7 @@ GameState::GameError MainScreen::Render()
 
 void MainScreen::RenderGlobals()
 {
+    IB_TRACE(IB_RGLOBALS);
     m_fNotesX = m_fOffsetX + m_fTempOffsetX;
     m_fNotesCX = m_pRenderer->GetBufferWidth() * m_fZoomX * m_fTempZoomX;
     m_fNotesY = m_fOffsetY + m_fTempOffsetY;
@@ -4200,12 +4212,170 @@ float MainScreen::GetCorruptorAmount() const
     return (float)dRamp;
 }
 
+// Splits the pitch-bend events of the song up per channel (they arrive time-ordered in
+// m_vProgramChange together with controller and program changes).
+void MainScreen::BuildBendTimeline()
+{
+    for (auto& timeline : m_vBendTimeline)
+        timeline.clear();
+    for (const auto& change : m_vProgramChange)
+    {
+        if (change.second < 0 || (size_t)change.second >= m_vEvents.size())
+            continue;
+        const MIDIChannelEvent pEvent = m_vEvents[change.second];
+        if (m_MIDI.GetEventChannelEventType(pEvent) != MIDI::PitchBend)
+            continue;
+        m_vBendTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
+    }
+    m_uBendTimelineKey = m_vProgramChange.size() ^ (m_vEvents.size() << 20);
+}
+
+// Samples every channel's bend (in semitones, as the old sliding visualization used) over the
+// visible window, [now, now + timespan], so the vertex shader can bend each note along its own
+// length. Returns true if any channel has a non-zero bend in the window.
+bool MainScreen::BuildBendCurves()
+{
+    constexpr unsigned N = Renderer::BendCurveSamples;
+    if (m_uBendTimelineKey != (m_vProgramChange.size() ^ (m_vEvents.size() << 20)))
+        BuildBendTimeline();
+
+    memset(m_bBendChanCurved, 0, sizeof(m_bBendChanCurved));
+    if (m_llTimeSpan <= 0)
+        return false;
+
+    m_vBendCurves.resize(16 * N);
+    m_vBendChangePrefix.resize(16 * N);
+
+    const long long llWindowStart = m_llRndStartTime;
+    const double dSpan = (double)m_llTimeSpan;
+    const float fCorrupt = GetCorruptorAmount();
+    auto unitOf = [&](const BendPoint& point) -> long long {
+        return m_bTickMode ? (long long)m_MIDI.GetEventAbsT(m_vEvents[point.idx]) : point.time;
+    };
+    auto semitonesOf = [&](const BendPoint& point) -> float {
+        const MIDIChannelEvent pEvent = m_vEvents[point.idx];
+        int iBend = CorruptPitchBend(fCorrupt, CorruptSeed(pEvent, UINT32_MAX),
+            (m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent));
+        return ((short)(iBend - 8192)) / (8192.0f / 12.0f);
+    };
+
+    bool bAny = false;
+    for (unsigned ch = 0; ch < 16; ch++)
+    {
+        float* curve = &m_vBendCurves[ch * N];
+        uint32_t* prefix = &m_vBendChangePrefix[ch * N];
+        const auto& timeline = m_vBendTimeline[ch];
+        if (timeline.empty())
+        {
+            memset(curve, 0, N * sizeof(float));
+            memset(prefix, 0, N * sizeof(uint32_t));
+            continue;
+        }
+
+        // First bend after the window start; the one before it is the value the window opens with.
+        size_t lo = 0, hi = timeline.size();
+        while (lo < hi)
+        {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (unitOf(timeline[mid]) <= llWindowStart)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        // The wheel holds its value until the next event, but bends are usually streams of closely
+        // spaced events: those are joined by straight segments so the note bends smoothly. A longer
+        // gap is a genuine jump and stays a step.
+        constexpr long long llSmoothGapUs = 100000;
+        size_t next = lo;
+        bool bHasPrev = next > 0;
+        float fPrev = bHasPrev ? semitonesOf(timeline[next - 1]) : 0.0f;
+        long long llPrevUnit = bHasPrev ? unitOf(timeline[next - 1]) : 0;
+        long long llPrevTime = bHasPrev ? timeline[next - 1].time : 0;
+        long long llNextUnit = LLONG_MAX;
+        float fNext = 0.0f;
+        auto loadNext = [&]() {
+            llNextUnit = next < timeline.size() ? unitOf(timeline[next]) : LLONG_MAX;
+            fNext = next < timeline.size() ? semitonesOf(timeline[next]) : 0.0f;
+        };
+        loadNext();
+
+        uint32_t uChanges = 0;
+        bool bNonZero = false;
+        for (unsigned k = 0; k < N; k++)
+        {
+            const long long llSample = llWindowStart + (long long)(dSpan * (double)k / (double)(N - 1));
+            while (llNextUnit <= llSample)
+            {
+                fPrev = fNext;
+                llPrevUnit = llNextUnit;
+                llPrevTime = timeline[next].time;
+                bHasPrev = true;
+                next++;
+                loadNext();
+            }
+            float fValue = fPrev;
+            if (bHasPrev && next < timeline.size() && llNextUnit > llPrevUnit &&
+                timeline[next].time - llPrevTime <= llSmoothGapUs)
+                fValue = fPrev + (fNext - fPrev) * (float)((double)(llSample - llPrevUnit) / (double)(llNextUnit - llPrevUnit));
+            if (k > 0 && fValue != curve[k - 1])
+                uChanges++;
+            curve[k] = fValue;
+            prefix[k] = uChanges;
+            bNonZero |= fValue != 0.0f;
+        }
+        m_bBendChanCurved[ch] = bNonZero;
+        bAny |= bNonZero;
+    }
+
+    if (bAny)
+        m_pRenderer->SetBendCurves(m_vBendCurves.data());
+    return bAny;
+}
+
+// Routes a note of a bending channel to the ribbon pipeline. Notes whose channel is not bent
+// anywhere along their length take the cheap plain path instead (unbent) or a single shifted
+// quad (constant bend); the rest get a slice count that follows their height on screen.
+bool MainScreen::PushBendRibbonNote(const NoteData& data)
+{
+    constexpr unsigned N = Renderer::BendCurveSamples;
+    const unsigned ch = data.channel & 15u;
+    if (!m_bBendChanCurved[ch] || m_llTimeSpan <= 0)
+        return false;
+
+    const double dSpan = (double)m_llTimeSpan;
+    const double dFrom = min(max((double)data.pos / dSpan, 0.0), 1.0);
+    const double dTo = min(max(((double)data.pos + max((double)data.length, 0.0)) / dSpan, 0.0), 1.0);
+    const unsigned k0 = (unsigned)floor(dFrom * (N - 1));
+    const unsigned k1 = min((unsigned)ceil(dTo * (N - 1)), N - 1);
+
+    unsigned tier = 0;
+    if (m_vBendChangePrefix[ch * N + k1] == m_vBendChangePrefix[ch * N + k0])
+    {
+        if (m_vBendCurves[ch * N + k0] == 0.0f)
+            return false;
+    }
+    else
+    {
+        const double dRows = (dTo - dFrom) * (double)m_fNotesCY;
+        const unsigned uWanted = (unsigned)min(max(ceil(dRows / 3.0), 2.0), (double)(1u << (Renderer::RibbonTierCount - 1)));
+        while ((1u << tier) < uWanted)
+            tier++;
+    }
+    return m_pRenderer->PushRibbonNoteData(data, tier);
+}
+
 void MainScreen::RenderNotes()
 {
+    IB_TRACE(IB_RNOTES);
     const int64_t eventCount = (int64_t)m_vEvents.size();
     const auto& renderViz = Config::GetConfig().GetVizSettings();
     const bool horizontalOnly = renderViz.bHorizontalPianoRoll;
     const bool hasStrip = renderViz.bDualPianoRoll || horizontalOnly;
+
+    // Bent notes are drawn as ribbons straight from the event list. Visual Buffer Notes bakes notes
+    // into cached chunks that cannot follow a bend per note, so frames that have a bend in view
+    // bypass the baked chunks for the main roll (the strip below keeps using them).
+    m_bBendRibbonsFrame = renderViz.bVisualizePitchBends && !horizontalOnly && BuildBendCurves();
 
     if ( m_iEndPos < 0 || m_iStartPos >= eventCount )
     {
@@ -4219,7 +4389,7 @@ void MainScreen::RenderNotes()
                               m_pRenderer->ImageBufferCanRender();
 
     if (!horizontalOnly) {
-        if (bImageBuffer) {
+        if (bImageBuffer && !m_bBendRibbonsFrame) {
             RenderNotesImageBuffer();
         } else {
             for (auto i = m_iEndPos; i >= m_iStartPos; i--) {
@@ -4296,7 +4466,10 @@ NoteData MainScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
 
 void MainScreen::RenderNote(const MIDIChannelEvent pNote)
 {
-    m_pRenderer->PushNoteData(BuildRenderNoteData(pNote));
+    const NoteData data = BuildRenderNoteData(pNote);
+    if (m_bBendRibbonsFrame && PushBendRibbonNote(data))
+        return;
+    m_pRenderer->PushNoteData(data);
 }
 
 NoteData MainScreen::BuildChunkNoteData(const MIDIChannelEvent pNote, long long chunkStart) const
@@ -4325,11 +4498,33 @@ NoteData MainScreen::BuildChunkNoteData(const MIDIChannelEvent pNote, long long 
 
 void MainScreen::RenderNotesImageBuffer()
 {
+    IB_TRACE(IB_NOTESIB);
+    // Interactive move/zoom drags and the 88<->127 key-range transition change the layout every
+    // frame; see the bypass below.
+    const bool bKeysTransitionActive =
+        (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
+        (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
+    const bool bLayoutAnimating = m_bTrackZoom || m_bTrackPos || bKeysTransitionActive;
+
+    // Packed songs are served by the song-wide dense store. Its parameters do not move while the
+    // layout animates (rows follow the window height), so it can be configured on every frame,
+    // from the very first one, before the regular per-window preparation gets started.
+    UpdateDenseStore(true);
+    auto& denseStore = PGFADense::Store::Get();
+    if (m_bDenseStoreServes) {
+        // A continuation window is the same song: keep the cache. The per-window prepared path
+        // and its playback gate do not apply.
+        m_bImageBufferNeedsInvalidate = false;
+        ImageBufferPreparedMarkPrewarmUnavailable(this);
+        denseStore.SetPlayhead(m_llStartTime);
+    } else if (denseStore.HasSong() && !denseStore.HoldsSong(m_MIDI.GetPackedSong().get())) {
+        denseStore.Reset(); // a different song: free the previous one's prepared chunks
+    }
     if (m_bImageBufferNeedsInvalidate) {
         m_pRenderer->ImageBufferInvalidate();
         m_bImageBufferNeedsInvalidate = false;
     }
-    m_pRenderer->ImageBufferSetEventCount((unsigned long long)m_vEvents.size());
+    m_pRenderer->ImageBufferSetEventCount(ImageBufferEventIdentity());
 
     const long long T = m_llTimeSpan;
     if (T <= 0)
@@ -4401,6 +4596,10 @@ void MainScreen::RenderNotesImageBuffer()
     auto BakeChunk = [&](long long k) -> bool {
         if (m_pRenderer->ImageBufferChunkCached(k))
             return true;
+        // Store mode: only chunks the store has prepared are baked. Until then a chunk is drawn
+        // directly from the window, so window-local notes never stay cached past a window swap.
+        if (m_bDenseStoreServes && !denseStore.Ready(k))
+            return false;
 
         CollectChunk(k);
         return m_pRenderer->ImageBufferRenderChunk(k, chunkNotes.data(), (unsigned)chunkNotes.size());
@@ -4413,10 +4612,7 @@ void MainScreen::RenderNotesImageBuffer()
     // warm and a single rebuild happens when the drag commits.
     // The 88<->127 key-range transition does the same thing (white_cx /
     // notes_cy / note_x animate every frame), so bypass during it too.
-    const bool bKeysTransitionActive =
-        (s_fTransitionPhase > 0.001f && s_fTransitionPhase < 0.999f) ||
-        (m_fKeysTransition > 0.001f && m_fKeysTransition < 0.999f);
-    if (m_bTrackZoom || m_bTrackPos || bKeysTransitionActive) {
+    if (bLayoutAnimating) {
         m_bImageBufferDirectCollect = true;
         for (long long k = kFirst; k <= kLast; k++) {
             CollectChunk(k);
@@ -4463,11 +4659,15 @@ void MainScreen::RenderNotesImageBuffer()
 
 void MainScreen::RenderPianoRollStripImageBuffer()
 {
+    IB_TRACE(IB_STRIPIB);
+    if (m_bDenseStoreServes)
+        m_bImageBufferNeedsInvalidate = false; // same song as the previous window (see RenderNotesImageBuffer)
     if (m_bImageBufferNeedsInvalidate) {
         m_pRenderer->ImageBufferInvalidate();
         m_bImageBufferNeedsInvalidate = false;
     }
-    m_pRenderer->ImageBufferSetEventCount((unsigned long long)m_vEvents.size());
+    m_pRenderer->ImageBufferSetEventCount(ImageBufferEventIdentity());
+    auto& denseStore = PGFADense::Store::Get();
     const long long T = m_llTimeSpan;
     if (T <= 0 || m_vEvents.empty()) return;
 
@@ -4496,6 +4696,17 @@ void MainScreen::RenderPianoRollStripImageBuffer()
                     [&](MIDIChannelEvent note, long long chunkStart) { return BuildChunkNoteData(note, chunkStart); });
             }
         };
+        if (m_bDenseStoreServes) {
+            if (auto dense = denseStore.Ready(chunk)) {
+                chunkNotes.assign(dense->begin(), dense->end());
+                return;
+            }
+            chunkNotes.clear();
+            ImageBufferOverlapSkipPrepared() = true;
+            exact(key);
+            ImageBufferOverlapSkipPrepared() = false;
+            return;
+        }
         if (m_bImageBufferDirectCollect) {
             chunkNotes.clear();
             exact(key);
@@ -4507,6 +4718,8 @@ void MainScreen::RenderPianoRollStripImageBuffer()
     auto bake = [&](long long chunk) {
         const long long key = Renderer::ImageBufferStripChunkKey(chunk);
         if (m_pRenderer->ImageBufferChunkCached(key)) return true;
+        if (m_bDenseStoreServes && !denseStore.Ready(chunk))
+            return false; // drawn directly until the store has it (see RenderNotesImageBuffer)
         collect(chunk);
         return m_pRenderer->ImageBufferRenderChunk(key, chunkNotes.data(), (unsigned)chunkNotes.size());
     };
@@ -4590,6 +4803,7 @@ float MainScreen::GetNoteX(int iNote) {
 
 void MainScreen::RenderKeys()
 {
+    IB_TRACE(IB_RKEYS);
     // Work from a sanitized copy of the per-key "last note on" indices. Anything outside the event list is
     // treated as "key up": the old code only special-cased -1, so any other negative or stale index ended
     // in m_vEvents[idx] / GetEventTrack(UINT32_MAX) reading far outside the arrays and crashing mid-playback.
@@ -4887,6 +5101,7 @@ static bool StatsCoveredByUI(Renderer* renderer)
 
 void MainScreen::RenderText()
 {
+    IB_TRACE(IB_RTEXT);
     Config& config = Config::GetConfig();
     VizSettings viz = config.GetVizSettings();
     const bool showNerdStats = viz.bNerdStats && !StatsCoveredByUI(m_pRenderer);

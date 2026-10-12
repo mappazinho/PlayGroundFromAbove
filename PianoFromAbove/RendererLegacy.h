@@ -26,6 +26,7 @@ using Microsoft::WRL::ComPtr;
 enum class Pipeline {
     Rect,
     Note,
+    NoteRibbon,
     Background,
 };
 
@@ -194,8 +195,27 @@ public:
 
     inline void PushNoteData(NoteData data) { m_vNotesIntermediate.push_back(data); };
     inline void PushPianoRollStripNoteData(NoteData data) { m_vPianoRollStripNotesIntermediate.push_back(data); };
+
+    // Pitch-bend ribbons: notes whose shape follows a per-channel bend curve instead of sliding
+    // as a rigid bar. The curve holds each channel's bend (in semitones) sampled over the
+    // visible window, [channel][BendCurveSamples], now -> now + timespan. A ribbon note is cut into
+    // 1 << tier slices (tier 0..RibbonTierCount-1); the shader reads the slice count back from
+    // the channel byte, so channel is stored as chan | (tier << 4).
+    static constexpr unsigned BendCurveSamples = 1024;
+    static constexpr unsigned RibbonTierCount = 8;
+    static constexpr unsigned RibbonNoteCapacity = 262144;
+    void SetBendCurves(const float* curves) { memcpy(m_BendCurves, curves, sizeof(m_BendCurves)); m_bBendCurvesValid = true; }
+    // false = over capacity, the caller draws the note through the plain path instead
+    bool PushRibbonNoteData(NoteData data, unsigned tier) {
+        if (tier >= RibbonTierCount || !m_bBendCurvesValid || m_uRibbonNoteCount >= RibbonNoteCapacity)
+            return false;
+        data.channel = (uint8_t)((data.channel & 15u) | (tier << 4));
+        m_vRibbonNotes[tier].push_back(data);
+        m_uRibbonNoteCount++;
+        return true;
+    }
     float GetDualRollTimeSpan(float normalTimeSpan, float normalRollPixels) const;
-    size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size(); };
+    size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size() + m_uRibbonNoteCount; };
     void SplitRect() { m_iRectSplit = (int)m_vRectsIntermediate.size(); }
 
     bool LoadBackgroundBitmap(std::wstring path);
@@ -320,6 +340,10 @@ protected:
     std::vector<RectVertex> m_vRectsIntermediate;
     std::vector<NoteData> m_vNotesIntermediate;
     std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
+    std::vector<NoteData> m_vRibbonNotes[RibbonTierCount];
+    unsigned m_uRibbonNoteCount = 0;
+    float m_BendCurves[16 * BendCurveSamples] = {};
+    bool m_bBendCurvesValid = false;
     int m_iRectSplit = -1;
 
     // Image buffer shared state (backend keeps the GPU resources)
@@ -430,6 +454,7 @@ private:
     ComPtr<ID3D12PipelineState> m_pRectPipelineState;
     ComPtr<ID3D12RootSignature> m_pNoteRootSignature;
     ComPtr<ID3D12PipelineState> m_pNotePipelineState;
+    ComPtr<ID3D12PipelineState> m_pRibbonPipelineState; // shares the note root signature (+ bend curve SRV at t4)
 ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12PipelineState> m_pBackgroundPipelineState;
     ComPtr<ID3D12RootSignature> m_pChunkQuadRootSignature;
@@ -446,6 +471,7 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pVertexBuffers[FrameCount];
     D3D12_VERTEX_BUFFER_VIEW m_VertexBufferViews[FrameCount];
     ComPtr<ID3D12Resource> m_pNoteBuffers[FrameCount];
+    ComPtr<ID3D12Resource> m_pRibbonBuffers[FrameCount]; // per frame: bend curve, then ribbon notes grouped by tier
     ComPtr<ID3D12Resource> m_pGenericUpload;
     ComPtr<ID3D12Resource> m_pFixedBuffer;
     ComPtr<ID3D12Resource> m_pTrackColorBuffer;

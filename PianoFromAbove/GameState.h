@@ -272,6 +272,16 @@ public:
     // huge store and invalidates GPU caches; used after note-speed changes.
     void RequestDenseRegeneration() { m_bImageBufferNeedsInvalidate = true; }
 
+    // Packed songs: the image buffer is served by the song-wide dense store (ImageBufferDenseStore.h)
+    // instead of the per-window prepared path. False for non-packed songs and for settings the store
+    // does not model (tick mode, corruption, hidden channels).
+    bool DenseStoreServes() const { return m_bDenseStoreServes; }
+    // "Wait for dense buffers" gate in store mode: true while playback must still wait (every chunk
+    // of the song prepared, and the chunks at the playhead baked). Fills `why` for the log.
+    bool DenseStoreGateHold(char* why, size_t cch) const;
+    // Progress of the song-wide preparation for the on-screen bar; false when not in store mode.
+    bool DenseStoreProgress(size_t& done, size_t& total) const;
+
     void ToggleMuted( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bMuted =
                                                   !m_vTrackSettings[iTrack].aChannels[iChannel].bMuted; }
     void ToggleHidden( int iTrack, int iChannel ) { m_vTrackSettings[iTrack].aChannels[iChannel].bHidden =
@@ -392,6 +402,7 @@ void RenderText();
     std::atomic<int> m_iPackedState{ 0 }; // 0 idle, 1 building, 2 next screen ready, 3 failed
     MainScreen* m_pPackedNext = nullptr;
     long long m_llPendingJumpUs = LLONG_MIN; // set on a continuation screen: seek here on its first frame
+    bool m_bContinuationLanding = false;     // inside that seek: playback continues, it is not a user seek
     bool m_bPackedHold = false;              // playhead is outside the expanded window: time stands still until the next one is in
     std::atomic<long long> m_llPackedBuildMs{ 1500 };
     long long m_llPackedLastTriggerUs = LLONG_MIN;
@@ -445,6 +456,20 @@ void RenderText();
     ChannelSettings m_csKBRed, m_csKBWhite, m_csKBSharp, m_csKBBackground;
     vector< TrackSettings > m_vTrackSettings;
     float m_pBends[16] = {};
+
+    // Pitch-bend ribbons ("Visualize Pitch Bends"): the bend history of each channel, and the
+    // bend curves sampled over the visible window that are handed to the renderer every frame.
+    struct BendPoint { long long time; int idx; }; // idx: row in m_vEvents
+    vector<BendPoint> m_vBendTimeline[16];
+    size_t m_uBendTimelineKey = SIZE_MAX;
+    vector<float> m_vBendCurves;            // [16][Renderer::BendCurveSamples], semitones
+    vector<uint32_t> m_vBendChangePrefix;   // running count of curve changes, same layout
+    bool m_bBendChanCurved[16] = {};        // channel has a non-zero bend somewhere in the window
+    bool m_bBendRibbonsFrame = false;       // this frame's notes may be drawn as ribbons
+    void BuildBendTimeline();
+    bool BuildBendCurves();
+    bool PushBendRibbonNote(const NoteData& data);
+
     deque<tuple<long long, long long>> m_dNPSNotes;
     deque<long long> m_dNPSHistory;
     long long m_llMaxNPS = 1;
@@ -458,6 +483,10 @@ void RenderText();
     // Set while the image buffer is bypassed (key-range transition, zoom/position drag): chunk notes
     // are collected exactly and drawn directly, without the prepared store or multipass staging.
     bool m_bImageBufferDirectCollect = false;
+    // Set each image-buffer frame: the song-wide dense store prepares this song's chunks.
+    bool m_bDenseStoreServes = false;
+    bool UpdateDenseStore(bool bConfigure);
+    unsigned long long ImageBufferEventIdentity() const;
     std::wstring m_sCurBackground;
     bool m_bBackgroundLoaded;
     float m_fLastBGBlur = -1.0f;

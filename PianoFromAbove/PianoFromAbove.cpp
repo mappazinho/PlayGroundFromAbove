@@ -1188,6 +1188,14 @@ static DWORD GameThreadBody( LPVOID lpParameter )
             auto tRender = std::chrono::steady_clock::now();
             pGameState->Render();
             auto tEnd = std::chrono::steady_clock::now();
+#ifdef PGFA_IMGBUF_TRACE
+            {
+                auto& ibt = PGFAIbTraceGet();
+                ibt.ms[IB_LOGIC] += std::chrono::duration<double, std::milli>(tRender - tLogic).count(); ibt.calls[IB_LOGIC]++;
+                ibt.ms[IB_RENDER] += std::chrono::duration<double, std::milli>(tEnd - tRender).count(); ibt.calls[IB_RENDER]++;
+                PGFAIbTraceFlush(std::chrono::duration<double, std::milli>(tEnd - tLogic).count());
+            }
+#endif
             static int s_frameLog = 0;
             static double s_logicMs = 0.0, s_renderMs = 0.0;
             s_logicMs += std::chrono::duration<double, std::milli>(tRender - tLogic).count();

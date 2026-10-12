@@ -310,7 +310,7 @@ bool MIDI::LoadPackedWindow( long long llStartUs, uint64_t iMaxNotes, long long 
         const PGFAPacked::PackedSong &ps = *m_pPacked;
         const uint32_t t0 = PGFAPacked::TickAtUs( ps, llStartUs );
         const uint32_t minTicks = PGFAPacked::TickAtUs( ps, llStartUs + llMinSpanUs ) - t0;
-        const uint32_t t1 = PGFAPacked::WindowEnd( ps, t0, iMaxNotes, minTicks );
+        const uint32_t t1 = PGFAPacked::WindowEnd( ps, t0, iMaxNotes, minTicks, iMaxNotes + iMaxNotes / 2 );
         PGFAPacked::SynthStats ss;
         std::vector< uint8_t > smf = PGFAPacked::SynthWindow( ps, t0, t1, &ss );
         PRE_DbgLog("PACKED window: ticks [%u,%u) = %.1fs..%.1fs, %llu notes, SMF %.1f MB, synth %.0f ms",

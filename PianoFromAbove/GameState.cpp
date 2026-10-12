@@ -25,6 +25,7 @@
 #include "ImageBufferOverlapIndex.h"
 #include "ImageBufferPreparedChunks.h"
 #include "ImageBufferGpuPins.h"
+#include "ImageBufferDenseStore.h"
 
 static constexpr size_t ImageBufferFullPreparedMaxEvents = 64000000;
 static constexpr size_t ImageBufferFullPreparedMaxNotes = 32000000;
@@ -559,6 +560,90 @@ static std::vector<long long> ImageBufferSelectHugePrewarmChunks(
     return result;
 }
 
+// --- Song-wide dense store (packed songs) -------------------------------------------------------
+
+bool MainScreen::UpdateDenseStore(bool bConfigure)
+{
+    m_bDenseStoreServes = false;
+    if (!m_MIDI.IsPacked() || IsFreePlay() || m_bTickMode || m_llTimeSpan <= 0 ||
+        GetCorruptorAmount() > 0.0f)
+        return false;
+    // Hidden channels would still occlude visible notes in the compacted chunks.
+    for (const auto& track : m_vTrackSettings)
+        for (int c = 0; c < 16; ++c)
+            if (track.aChannels[c].bHidden)
+                return false;
+    const auto song = m_MIDI.GetPackedSong();
+    if (!song)
+        return false;
+
+    auto& store = PGFADense::Store::Get();
+    if (!bConfigure) {
+        m_bDenseStoreServes = store.ServesSong(song.get(), m_llTimeSpan);
+        return m_bDenseStoreServes;
+    }
+    PGFADense::Params params;
+    params.timeSpan = m_llTimeSpan;
+    // Compact at the full window height rather than the notes area height: the notes area changes
+    // with the keyboard (key-range transition, keyboard toggle), and any change of rows prepares the
+    // whole song again. Finer rows than the chunk texture only merge less; positions are unaffected.
+    const int fullRows = m_pRenderer ? m_pRenderer->GetBufferHeight() : (int)std::ceil(std::fabs(m_fNotesCY));
+    params.rows = (std::min)((std::max)(fullRows, 64), ImageBufferPreparedMaxRows);
+    params.trackCount = m_vTrackSettings.size();
+    store.Configure(song, params, m_llStartTime);
+    m_bDenseStoreServes = store.ActiveFor(song.get(), params);
+    return m_bDenseStoreServes;
+}
+
+// Image-buffer cache identity of the notes source. Store-served chunks are the same in every
+// window of a packed song, so the cache survives window swaps; otherwise any change of the event
+// set starts the cache over.
+unsigned long long MainScreen::ImageBufferEventIdentity() const
+{
+    if (m_bDenseStoreServes) {
+        const auto song = m_MIDI.GetPackedSong();
+        return ImageBufferPreparedMix((uint64_t)(uintptr_t)song.get()) ^ 0x5eed5eedull;
+    }
+    return (unsigned long long)m_vEvents.size();
+}
+
+bool MainScreen::DenseStoreProgress(size_t& done, size_t& total) const
+{
+    if (!m_bDenseStoreServes)
+        return false;
+    const PGFADense::Progress p = PGFADense::Store::Get().GetProgress();
+    done = p.done;
+    total = p.total;
+    return p.active;
+}
+
+bool MainScreen::DenseStoreGateHold(char* why, size_t cch) const
+{
+    if (!m_bDenseStoreServes)
+        return false;
+    auto& store = PGFADense::Store::Get();
+    const PGFADense::Progress p = store.GetProgress();
+    if (!p.Complete()) {
+        sprintf_s(why, cch, "dense:hold(prepare %zu/%zu)", p.done, p.total);
+        return true;
+    }
+    // Everything is prepared; also wait until the chunks at the playhead are textures, so the first
+    // frames of playback are not drawn while they bake.
+    if (!m_pRenderer || m_llTimeSpan <= 0)
+        return false;
+    const long long T = m_llTimeSpan;
+    long long first = m_llStartTime / T;
+    if (m_llStartTime < 0 && m_llStartTime % T) --first;
+    for (long long k = first; k <= first + 2; ++k) {
+        const auto notes = store.Ready(k);
+        if (notes && !notes->empty() && !m_pRenderer->ImageBufferChunkCached(k)) {
+            sprintf_s(why, cch, "dense:hold(bake chunk %lld)", k);
+            return true;
+        }
+    }
+    return false;
+}
+
 static size_t CountImageBufferPrewarmCached(
     Renderer* renderer, const std::vector<long long>& chunks)
 {
@@ -579,6 +664,7 @@ static void UpdateImageBufferPrewarmGpuProgress(
     bool tickMode,
     long long tStart = 0)
 {
+    IB_TRACE(IB_PROGRESS);
     if (!owner || !renderer || !ImageBufferPreparedGetWaitBeforePlayback())
         return;
 
@@ -723,7 +809,23 @@ static void DrawImageBufferPrewarmProgress(
     if (!playRequested)
         return;
 
-    if (!cpu.initialized && !hugeMode) {
+    // Packed song served by the song-wide store: show its progress instead.
+    bool denseStore = false;
+    if (const MainScreen* ms = dynamic_cast<const MainScreen*>(g_pGameState); ms && ms->DenseStoreServes()) {
+        size_t storeDone = 0, storeTotal = 0;
+        ms->DenseStoreProgress(storeDone, storeTotal);
+        if (storeDone >= storeTotal)
+            return; // only the short bake of the playhead chunks is left
+        denseStore = true;
+        done = storeDone;
+        total = storeTotal;
+        failed = 0;
+        gpuStage = false;
+    }
+
+    if (denseStore) {
+        // progress is already set
+    } else if (!cpu.initialized && !hugeMode) {
         initializing = true;
         done = 0;
         total = 1;
@@ -772,6 +874,8 @@ static void DrawImageBufferPrewarmProgress(
         } else {
             sprintf_s(text, "Initializing dense visual buffers...");
         }
+    } else if (denseStore) {
+        sprintf_s(text, "Preparing visual buffers for the whole song  %zu / %zu", done, total);
     } else if (gpuStage) {
             sprintf_s(text, "Prewarming dense visual buffers  %zu / %zu", done, total);
     } else if (failed > 0) {
@@ -999,6 +1103,19 @@ static void ImageBufferDriveHugePrewarm(
             } \
         } \
     }; \
+    /* Packed song: chunks come from the song-wide dense store. One that is not prepared yet is \
+       collected exactly from the window, without building the per-window prepared source. */ \
+    if (m_bDenseStoreServes) { \
+        if (auto imageBufferDense = PGFADense::Store::Get().Ready((k))) { \
+            chunkNotes.assign(imageBufferDense->begin(), imageBufferDense->end()); \
+            return; \
+        } \
+        chunkNotes.clear(); \
+        ImageBufferOverlapSkipPrepared() = true; \
+        ImageBufferExactCollector((k)); \
+        ImageBufferOverlapSkipPrepared() = false; \
+        return; \
+    } \
     /* Image buffer bypassed: the layout (notes_cy, so the prepared signature) changes every frame, and \
        going through the prepared store would discard it and re-queue the whole song every frame. */ \
     if (m_bImageBufferDirectCollect) { \
@@ -1035,8 +1152,10 @@ static void ImageBufferDriveHugePrewarm(
 ([&](auto* imageBufferPrewarmSelf) { \
     using ImageBufferPrewarmSelfT = std::remove_pointer_t<decltype(imageBufferPrewarmSelf)>; \
     if constexpr (std::is_same_v<ImageBufferPrewarmSelfT, MainScreen>) { \
+        IB_TRACE(IB_PREWARM); \
         const bool imageBufferPrewarmActive = !imageBufferPrewarmSelf->m_bDiscarded && \
             !imageBufferPrewarmSelf->IsFreePlay() && \
+            !imageBufferPrewarmSelf->m_bDenseStoreServes && /* the store has its own gate */ \
             ImageBufferPreparedGetWaitBeforePlayback() && \
             Config::GetConfig().GetVizSettings().bImageBufferNotes && \
             !g_bVideoRendering && \
@@ -1472,6 +1591,23 @@ BOOL ImageBufferPrewarmPlaybackHold()
             s_ImageBufferPrewarmGpu.chunks.clear();
             TrackGateState(9, b);
         }
+    }
+
+    if (screen->DenseStoreServes()) {
+        // Packed song: the song-wide store replaces the per-window preparation. Hold until every
+        // chunk of the song is prepared and the chunks at the playhead are baked.
+        char why[96];
+        if (screen->DenseStoreGateHold(why, sizeof(why))) {
+            TrackGateState(13, why);
+            return TRUE;
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_ImageBufferPrewarmGpuMutex);
+            s_ImageBufferPrewarmGpu.playRequested = false;
+        }
+        ImageBufferPreparedCancelPlaybackGate();
+        TrackGateState(8, "prewarm:released(dense store)");
+        return FALSE;
     }
 
     if (ImageBufferPreparedShouldHoldPlayback(screen)) {
