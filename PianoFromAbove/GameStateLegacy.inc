@@ -3909,6 +3909,15 @@ GameState::GameError MainScreen::Render()
     {
         DWORD pressedKeys[128] = {};
         DWORD ribbonColors[128] = {};
+        DWORD ribbonDarkColors[128] = {};
+        const VizSettings& stripViz = Config::GetConfig().GetVizSettings();
+        // Same ribbon colors as the main keyboard (custom color or the red of the keyboard theme)
+        if (stripViz.bRibbonCustomColor) {
+            const DWORD base = stripViz.dwRibbonBaseColor & 0x00FFFFFF;
+            const DWORD dark = (((base >> 16) & 0xFF) * 3 / 4) << 16 | (((base >> 8) & 0xFF) * 3 / 4) << 8 | ((base & 0xFF) * 3 / 4);
+            m_pRenderer->SetStripRibbonBase(dark, base);
+        } else
+            m_pRenderer->SetStripRibbonBase(m_csKBRed.iDarkRGB, m_csKBRed.iPrimaryRGB);
         for (int i = 0; i < 128; i++) {
             if (m_pNoteState[i] != -1) {
                 // bounds-checked on both ends: a stale or corrupted index must not read outside m_vEvents
@@ -3919,11 +3928,14 @@ GameState::GameError MainScreen::Render()
                     const int iChannel = m_MIDI.GetEventChannel(pEvent);
                     const ChannelSettings &cs = m_vTrackSettings[iTrack].aChannels[iChannel];
                     pressedKeys[i] = cs.iPrimaryRGB;
-                    ribbonColors[i] = cs.iPrimaryRGB;
+                    if (stripViz.bColoredRibbon) {
+                        ribbonColors[i] = cs.iPrimaryRGB;
+                        ribbonDarkColors[i] = cs.iDarkRGB;
+                    }
                 }
             }
         }
-        m_pRenderer->SetStripPressedKeys(pressedKeys, ribbonColors);
+        m_pRenderer->SetStripPressedKeys(pressedKeys, ribbonColors, ribbonDarkColors);
     }
 
     m_pRenderer->DrawPianoRollStripKeyboard();

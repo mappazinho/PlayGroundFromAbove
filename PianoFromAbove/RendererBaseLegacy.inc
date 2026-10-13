@@ -2107,10 +2107,21 @@ void Renderer::DrawPianoRollStripKeyboard() {
 
     float gapHalf = floor(keyGap / 2.0f + 0.5f);
 
-    float ribbonW = max(2.0f, floor(kbWidth * 0.08f + 0.5f));
-    float ribbonX = kbWidth + 1.0f;
-
-    dl->AddRectFilled(ImVec2(ribbonX, stripTop), ImVec2(ribbonX + ribbonW, stripTop + stripH), bgDark);
+    // Same layout as the main keyboard turned on its side: keys, a thin spacer, the ribbon band
+    // (bright next to the keys, dark away from them). The band sits right
+    // on the tips of the black keys (it covers the white keys' ends), like the main ribbon above them.
+    const float spacerW = 2.0f;
+    const float ribbonW = max(4.0f, floor(kbWidth * 0.15f + 0.5f));
+    const float blackEnd = (kbWidth + kbWidth * 0.6f) * 0.5f; // right edge of the black keys
+    const float ribbonX = blackEnd + spacerW;
+    struct RibbonSegment { float y0, y1; int note; };
+    std::vector<RibbonSegment> segments; // pressed keys' ribbon pieces, drawn over the band
+    const bool hasRibbonBase = m_stripRibbonBasePrimary != 0 || m_stripRibbonBaseDark != 0;
+    const ImU32 baseDark = toImCol(m_stripRibbonBaseDark);
+    const ImU32 basePrim = toImCol(m_stripRibbonBasePrimary);
+    auto ribbonGradient = [&](float y0, float y1, ImU32 prim, ImU32 dark) {
+        dl->AddRectFilledMultiColor(ImVec2(ribbonX, y0), ImVec2(ribbonX + ribbonW, y1), prim, dark, dark, prim);
+    };
 
     dl->AddRectFilled(ImVec2(0, stripTop), ImVec2(kbWidth, stripTop + stripH), bgPrim);
 
@@ -2129,12 +2140,16 @@ void Renderer::DrawPianoRollStripKeyboard() {
         if (pressed) {
             ImU32 pColor = toImCol(m_stripPressedKeys[note]);
             dl->AddRectFilled(ImVec2(kx, ky), ImVec2(kx + kw, ky + kh), pColor);
-            ImU32 rColor = toImCol(m_stripRibbonColors[note]);
-            dl->AddRectFilled(ImVec2(ribbonX, ky), ImVec2(ribbonX + ribbonW, ky + kh), rColor);
+            if (m_stripRibbonColors[note] != 0)
+                segments.push_back({ ky, ky + kh, note });
         } else {
             dl->AddRectFilled(ImVec2(kx, ky), ImVec2(kx + kw, ky + kh * 0.55f), wDark);
-            dl->AddRectFilled(ImVec2(kx, ky + kh * 0.55f), ImVec2(kx + kw, ky + kh * 0.55f + 2.0f), bgDark);
-            dl->AddRectFilled(ImVec2(kx, ky + kh * 0.55f + 2.0f), ImVec2(kx + kw, ky + kh), wVeryDark);
+            // At small key heights the 2px separator is taller than the rest of the key; keep it inside
+            // the key so the last key doesn't stick out past the ribbon.
+            const float sepEnd = (std::min)(ky + kh * 0.55f + 2.0f, ky + kh);
+            dl->AddRectFilled(ImVec2(kx, ky + kh * 0.55f), ImVec2(kx + kw, sepEnd), bgDark);
+            if (sepEnd < ky + kh)
+                dl->AddRectFilled(ImVec2(kx, sepEnd), ImVec2(kx + kw, ky + kh), wVeryDark);
         }
     }
 
@@ -2157,12 +2172,22 @@ void Renderer::DrawPianoRollStripKeyboard() {
         if (pressed) {
             ImU32 pColor = toImCol(m_stripPressedKeys[note]);
             dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + sw, sy + sH), pColor);
-            ImU32 rColor = toImCol(m_stripRibbonColors[note]);
-            dl->AddRectFilled(ImVec2(ribbonX, sy), ImVec2(ribbonX + ribbonW, sy + sH), rColor);
+            if (m_stripRibbonColors[note] != 0)
+                segments.push_back({ sy, sy + sH, note });
         } else {
             dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + sw, sy + sTopH), sDark);
             dl->AddRectFilled(ImVec2(sx, sy + sTopH), ImVec2(sx + sw, sy + sTopH + 1.0f), sPrim);
             dl->AddRectFilled(ImVec2(sx, sy + sTopH + 1.0f), ImVec2(sx + sw, sy + sH), sVeryDark);
         }
     }
+
+    // Spacer and ribbon band go over the keys' ends, then the pressed keys' pieces over the band.
+    dl->AddRectFilled(ImVec2(blackEnd, stripTop), ImVec2(ribbonX, stripTop + stripH), bgDark);
+    if (hasRibbonBase)
+        ribbonGradient(stripTop, stripTop + stripH, basePrim, baseDark);
+    else
+        dl->AddRectFilled(ImVec2(ribbonX, stripTop), ImVec2(ribbonX + ribbonW, stripTop + stripH), bgDark);
+
+    for (const RibbonSegment& seg : segments)
+        ribbonGradient(seg.y0, seg.y1, toImCol(m_stripRibbonColors[seg.note]), toImCol(m_stripRibbonDarkColors[seg.note]));
 }

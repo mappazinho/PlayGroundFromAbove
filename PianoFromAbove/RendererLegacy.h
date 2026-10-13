@@ -239,9 +239,13 @@ public:
         m_stripKBSharp = sharp; m_stripKBSharpDark = sharpDark; m_stripKBSharpVeryDark = sharpVeryDark;
         m_stripKBBackground = background; m_stripKBBackgroundDark = backgroundDark;
     }
-    void SetStripPressedKeys(const DWORD colors[128], const DWORD ribbonColors[128]) {
+    // The ribbon band beside the dual roll keyboard: base gradient colors, and for every pressed key
+    // its own segment (primary at the keys fading to dark; 0 = no segment).
+    void SetStripRibbonBase(DWORD dark, DWORD primary) { m_stripRibbonBaseDark = dark; m_stripRibbonBasePrimary = primary; }
+    void SetStripPressedKeys(const DWORD colors[128], const DWORD ribbonColors[128], const DWORD ribbonDarkColors[128]) {
         memcpy(m_stripPressedKeys, colors, sizeof(m_stripPressedKeys));
         memcpy(m_stripRibbonColors, ribbonColors, sizeof(m_stripRibbonColors));
+        memcpy(m_stripRibbonDarkColors, ribbonDarkColors, sizeof(m_stripRibbonDarkColors));
     }
     ImTextureID GetBlurTextureID() const { return m_BlurTextureID; }
     // 12px UI font baked at its own size. Text drawn at a size the atlas doesn't contain is a bilinearly
@@ -391,6 +395,8 @@ protected:
     DWORD m_stripKBBackground = 0, m_stripKBBackgroundDark = 0;
     DWORD m_stripPressedKeys[128] = {};
     DWORD m_stripRibbonColors[128] = {};
+    DWORD m_stripRibbonDarkColors[128] = {};
+    DWORD m_stripRibbonBaseDark = 0, m_stripRibbonBasePrimary = 0;
 
     ComPtr<IWICBitmapSource> m_pUnscaledBackground;
     float m_fBGBlurSigma = 0.0f;
