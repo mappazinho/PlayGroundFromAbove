@@ -1909,7 +1909,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImVec2((wpos.x + wsize.x) / bw, (wpos.y + wsize.y) / bh));
                 ImGui::GetWindowDrawList()->AddRectFilled(wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y), 0x80000000);
             }
-            const char* desc = "placeholder";
+            const char* desc = "Loading...";
             switch (g_LoadingProgress.stage) {
             case MIDILoadingProgress::Stage::CopyToMem: desc = "Copying MIDI into memory..."; break;
             case MIDILoadingProgress::Stage::Decompress: desc = "Decompressing..."; break;
@@ -1917,7 +1917,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             case MIDILoadingProgress::Stage::ConnectNotes: desc = "Connecting notes..."; break;
             case MIDILoadingProgress::Stage::SortEvents: desc = "Sorting events..."; break;
             case MIDILoadingProgress::Stage::Finalize: desc = "Finalizing..."; break;
-            case MIDILoadingProgress::Stage::Done: g_bShowLoading = false; break;
+            case MIDILoadingProgress::Stage::Done: desc = "Done"; g_bShowLoading = false; break;
             }
             ImGui::Text("%s", desc);
             auto progLoaded = g_LoadingProgress.progress.load();

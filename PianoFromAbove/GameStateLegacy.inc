@@ -2345,6 +2345,10 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
         // the memory peak and throws bad_alloc; PostProcess's push_back doubling
         m_MIDI.PostProcess(m_vEvents, &m_vProgramChange, &m_vMetaEvents, &m_vTempo, &m_vSignature, &m_vMarkers);
         m_MIDI.ApplyPackedSongInfo();
+        // Sorting is over; what follows (event map, note statistics, ...) is the last stretch of the load.
+        g_LoadingProgress.stage = MIDILoadingProgress::Stage::Finalize;
+        g_LoadingProgress.progress = 0;
+        g_LoadingProgress.max = 0;
         if (!m_vEvents.empty())
         {
             size_t aProbe[] = { 0, 1, 10, 100, 1000, 10000, 100000, 1000000, (size_t)m_vEvents.size() / 16,
