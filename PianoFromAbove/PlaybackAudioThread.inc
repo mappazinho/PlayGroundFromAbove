@@ -357,6 +357,7 @@ static long long PGFAClampSongTime(long long value, long long lo, long long hi)
 
 MainScreen::~MainScreen()
 {
+    IB_TRACE(IB_SCREENDTOR);
     StopPlaybackAudioThread();
     if (m_PackedBuilder.joinable())
         m_PackedBuilder.join();
@@ -366,6 +367,7 @@ MainScreen::~MainScreen()
 
 void MainScreen::StartPlaybackAudioThread()
 {
+    IB_TRACE(IB_AUDIOSTART);
     if (IsFreePlay() || m_PlaybackAudioThread.joinable())
         return;
     m_bPlaybackAudioExit.store(false, std::memory_order_release);
@@ -378,6 +380,7 @@ void MainScreen::StartPlaybackAudioThread()
 
 void MainScreen::StopPlaybackAudioThread()
 {
+    IB_TRACE(IB_AUDIOSTOP);
     m_bPlaybackAudioExit.store(true, std::memory_order_release);
     if (m_PlaybackAudioThread.joinable() && m_PlaybackAudioThread.get_id() != std::this_thread::get_id())
         m_PlaybackAudioThread.join();
@@ -954,6 +957,7 @@ GameState::GameError MainScreen::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 // thread - exactly what loading a file does - and swapped in through the normal state change.
 void MainScreen::PackedPump()
 {
+    IB_TRACE(IB_PACKEDPUMP);
     if (!m_MIDI.IsPacked() || IsFreePlay())
         return;
 
@@ -973,24 +977,35 @@ void MainScreen::PackedPump()
             }
         }
     }
+    const long long songEnd = m_MIDI.PackedSongEndUs();
+    const long long wStart = m_MIDI.PackedWindowStartUs();
+    const long long wEnd = m_MIDI.PackedWindowEndUs();
+    const long long t = m_llStartTime;
+    const long long spanUs = (long long)(3.0 * Config::GetConfig().GetPlaybackSettings().GetNSpeed() * 1e6);
+    // Song time that passes while one window builds (playback keeps going meanwhile).
+    const double speed = (std::max)(0.05, m_dSpeed);
+    const long long buildUs = (long long)(1000.0 * (double)m_llPackedBuildMs.load(std::memory_order_relaxed) * speed);
+    const long long aheadUs = 1000000 + buildUs + buildUs / 2;
+
+    const bool outside = (wStart > 0 && t < wStart) || (t >= wEnd && wEnd < songEnd);
+    // The song-wide dense store draws the visible chunks whatever window is loaded. When it has
+    // them, running past the window does not freeze time: only that stretch's MIDI output is lost.
+    bool storeCovers = false;
+    if (m_bDenseStoreServes && m_llTimeSpan > 0) {
+        storeCovers = true;
+        for (long long k = t / m_llTimeSpan; k <= (t + m_llTimeSpan) / m_llTimeSpan && storeCovers; ++k)
+            storeCovers = (bool)PGFADense::Store::Get().Ready(k);
+    }
+    m_bPackedHold = outside && !storeCovers;
+
     const int st = m_iPackedState.load(std::memory_order_acquire);
     if (st == 2 || st == 3) {
         if (m_PackedBuilder.joinable())
             m_PackedBuilder.join();
-        m_iPackedState.store(0, std::memory_order_release);
         if (st == 2 && m_pPackedNext) {
-            MainScreen* next = m_pPackedNext;
-            m_pPackedNext = nullptr;
-            next->m_llPendingJumpUs = m_llStartTime;
-            next->m_fKeysTransition = m_fKeysTransition;
-            if (next->m_vTrackSettings.size() == m_vTrackSettings.size())
-                next->m_vTrackSettings = m_vTrackSettings;
-            m_bPackedHold = false;
-            m_pNextState = next;
-            char b[128];
-            sprintf_s(b, "packed:swap at %.3fs", (double)m_llStartTime / 1e6);
-            HeartbeatLog(b);
+            m_iPackedState.store(4, std::memory_order_release); // built; swap once the playhead reaches it
         } else {
+            m_iPackedState.store(0, std::memory_order_release);
             HeartbeatLog("packed:build failed");
             m_ullPackedRetryAt = GetTickCount64() + 1000; // back off for a moment
         }
@@ -998,17 +1013,34 @@ void MainScreen::PackedPump()
     }
     if (st == 1)
         return;
+    if (st == 4) {
+        MainScreen* next = m_pPackedNext;
+        const long long nStart = next->m_MIDI.PackedWindowStartUs();
+        const long long nEnd = next->m_MIDI.PackedWindowEndUs();
+        if (t >= nStart && (t < nEnd || nEnd >= songEnd)) {
+            m_pPackedNext = nullptr;
+            m_iPackedState.store(0, std::memory_order_release);
+            next->m_llPendingJumpUs = m_llStartTime;
+            next->m_fKeysTransition = m_fKeysTransition;
+            if (next->m_vTrackSettings.size() == m_vTrackSettings.size())
+                next->m_vTrackSettings = m_vTrackSettings;
+            m_bPackedHold = false;
+            m_pNextState = next;
+            char b[160];
+            sprintf_s(b, "packed:swap at %.3fs window=[%.3f,%.3f]", (double)m_llStartTime / 1e6, (double)nStart / 1e6, (double)nEnd / 1e6);
+            HeartbeatLog(b);
+            return;
+        }
+        if (t < nStart && (!outside || nStart - t <= aheadUs + spanUs))
+            return; // the playhead has not reached it yet (also when it was aimed ahead of the playhead)
+        // A seek left both windows behind: drop the prepared one and build for the new position.
+        HeartbeatLog("packed:next window stale, rebuilding");
+        delete next;
+        m_pPackedNext = nullptr;
+        m_iPackedState.store(0, std::memory_order_release);
+    }
 
-    const long long songEnd = m_MIDI.PackedSongEndUs();
-    const long long wStart = m_MIDI.PackedWindowStartUs();
-    const long long wEnd = m_MIDI.PackedWindowEndUs();
-    const long long t = m_llStartTime;
-    const long long spanUs = (long long)(3.0 * Config::GetConfig().GetPlaybackSettings().GetNSpeed() * 1e6);
-    const long long aheadUs = 1500000 + 2 * 1000 * m_llPackedBuildMs.load(std::memory_order_relaxed);
-
-    const bool outside = (wStart > 0 && t < wStart) || (t >= wEnd && wEnd < songEnd);
     const bool nearEnd = wEnd < songEnd && t + spanUs + aheadUs > wEnd;
-    m_bPackedHold = outside;
     if (!outside && !nearEnd)
         return;
     if (GetTickCount64() < m_ullPackedRetryAt)
@@ -1017,8 +1049,17 @@ void MainScreen::PackedPump()
     PGFAPacked::Continuation cont;
     cont.active = true;
     cont.song = m_MIDI.GetPackedSong();
-    cont.startUs = (std::max)(0LL, t);
-    cont.minSpanUs = spanUs + 3 * aheadUs + 2000000;
+    if (outside) {
+        // Aim at where the playhead will be when the build is done if it keeps moving.
+        cont.startUs = (std::max)(0LL, storeCovers ? t + buildUs + buildUs / 4 : t);
+    } else {
+        // Contiguous: the next window starts one visible span before this one ends, so the swap
+        // happens with the whole view already inside it.
+        cont.startUs = (std::max)((std::max)(0LL, t), wEnd - spanUs - 500000);
+    }
+    // Long enough to play while the following window builds; the note ceiling in WindowEnd keeps
+    // dense passages from turning this into a window that takes longer to build than to play.
+    cont.minSpanUs = spanUs + aheadUs;
     {
         char aEnv[32] = {};
         if (GetEnvironmentVariableA("PGFA_PACKED_NOTES", aEnv, sizeof(aEnv)) > 0)
@@ -1028,7 +1069,8 @@ void MainScreen::PackedPump()
     const State mode = m_eGameMode;
     {
         char b[160];
-        sprintf_s(b, "packed:build start t=%.3fs window=[%.3f,%.3f] outside=%d", (double)t / 1e6, (double)wStart / 1e6, (double)wEnd / 1e6, (int)outside);
+        sprintf_s(b, "packed:build start t=%.3fs from=%.3fs window=[%.3f,%.3f] outside=%d covered=%d", (double)t / 1e6,
+            (double)cont.startUs / 1e6, (double)wStart / 1e6, (double)wEnd / 1e6, (int)outside, (int)storeCovers);
         HeartbeatLog(b);
     }
     m_iPackedState.store(1, std::memory_order_release);
@@ -1063,7 +1105,9 @@ GameState::GameError MainScreen::Logic(void)
         // first frame of a continuation window: land on the playhead of the screen it replaces
         const long long t = m_llPendingJumpUs;
         m_llPendingJumpUs = LLONG_MIN;
+        m_bContinuationLanding = true;
         JumpTo(t, false);
+        m_bContinuationLanding = false;
         StartPlaybackAudioThread();
         PlaybackAudioSeek(m_llStartTime);
         m_Timer.Start();

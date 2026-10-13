@@ -421,8 +421,11 @@ inline long long UsAtTick(const PackedSong& ps, u32 tick)
     return accUs + (long long)((u64)(tick - lastTick) * tempo / div);
 }
 
-// First tick t1 > t0 such that [t0, t1) holds about maxNotes note starts (at least minTicks long).
-inline u32 WindowEnd(const PackedSong& ps, u32 t0, u64 maxNotes, u32 minTicks)
+// First tick t1 > t0 such that [t0, t1) holds about maxNotes note starts. The window is stretched to
+// at least minTicks, but never past hardMaxNotes note starts (0 = no ceiling): in a dense passage a
+// minimum time span would otherwise pull in many times the note budget, and a window that takes
+// longer to build than to play starves playback.
+inline u32 WindowEnd(const PackedSong& ps, u32 t0, u64 maxNotes, u32 minTicks, u64 hardMaxNotes = 0)
 {
     u64 acc = 0; size_t b = t0 / ps.bucketTicks;
     for (; b < ps.hist.size(); b++) {
@@ -430,7 +433,16 @@ inline u32 WindowEnd(const PackedSong& ps, u32 t0, u64 maxNotes, u32 minTicks)
         if (acc >= maxNotes) break;
     }
     u64 t1 = (u64)(b + 1) * ps.bucketTicks;
-    t1 = (std::max)(t1, (u64)t0 + minTicks);
+    const u64 tMin = (u64)t0 + minTicks;
+    if (t1 < tMin) {
+        size_t e = b + 1;
+        for (; e < ps.hist.size() && (u64)e * ps.bucketTicks < tMin; e++) {
+            if (hardMaxNotes && acc + ps.hist[e] > hardMaxNotes) break;
+            acc += ps.hist[e];
+        }
+        t1 = (std::min)(tMin, (u64)e * ps.bucketTicks);
+        t1 = (std::max)(t1, (u64)(b + 1) * ps.bucketTicks);
+    }
     return t1 > 0xFFFFFFFEull ? 0xFFFFFFFEu : (u32)t1;
 }
 

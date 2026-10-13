@@ -151,6 +151,7 @@ inline size_t ImageBufferPreparedEstimateStarts(
     long long margin,
     bool tickMode)
 {
+    IB_TRACE(IB_ESTIMATE);
     if (source.notes.empty() || timeSpan <= 0)
         return 0;
 
@@ -855,6 +856,7 @@ inline void ImageBufferPreparedPrime(
     int rows,
     uint64_t signature)
 {
+    IB_TRACE(IB_PRIME);
     if (!source || first > last)
         return;
 
@@ -908,6 +910,7 @@ inline void ImageBufferPreparedPrimeAllDense(
     int rows,
     uint64_t signature)
 {
+    IB_TRACE(IB_FULLPRIME);
     if (!ImageBufferPreparedGetWaitBeforePlayback() || !source || source->notes.empty())
         return;
 
@@ -977,6 +980,7 @@ inline bool ImageBufferPreparedTryCollect(
     size_t trackCount,
     int rows)
 {
+    IB_TRACE(IB_TRYCOLLECT);
     auto& overlap = ImageBufferOverlapEnsureIndex(owner, events, midi);
     const auto source = overlap.preparedSource;
     if (!source || source->notes.empty() || corruption > 1.0f ||

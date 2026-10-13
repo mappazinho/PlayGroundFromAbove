@@ -13,6 +13,7 @@
 #include <atomic>
 #include "Misc.h"
 #include "StartupLog.h"
+#include "ImageBufferTrace.h"
 
 extern HINSTANCE g_hInstance;
 extern HWND g_hWnd;

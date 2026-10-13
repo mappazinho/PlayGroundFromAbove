@@ -26,6 +26,7 @@ using Microsoft::WRL::ComPtr;
 enum class Pipeline {
     Rect,
     Note,
+    NoteRibbon,
     Background,
 };
 
@@ -194,8 +195,39 @@ public:
 
     inline void PushNoteData(NoteData data) { m_vNotesIntermediate.push_back(data); };
     inline void PushPianoRollStripNoteData(NoteData data) { m_vPianoRollStripNotesIntermediate.push_back(data); };
+
+    // Pitch-bend ribbons: notes whose shape follows a per-channel bend curve instead of sliding
+    // as a rigid bar. The curve holds each channel's bend (in semitones) sampled over the
+    // visible window, [channel][BendCurveSamples], now -> now + timespan. A ribbon note is cut into
+    // 1 << tier slices (tier 0..RibbonTierCount-1); the shader reads the slice count back from
+    // the channel byte, so channel is stored as chan | (tier << 4).
+    static constexpr unsigned BendCurveSamples = 1024;
+    static constexpr unsigned BendCurveRows = 32; // rows 0..15: bend per channel (semitones), 16..31: modulation per channel (0..1)
+    static constexpr unsigned RibbonTierCount = 8;
+    static constexpr unsigned RibbonNoteCapacity = 262144;
+    void SetBendCurves(const float* curves) { memcpy(m_BendCurves, curves, sizeof(m_BendCurves)); m_bBendCurvesValid = true; }
+    // The dual roll has its own time window, so its bent notes get their own curves and tiers.
+    void SetStripBendCurves(const float* curves) { memcpy(m_StripBendCurves, curves, sizeof(m_StripBendCurves)); m_bStripBendCurvesValid = true; }
+    bool PushRibbonStripNoteData(NoteData data, unsigned tier) {
+        if (tier >= RibbonTierCount || !m_bStripBendCurvesValid || m_uRibbonStripCount >= RibbonNoteCapacity)
+            return false;
+        data.channel = (uint8_t)((data.channel & 15u) | (tier << 4));
+        m_vRibbonStripNotes[tier].push_back(data);
+        m_uRibbonStripCount++;
+        return true;
+    }
+    // false = over capacity, the caller draws the note through the plain path instead
+    bool PushRibbonNoteData(NoteData data, unsigned tier) {
+        if (tier >= RibbonTierCount || !m_bBendCurvesValid || m_uRibbonNoteCount >= RibbonNoteCapacity)
+            return false;
+        data.channel = (uint8_t)((data.channel & 15u) | (tier << 4));
+        m_vRibbonNotes[tier].push_back(data);
+        m_uRibbonNoteCount++;
+        return true;
+    }
     float GetDualRollTimeSpan(float normalTimeSpan, float normalRollPixels) const;
-    size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size(); };
+    unsigned GetRibbonNoteCount() const { return m_uRibbonNoteCount; }
+    size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size() + m_uRibbonNoteCount; };
     void SplitRect() { m_iRectSplit = (int)m_vRectsIntermediate.size(); }
 
     bool LoadBackgroundBitmap(std::wstring path);
@@ -217,9 +249,13 @@ public:
         m_stripKBSharp = sharp; m_stripKBSharpDark = sharpDark; m_stripKBSharpVeryDark = sharpVeryDark;
         m_stripKBBackground = background; m_stripKBBackgroundDark = backgroundDark;
     }
-    void SetStripPressedKeys(const DWORD colors[128], const DWORD ribbonColors[128]) {
+    // The ribbon band beside the dual roll keyboard: base gradient colors, and for every pressed key
+    // its own segment (primary at the keys fading to dark; 0 = no segment).
+    void SetStripRibbonBase(DWORD dark, DWORD primary) { m_stripRibbonBaseDark = dark; m_stripRibbonBasePrimary = primary; }
+    void SetStripPressedKeys(const DWORD colors[128], const DWORD ribbonColors[128], const DWORD ribbonDarkColors[128]) {
         memcpy(m_stripPressedKeys, colors, sizeof(m_stripPressedKeys));
         memcpy(m_stripRibbonColors, ribbonColors, sizeof(m_stripRibbonColors));
+        memcpy(m_stripRibbonDarkColors, ribbonDarkColors, sizeof(m_stripRibbonDarkColors));
     }
     ImTextureID GetBlurTextureID() const { return m_BlurTextureID; }
     // 12px UI font baked at its own size. Text drawn at a size the atlas doesn't contain is a bilinearly
@@ -321,6 +357,15 @@ protected:
     std::vector<RectVertex> m_vRectsIntermediate;
     std::vector<NoteData> m_vNotesIntermediate;
     std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
+    std::vector<NoteData> m_vRibbonNotes[RibbonTierCount];
+    unsigned m_uRibbonNoteCount = 0;
+    std::vector<NoteData> m_vRibbonStripNotes[RibbonTierCount];
+    unsigned m_uRibbonStripCount = 0;
+    float m_StripBendCurves[BendCurveRows * BendCurveSamples] = {};
+    bool m_bStripBendCurvesValid = false;
+    bool m_bStripDepthCleared = false; // the strip's note pass already cleared depth this frame
+    float m_BendCurves[BendCurveRows * BendCurveSamples] = {};
+    bool m_bBendCurvesValid = false;
     int m_iRectSplit = -1;
 
     // Image buffer shared state (backend keeps the GPU resources)
@@ -366,6 +411,8 @@ protected:
     DWORD m_stripKBBackground = 0, m_stripKBBackgroundDark = 0;
     DWORD m_stripPressedKeys[128] = {};
     DWORD m_stripRibbonColors[128] = {};
+    DWORD m_stripRibbonDarkColors[128] = {};
+    DWORD m_stripRibbonBaseDark = 0, m_stripRibbonBasePrimary = 0;
 
     ComPtr<IWICBitmapSource> m_pUnscaledBackground;
     float m_fBGBlurSigma = 0.0f;
@@ -431,6 +478,7 @@ private:
     ComPtr<ID3D12PipelineState> m_pRectPipelineState;
     ComPtr<ID3D12RootSignature> m_pNoteRootSignature;
     ComPtr<ID3D12PipelineState> m_pNotePipelineState;
+    ComPtr<ID3D12PipelineState> m_pRibbonPipelineState; // shares the note root signature (+ bend curve SRV at t4)
 ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12PipelineState> m_pBackgroundPipelineState;
     ComPtr<ID3D12RootSignature> m_pChunkQuadRootSignature;
@@ -447,6 +495,7 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pVertexBuffers[FrameCount];
     D3D12_VERTEX_BUFFER_VIEW m_VertexBufferViews[FrameCount];
     ComPtr<ID3D12Resource> m_pNoteBuffers[FrameCount];
+    ComPtr<ID3D12Resource> m_pRibbonBuffers[FrameCount]; // per frame: bend curve, then ribbon notes grouped by tier
     ComPtr<ID3D12Resource> m_pGenericUpload;
     ComPtr<ID3D12Resource> m_pFixedBuffer;
     ComPtr<ID3D12Resource> m_pTrackColorBuffer;
@@ -468,6 +517,8 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pChunkFixedUpload;
     HRESULT EnsureChunkResources(int slot, int W, int H);
     HRESULT RenderImageBuffer();
+    void DrawPianoRollStripNotes();
+    void DrawPianoRollStripRibbons();
 
     UINT m_uFrameIndex = 0;
     UINT64 m_pFenceValues[FrameCount] = {};

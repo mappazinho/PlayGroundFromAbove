@@ -86,6 +86,17 @@ struct NotePSInput {
     float4 border : COLOR1;
 };
 
+// Pitch-bend ribbon notes: edges.x/z are the (interpolated) left/right border positions at the
+// pixel's own row, tol is the horizontal border half-width that keeps steep edges as thick as
+// vertical ones.
+struct RibbonPSInput {
+    float4 position : SV_POSITION;
+    float4 color : COLOR;
+    float4 edges : TEXCOORD0; // left, top, right, bottom
+    float4 border : COLOR1;
+    float tol : TEXCOORD1;
+};
+
 struct BackgroundPSInput {
     float4 position : SV_POSITION;
     float2 uv : TEXCOORD0;

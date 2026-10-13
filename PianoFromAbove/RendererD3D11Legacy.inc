@@ -13,6 +13,8 @@
 #include "RectVertexShader11.h"
 #include "NotePixelShader11.h"
 #include "NoteVertexShader11.h"
+#include "RibbonPixelShader11.h"
+#include "RibbonVertexShader11.h"
 #include "BackgroundPixelShader11.h"
 #include "BackgroundVertexShader11.h"
 #include "ChunkQuadPixelShader11.h"
@@ -144,6 +146,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreatePixelShader(g_pNotePixelShader11, sizeof(g_pNotePixelShader11), nullptr, &m_pNotePS);
     if (FAILED(res))
         return std::make_tuple(res, "CreatePixelShader (note)");
+
+    // Create pitch-bend ribbon note shaders
+    res = m_pDevice->CreateVertexShader(g_pRibbonVertexShader11, sizeof(g_pRibbonVertexShader11), nullptr, &m_pRibbonVS);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateVertexShader (ribbon)");
+    res = m_pDevice->CreatePixelShader(g_pRibbonPixelShader11, sizeof(g_pRibbonPixelShader11), nullptr, &m_pRibbonPS);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreatePixelShader (ribbon)");
 
     // Create background shaders
     res = m_pDevice->CreateVertexShader(g_pBackgroundVertexShader11, sizeof(g_pBackgroundVertexShader11), nullptr, &m_pBackgroundVS);
@@ -353,6 +363,23 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     res = m_pDevice->CreateShaderResourceView(m_pNoteBuffer.Get(), &srv_desc, &m_pStripNoteSRV);
     if (FAILED(res))
         return std::make_tuple(res, "CreateShaderResourceView (strip notes)");
+
+    // Per-channel bend curves sampled over the visible window (t4, ribbon notes only)
+    D3D11_BUFFER_DESC bend_desc = {};
+    bend_desc.Usage = D3D11_USAGE_DYNAMIC;
+    bend_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bend_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bend_desc.ByteWidth = BendCurveRows * BendCurveSamples * sizeof(float);
+    bend_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bend_desc.StructureByteStride = sizeof(float);
+    res = m_pDevice->CreateBuffer(&bend_desc, nullptr, &m_pBendCurveBuffer);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateBuffer (bend curves)");
+    srv_desc.BufferEx.FirstElement = 0;
+    srv_desc.BufferEx.NumElements = BendCurveRows * BendCurveSamples;
+    res = m_pDevice->CreateShaderResourceView(m_pBendCurveBuffer.Get(), &srv_desc, &m_pBendCurveSRV);
+    if (FAILED(res))
+        return std::make_tuple(res, "CreateShaderResourceView (bend curves)");
 
     // Dynamic rect vertex buffer
     D3D11_BUFFER_DESC vb_desc = {};
@@ -666,6 +693,8 @@ void D3D11Renderer::ReleaseDeviceResources() {
     m_pNoteBuffer.Reset();
     m_pNoteSRV.Reset();
     m_pStripNoteSRV.Reset();
+    m_pBendCurveSRV.Reset();
+    m_pBendCurveBuffer.Reset();
     m_pRectVertexBuffer.Reset();
     m_pFixedBuffer.Reset();
     m_pFixedSRV.Reset();
@@ -679,6 +708,8 @@ void D3D11Renderer::ReleaseDeviceResources() {
     m_pRectPS.Reset();
     m_pNoteVS.Reset();
     m_pNotePS.Reset();
+    m_pRibbonVS.Reset();
+    m_pRibbonPS.Reset();
     m_pBackgroundVS.Reset();
     m_pBackgroundPS.Reset();
     m_pChunkQuadVS.Reset();
@@ -735,6 +766,12 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
     m_vRectsIntermediate.clear();
     m_vNotesIntermediate.clear();
     m_vPianoRollStripNotesIntermediate.clear();
+    for (auto& tierNotes : m_vRibbonNotes)
+        tierNotes.clear();
+    m_uRibbonNoteCount = 0;
+    for (auto& tierNotes : m_vRibbonStripNotes)
+        tierNotes.clear();
+    m_uRibbonStripCount = 0;
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
@@ -842,6 +879,32 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
             m_pContext->Unmap(m_pNoteBuffer.Get(), 0);
 
             m_pContext->DrawIndexed((UINT)(note_count * 6), 0, 0);
+        }
+    }
+
+    // Pitch-bend ribbon notes: one instanced draw per slice-count tier (6 << tier vertices a note).
+    if (m_uRibbonNoteCount > 0 && m_bBendCurvesValid && m_pRibbonVS && m_pRibbonPS) {
+        D3D11_MAPPED_SUBRESOURCE curve_map = {};
+        res = m_pContext->Map(m_pBendCurveBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &curve_map);
+        if (FAILED(res))
+            return res;
+        memcpy(curve_map.pData, m_BendCurves, sizeof(m_BendCurves));
+        m_pContext->Unmap(m_pBendCurveBuffer.Get(), 0);
+
+        ID3D11ShaderResourceView* nullRibbonSRVs[5] = {};
+        m_pContext->VSSetShaderResources(0, 5, nullRibbonSRVs);
+        SetPipeline(Pipeline::NoteRibbon);
+        for (unsigned tier = 0; tier < RibbonTierCount; tier++) {
+            const auto& tierNotes = m_vRibbonNotes[tier];
+            if (tierNotes.empty())
+                continue;
+            D3D11_MAPPED_SUBRESOURCE ribbon_map = {};
+            res = m_pContext->Map(m_pNoteBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ribbon_map);
+            if (FAILED(res))
+                return res;
+            memcpy(ribbon_map.pData, tierNotes.data(), tierNotes.size() * sizeof(NoteData));
+            m_pContext->Unmap(m_pNoteBuffer.Get(), 0);
+            m_pContext->DrawInstanced(6u << tier, (UINT)tierNotes.size(), 0, 0);
         }
     }
 
@@ -1148,6 +1211,25 @@ void D3D11Renderer::SetPipeline(Pipeline pipeline) {
             // D3D12 root signature); slot t0 is unused.
             ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pNoteSRV.Get() };
             m_pContext->VSSetShaderResources(0, 4, bindSRVs);
+        }
+        break;
+    case Pipeline::NoteRibbon:
+        m_pContext->VSSetShader(m_pRibbonVS.Get(), nullptr, 0);
+        m_pContext->PSSetShader(m_pRibbonPS.Get(), nullptr, 0);
+        m_pContext->IASetInputLayout(nullptr);
+        m_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_pContext->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+        m_pContext->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+        m_pContext->RSSetState(m_pRasterizer.Get());
+        m_pContext->OMSetBlendState(m_pBlendInverted.Get(), nullptr, 0xFFFFFFFF);
+        m_pContext->OMSetDepthStencilState(m_pDepthEnabled.Get(), 0);
+        m_pContext->VSSetConstantBuffers(0, 1, m_pPerFrameConstants.GetAddressOf());
+        m_pContext->PSSetConstantBuffers(0, 1, m_pPerFrameConstants.GetAddressOf());
+        UploadPerFrameConstants();
+        {
+            // fixed:t1, colors:t2, note_data:t3 as for plain notes, plus the bend curves at t4
+            ID3D11ShaderResourceView* bindSRVs[] = { nullptr, m_pFixedSRV.Get(), m_pTrackColorSRV.Get(), m_pNoteSRV.Get(), m_pBendCurveSRV.Get() };
+            m_pContext->VSSetShaderResources(0, 5, bindSRVs);
         }
         break;
     case Pipeline::Background:
@@ -1529,6 +1611,66 @@ void D3D11Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D11Renderer::DrawPianoRollStrip() {
+    m_bStripDepthCleared = false;
+    DrawPianoRollStripNotes();
+    DrawPianoRollStripRibbons();
+}
+
+// Bent dual roll notes: instanced slice strips, drawn after the plain strip notes.
+void D3D11Renderer::DrawPianoRollStripRibbons() {
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    const bool horizontal = stripViz.bHorizontalPianoRoll;
+    if ((!stripViz.bDualPianoRoll && !horizontal) || m_uRibbonStripCount == 0 || !m_bStripBendCurvesValid ||
+        !m_pRibbonVS || !m_pRibbonPS)
+        return;
+
+    const float stripTop = horizontal ? 0.0f : 20.0f + 35.0f;
+    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+    const float stripW = (float)m_iBufferWidth;
+    const int nKeys = 128;
+    static const int sSharpsBelow[12] = { 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5 };
+    const int nWhiteKeys = nKeys - (nKeys / 12) * 5 - sSharpsBelow[nKeys % 12];
+    const float keyH = stripH / (float)nKeys;
+    const float whiteH = stripH / (float)nWhiteKeys;
+
+    if (!m_bStripDepthCleared)
+        m_pContext->ClearDepthStencilView(m_pDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    RootConstants savedRoot = m_RootConstants;
+    m_RootConstants.deflate = max(1.0f, min(3.0f, round(keyH * 0.15f / 2.0f)));
+    m_RootConstants.notes_y = stripTop;
+    m_RootConstants.notes_cy = stripW;
+    m_RootConstants.white_cx = whiteH;
+    m_RootConstants.timespan = stripH;
+    m_RootConstants.stripMode = 1.0f;
+    m_RootConstants.stripTimeSpan = GetDualRollTimeSpan(savedRoot.timespan, savedRoot.notes_cy);
+
+    D3D11_MAPPED_SUBRESOURCE curve_map = {};
+    if (SUCCEEDED(m_pContext->Map(m_pBendCurveBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &curve_map))) {
+        memcpy(curve_map.pData, m_StripBendCurves, sizeof(m_StripBendCurves));
+        m_pContext->Unmap(m_pBendCurveBuffer.Get(), 0);
+
+        ID3D11ShaderResourceView* nullRibbonSRVs[5] = {};
+        m_pContext->VSSetShaderResources(0, 5, nullRibbonSRVs);
+        SetPipeline(Pipeline::NoteRibbon);
+        for (unsigned tier = 0; tier < RibbonTierCount; tier++) {
+            const auto& tierNotes = m_vRibbonStripNotes[tier];
+            if (tierNotes.empty())
+                continue;
+            D3D11_MAPPED_SUBRESOURCE ribbon_map = {};
+            if (FAILED(m_pContext->Map(m_pNoteBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ribbon_map)))
+                break;
+            memcpy(ribbon_map.pData, tierNotes.data(), tierNotes.size() * sizeof(NoteData));
+            m_pContext->Unmap(m_pNoteBuffer.Get(), 0);
+            m_pContext->DrawInstanced(6u << tier, (UINT)tierNotes.size(), 0, 0);
+        }
+    }
+
+    m_RootConstants = savedRoot;
+    SetPipeline(Pipeline::Note);
+}
+
+void D3D11Renderer::DrawPianoRollStripNotes() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     const bool horizontal = stripViz.bHorizontalPianoRoll;
     if (!stripViz.bDualPianoRoll && !horizontal)
@@ -1556,6 +1698,7 @@ void D3D11Renderer::DrawPianoRollStrip() {
     const float stripTop = horizontal ? 0.0f : menuBarHeight + toolbarHeight;
 
     m_pContext->ClearDepthStencilView(m_pDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    m_bStripDepthCleared = true;
 
     const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripW = (float)m_iBufferWidth;
@@ -1658,6 +1801,7 @@ HRESULT D3D11Renderer::EnsureChunkResources(int slot, int W, int H) {
 }
 
 HRESULT D3D11Renderer::RenderImageBuffer() {
+    IB_TRACE(IB_RENDERIB);
     const int W = (int)round(m_RootConstants.notes_cx);
     const int H = (int)round(m_RootConstants.notes_cy);
     if (W <= 0 || H <= 0)

@@ -234,6 +234,7 @@ static bool PGFASliderInt(const char* label, int* v, int v_min, int v_max,
 
 bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, unsigned noteCount)
 {
+    IB_TRACE(IB_RENDERCHUNK);
     // Remember the active renderer so a later Play request can explicitly wake
     // full-song preparation even if the current lookahead is already cached.
     ImageBufferPrewarmRendererSeen(this);
@@ -250,8 +251,10 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
 
     // A pass this size is large enough to amortize state changes but bounded
     // enough that a multi-million-note chunk cannot monopolize one frame.
-    static constexpr size_t kImageBufferNotesPerPass = 65536;
-    static constexpr size_t kImageBufferNotesPerFrame = 65536;
+    // 128 keys x 1536 rows: a compacted (prepared or dense-store) chunk always fits one pass, so it
+    // bakes in a single frame instead of trickling in over several.
+    static constexpr size_t kImageBufferNotesPerPass = 196608;
+    static constexpr size_t kImageBufferNotesPerFrame = 196608;
 
     auto& state = ImageBufferMPGet(this);
     if (state.generation != m_ullImageBufferGeneration) {

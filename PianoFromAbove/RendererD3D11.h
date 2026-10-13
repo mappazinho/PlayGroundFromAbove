@@ -91,6 +91,8 @@ private:
     ComPtr<ID3D11PixelShader> m_pRectPS;
     ComPtr<ID3D11VertexShader> m_pNoteVS;
     ComPtr<ID3D11PixelShader> m_pNotePS;
+    ComPtr<ID3D11VertexShader> m_pRibbonVS;
+    ComPtr<ID3D11PixelShader> m_pRibbonPS;
     ComPtr<ID3D11VertexShader> m_pBackgroundVS;
     ComPtr<ID3D11PixelShader> m_pBackgroundPS;
     ComPtr<ID3D11ComputeShader> m_pBlurCS;
@@ -113,6 +115,8 @@ private:
     ComPtr<ID3D11Buffer> m_pChunkQuadConstants; // b0 during chunk quad pass (proj + quadPos + quadSize)
     HRESULT EnsureChunkResources(int slot, int W, int H);
     HRESULT RenderImageBuffer();
+    void DrawPianoRollStripNotes();
+    void DrawPianoRollStripRibbons();
 
     ComPtr<ID3D11InputLayout> m_pRectInputLayout;
     ComPtr<ID3D11Buffer> m_pIndexBuffer;
@@ -131,6 +135,8 @@ private:
     ComPtr<ID3D11Buffer> m_pNoteBuffer;      // dynamic, NoteBufferCapacity elements
     ComPtr<ID3D11ShaderResourceView> m_pNoteSRV;
     ComPtr<ID3D11ShaderResourceView> m_pStripNoteSRV; // starts at PianoRollStripNoteOffset
+    ComPtr<ID3D11Buffer> m_pBendCurveBuffer;  // dynamic, BendCurveRows * BendCurveSamples floats (t4 for ribbon notes)
+    ComPtr<ID3D11ShaderResourceView> m_pBendCurveSRV;
     ComPtr<ID3D11Buffer> m_pRectVertexBuffer; // dynamic, RectsPerPass * 4 vertices
 
     ComPtr<ID3D11BlendState> m_pBlendInverted;
