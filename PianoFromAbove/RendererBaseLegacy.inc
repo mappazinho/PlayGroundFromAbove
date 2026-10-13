@@ -1121,144 +1121,11 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImGui::Checkbox("KDMAPI", &viz.bKDMAPI);
                     ImGui::Separator();
                     ImGui::Checkbox("Prerendered Audio", &as.bPreRenderAudio);
-                    if (as.bPreRenderAudio)
-                    {
-                        ImGui::Separator();
-                        ImGui::TextUnformatted("Prerender Audio Settings:");
-                        if (ImGui::DragInt("Voices", &as.iPreVoices, 20.0f, 32, 5000))
-                            as.iPreVoices = clamp(as.iPreVoices, 32, 5000);
-                        if (ImGui::DragInt("Prerender Buffer (ms)", &as.iPreBufferMs, 500.0f, 1000, 300000))
-                            as.iPreBufferMs = clamp(as.iPreBufferMs, 1000, 300000);
-                        if (ImGui::DragInt("Limiter Attack (ms)", &as.iPreLMAttack, 1.0f, 0, 1000))
-                            as.iPreLMAttack = clamp(as.iPreLMAttack, 0, 1000);
-                        if (ImGui::DragInt("Limiter Release (ms)", &as.iPreLMRelease, 1.0f, 1, 1000))
-                            as.iPreLMRelease = clamp(as.iPreLMRelease, 1, 1000);
-                        float fFPS = (float)as.dPreFPS;
-                        if (ImGui::DragFloat("Note FPS (0 = off)", &fFPS, 1.0f, 0.0f, 1000.0f, "%.1f"))
-                            as.dPreFPS = fFPS;
-                        ImGui::Checkbox("Repeat last chunk on buffer underrun", &as.bPreUnderrunRepeat);
-                        ImGui::Checkbox("Custom repeat chunk length (ms)", &as.bPreRepeatCustom);
-                        if (ImGui::DragInt("Repeat length (ms)", &as.iPreRepeatMs, 1.0f, 10, 5000))
-                            as.iPreRepeatMs = clamp(as.iPreRepeatMs, 10, 5000);
-                        ImGui::Checkbox("Lock visuals to prerender audio clock (fixes sync, MAY cause note hitches)", &as.bPreStutterOnLag);
-                        int iLow = as.iPreVelThreshLow;
-                        if (ImGui::DragInt("Vel. threshold low", &iLow, 1.0f, 0, 126))
-                            as.iPreVelThreshLow = clamp(iLow, 0, 126);
-                        int iUpp = as.iPreVelThreshUpp;
-                        if (ImGui::DragInt("Vel. threshold high", &iUpp, 1.0f, 1, 127))
-                            as.iPreVelThreshUpp = clamp(iUpp, 1, 127);
-                        ImGui::Checkbox("No FX (drum-only synth)", &as.bNoFX);
-                        
-                        ImGui::Separator();
-                        ImGui::TextUnformatted("Soundfont Settings: (applies in next MIDI reset)");
-
-                        WCHAR wchExe[MAX_PATH];
-                        GetModuleFileNameW(NULL, wchExe, MAX_PATH);
-                        std::wstring exeDir = std::wstring(wchExe);
-                        size_t pos = exeDir.find_last_of(L"\\/");
-                        if (pos != std::wstring::npos) exeDir = exeDir.substr(0, pos + 1);
-
-                        std::wstring effectiveDir = as.sPreSoundfontDir;
-                        if (effectiveDir.empty() && !as.sPreSoundfontPath.empty())
-                        {
-                            size_t lastSlash = as.sPreSoundfontPath.find_last_of(L"\\/");
-                            if (lastSlash != std::wstring::npos)
-                                effectiveDir = as.sPreSoundfontPath.substr(0, lastSlash);
-                        }
-                        if (effectiveDir.empty())
-                        {
-                            effectiveDir = exeDir + L"Soundfonts";
-                        }
-
-                        std::string dirStr = Util::WstringToString(effectiveDir);
-                        char dirBuf[1024];
-                        strncpy_s(dirBuf, dirStr.c_str(), sizeof(dirBuf));
-                        if (ImGui::InputText("Soundfont Directory", dirBuf, sizeof(dirBuf)))
-                        {
-                            as.sPreSoundfontDir = Util::StringToWstring(dirBuf);
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::Button("Browse Dir...##sfdir")) {
-                            std::wstring pickedDir;
-                            if (PickFolderDialog(g_hWnd, L"Select Soundfont Directory", pickedDir)) {
-                                as.sPreSoundfontDir = pickedDir;
-                                std::vector<std::wstring> sfs = BASSMIDI::EnumerateSoundfonts(as.sPreSoundfontDir);
-                                if (!sfs.empty()) {
-                                    as.sPreSoundfontPath = sfs[0];
-                                    BASSMIDI::LoadSoundfont(as.sPreSoundfontPath.c_str());
-                                }
-                            }
-                        }
-
-                        std::vector<std::wstring> detectedSFs = BASSMIDI::EnumerateSoundfonts(effectiveDir);
-                        if (detectedSFs.empty() && effectiveDir != exeDir + L"Soundfonts") {
-                            std::vector<std::wstring> fallbackSFs = BASSMIDI::EnumerateSoundfonts(exeDir + L"Soundfonts");
-                            if (!fallbackSFs.empty()) detectedSFs = fallbackSFs;
-                        }
-
-                        std::wstring resolvedCurr = BASSMIDI::ResolveSoundfontPath(as.sPreSoundfontPath, effectiveDir);
-                        std::string currName = detectedSFs.empty() ? "No Soundfonts Found in Directory" : "Select Soundfont...";
-                        for (const auto& sf : detectedSFs) {
-                            if (sf == as.sPreSoundfontPath || sf == resolvedCurr) {
-                                size_t lastSlash = sf.find_last_of(L"\\/");
-                                currName = Util::WstringToString(lastSlash != std::wstring::npos ? sf.substr(lastSlash + 1) : sf);
-                                break;
-                            }
-                        }
-
-                        if (ImGui::BeginCombo("Soundfont Selector", currName.c_str())) {
-                            for (const auto& sf : detectedSFs) {
-                                size_t lastSlash = sf.find_last_of(L"\\/");
-                                std::wstring fileName = (lastSlash != std::wstring::npos) ? sf.substr(lastSlash + 1) : sf;
-                                std::string nameStr = Util::WstringToString(fileName);
-                                bool isSelected = (as.sPreSoundfontPath == sf || resolvedCurr == sf);
-                                if (ImGui::Selectable(nameStr.c_str(), isSelected)) {
-                                    as.sPreSoundfontPath = sf;
-                                    BASSMIDI::LoadSoundfont(as.sPreSoundfontPath.c_str());
-                                }
-                            }
-                            ImGui::EndCombo();
-                        }
-
-                        if (ImGui::Button("Browse Soundfont File...##sffile")) {
-                            OPENFILENAMEA ofn = {};
-                            char fn[1024] = {};
-                            ofn.lStructSize = sizeof(ofn);
-                            ofn.hwndOwner = g_hWnd;
-                            ofn.lpstrFilter = "SoundFont Files (*.sf2, *.sf3, *.sfz)\0*.sf2;*.sf3;*.sfz;*.sf2pack\0All Files (*.*)\0*.*\0";
-                            ofn.lpstrFile = fn;
-                            ofn.nMaxFile = sizeof(fn);
-                            ofn.lpstrTitle = "Select Soundfont File";
-                            ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-                            if (GetOpenFileNameA(&ofn)) {
-                                as.sPreSoundfontPath = Util::StringToWstring(fn);
-                                size_t lastSlash = as.sPreSoundfontPath.find_last_of(L"\\/");
-                                if (lastSlash != std::wstring::npos)
-                                    as.sPreSoundfontDir = as.sPreSoundfontPath.substr(0, lastSlash);
-                                BASSMIDI::LoadSoundfont(as.sPreSoundfontPath.c_str());
-                            }
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::Button("Reset##sfreset")) {
-                            as.sPreSoundfontPath = L"";
-                            as.sPreSoundfontDir = L"";
-                            BASSMIDI::LoadSoundfont(L"");
-                        }
-
-                        if (PRE_MIDIAudio)
-                        {
-                            PRE_MIDIAudio->SetMaxAheadMs(as.iPreBufferMs);
-                            PRE_MIDIAudio->m_dFPS = as.dPreFPS;
-                            PRE_MIDIAudio->m_dAttack = (double)as.iPreLMAttack / 1000.0;
-                            PRE_MIDIAudio->m_dRelease = (double)as.iPreLMRelease / 1000.0;
-                            PRE_MIDIAudio->m_iVelThreshLow = as.iPreVelThreshLow;
-                            PRE_MIDIAudio->m_iVelThreshUpp = as.iPreVelThreshUpp;
-                            PRE_MIDIAudio->m_bUnderrunRepeat = as.bPreUnderrunRepeat;
-                            PRE_MIDIAudio->m_iRepeatFrames = as.bPreRepeatCustom ? as.iPreRepeatMs * 48 : 12000;
-                            PRE_MIDIAudio->m_bExtendVisualsOnSkip = as.bPreStutterOnLag;
-                            PRE_MIDIAudio->m_bDefaultNoFx = as.bNoFX;
-                        }
-                    }
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!as.bPreRenderAudio);
+                    if (ImGui::Button("Prerender Settings..."))
+                        m_bShowPrerenderSettings = true;
+                    ImGui::EndDisabled();
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Video")) {
@@ -1420,6 +1287,193 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
             }
             ImGui::End();
         }
+        ImGui::PopStyleColor();
+    }
+
+    if (m_bShowPrerenderSettings) {
+        ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        if (ImGui::Begin("Prerender Settings", &m_bShowPrerenderSettings, ImGuiWindowFlags_NoCollapse)) {
+            if (!g_bDisableBlur && m_BlurTextureID) {
+                ImVec2 wpos = ImGui::GetWindowPos();
+                ImVec2 wsize = ImGui::GetWindowSize();
+                float bw = (float)m_iBufferWidth, bh = (float)m_iBufferHeight;
+                ImGui::GetWindowDrawList()->AddImage(m_BlurTextureID,
+                    wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y),
+                    ImVec2(wpos.x / bw, wpos.y / bh),
+                    ImVec2((wpos.x + wsize.x) / bw, (wpos.y + wsize.y) / bh));
+                ImGui::GetWindowDrawList()->AddRectFilled(wpos, ImVec2(wpos.x + wsize.x, wpos.y + wsize.y), 0x80000000);
+            }
+            auto& as = config.GetAudioSettings();
+            static bool s_sfDirty = false;
+
+            ImGui::Checkbox("Prerendered Audio", &as.bPreRenderAudio);
+
+            if (ImGui::CollapsingHeader("Soundfonts", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextDisabled("Earlier soundfonts win. Give a soundfont only some channels (e.g. drums) to layer it over the main one.");
+
+                static const unsigned kAllMask = 0xFFFF, kDrumMask = 1u << 9, kNoDrumMask = 0xFFFF & ~(1u << 9);
+                int iRemove = -1, iMoveUp = -1;
+                for (int i = 0; i < (int)as.vSoundfonts.size(); i++) {
+                    SoundfontEntry& e = as.vSoundfonts[i];
+                    ImGui::PushID(i);
+                    if (ImGui::Checkbox("##en", &e.bEnabled)) s_sfDirty = true;
+                    ImGui::SameLine();
+                    size_t slash = e.sPath.find_last_of(L"\\/");
+                    std::string nameStr = Util::WstringToString(slash != std::wstring::npos ? e.sPath.substr(slash + 1) : e.sPath);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(nameStr.c_str());
+                    if (ImGui::IsItemHovered()) {
+                        std::string full = Util::WstringToString(e.sPath);
+                        ImGui::SetTooltip("%s", full.c_str());
+                    }
+                    ImGui::SameLine(ImGui::GetWindowWidth() - 330.0f);
+
+                    int preset = (e.uChanMask == kAllMask) ? 0 : (e.uChanMask == kDrumMask) ? 1 : (e.uChanMask == kNoDrumMask) ? 2 : 3;
+                    char customLabel[32];
+                    snprintf(customLabel, sizeof(customLabel), "Custom (%d ch)", (int)__popcnt(e.uChanMask));
+                    ImGui::SetNextItemWidth(150.0f);
+                    if (ImGui::BeginCombo("##chan", preset == 0 ? "All channels" : preset == 1 ? "Drums only" : preset == 2 ? "All but drums" : customLabel)) {
+                        if (ImGui::Selectable("All channels", preset == 0)) { e.uChanMask = kAllMask; s_sfDirty = true; }
+                        if (ImGui::Selectable("Drums only (ch 10)", preset == 1)) { e.uChanMask = kDrumMask; s_sfDirty = true; }
+                        if (ImGui::Selectable("All but drums", preset == 2)) { e.uChanMask = kNoDrumMask; s_sfDirty = true; }
+                        ImGui::TextDisabled("Pick exact channels in the Channels list below");
+                        ImGui::EndCombo();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Up") && i > 0) iMoveUp = i;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Remove")) iRemove = i;
+
+                    if (ImGui::TreeNode("Channels")) {
+                        for (int c = 0; c < 16; c++) {
+                            bool on = (e.uChanMask >> c) & 1;
+                            char lbl[16];
+                            snprintf(lbl, sizeof(lbl), "%d##c%d", c + 1, c);
+                            if (ImGui::Checkbox(lbl, &on)) {
+                                e.uChanMask = on ? (e.uChanMask | (1u << c)) : (e.uChanMask & ~(1u << c));
+                                s_sfDirty = true;
+                            }
+                            if (c % 8 != 7) ImGui::SameLine();
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                if (iMoveUp > 0) { std::swap(as.vSoundfonts[iMoveUp], as.vSoundfonts[iMoveUp - 1]); s_sfDirty = true; }
+                if (iRemove >= 0) { as.vSoundfonts.erase(as.vSoundfonts.begin() + iRemove); s_sfDirty = true; }
+                if (as.vSoundfonts.empty())
+                    ImGui::TextDisabled("No soundfonts added: one is auto-detected from the Soundfonts folder next to the exe.");
+
+                if (ImGui::Button("Add Soundfont...##sfadd")) {
+                    OPENFILENAMEA ofn = {};
+                    char fn[1024] = {};
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = g_hWnd;
+                    ofn.lpstrFilter = "SoundFont Files (*.sf2, *.sf3, *.sfz)\0*.sf2;*.sf3;*.sfz;*.sf2pack\0All Files (*.*)\0*.*\0";
+                    ofn.lpstrFile = fn;
+                    ofn.nMaxFile = sizeof(fn);
+                    ofn.lpstrTitle = "Select Soundfont File";
+                    ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                    if (GetOpenFileNameA(&ofn)) {
+                        SoundfontEntry e;
+                        e.sPath = Util::StringToWstring(fn);
+                        as.sPreSoundfontDir = e.sPath.substr(0, e.sPath.find_last_of(L"\\/"));
+                        as.vSoundfonts.push_back(e);
+                        s_sfDirty = true;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Browse Folder...##sfdir")) {
+                    std::wstring pickedDir;
+                    if (PickFolderDialog(g_hWnd, L"Select Soundfont Directory", pickedDir))
+                        as.sPreSoundfontDir = pickedDir;
+                }
+                ImGui::SameLine();
+                {
+                    WCHAR wchExe[MAX_PATH];
+                    GetModuleFileNameW(NULL, wchExe, MAX_PATH);
+                    std::wstring exeDir = wchExe;
+                    exeDir = exeDir.substr(0, exeDir.find_last_of(L"\\/") + 1);
+                    std::wstring dir = as.sPreSoundfontDir.empty() ? exeDir + L"Soundfonts" : as.sPreSoundfontDir;
+                    std::vector<std::wstring> found = BASSMIDI::EnumerateSoundfonts(dir);
+                    ImGui::SetNextItemWidth(220.0f);
+                    if (ImGui::BeginCombo("##sfpick", found.empty() ? "No soundfonts in folder" : "Add from folder...")) {
+                        for (const auto& sf : found) {
+                            std::string nm = Util::WstringToString(sf.substr(sf.find_last_of(L"\\/") + 1));
+                            if (ImGui::Selectable(nm.c_str())) {
+                                SoundfontEntry e;
+                                e.sPath = sf;
+                                as.vSoundfonts.push_back(e);
+                                s_sfDirty = true;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        std::string d = Util::WstringToString(dir);
+                        ImGui::SetTooltip("%s", d.c_str());
+                    }
+                }
+
+                if (s_sfDirty) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.45f, 0.1f, 1.0f));
+                if (ImGui::Button("Apply Soundfonts")) {
+                    BASSMIDI::LoadConfiguredSoundfonts();
+                    s_sfDirty = false;
+                }
+                if (s_sfDirty) ImGui::PopStyleColor();
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", s_sfDirty ? "Changed - Apply, then takes effect on the next MIDI reset" : "Takes effect on the next MIDI reset");
+            }
+
+            if (ImGui::CollapsingHeader("Synth", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::DragInt("Voices", &as.iPreVoices, 20.0f, 32, 5000))
+                    as.iPreVoices = clamp(as.iPreVoices, 32, 5000);
+                ImGui::Checkbox("No FX (drum-only synth)", &as.bNoFX);
+                int iLow = as.iPreVelThreshLow;
+                if (ImGui::DragInt("Vel. threshold low", &iLow, 1.0f, 0, 126))
+                    as.iPreVelThreshLow = clamp(iLow, 0, 126);
+                int iUpp = as.iPreVelThreshUpp;
+                if (ImGui::DragInt("Vel. threshold high", &iUpp, 1.0f, 1, 127))
+                    as.iPreVelThreshUpp = clamp(iUpp, 1, 127);
+                if (ImGui::DragInt("Limiter Attack (ms)", &as.iPreLMAttack, 1.0f, 0, 1000))
+                    as.iPreLMAttack = clamp(as.iPreLMAttack, 0, 1000);
+                if (ImGui::DragInt("Limiter Release (ms)", &as.iPreLMRelease, 1.0f, 1, 1000))
+                    as.iPreLMRelease = clamp(as.iPreLMRelease, 1, 1000);
+            }
+
+            if (ImGui::CollapsingHeader("Buffer & Sync", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::DragInt("Prerender Buffer (ms)", &as.iPreBufferMs, 500.0f, 1000, 300000))
+                    as.iPreBufferMs = clamp(as.iPreBufferMs, 1000, 300000);
+                float fFPS = (float)as.dPreFPS;
+                if (ImGui::DragFloat("Note FPS (0 = off)", &fFPS, 1.0f, 0.0f, 1000.0f, "%.1f"))
+                    as.dPreFPS = fFPS;
+                ImGui::Checkbox("Repeat last chunk on buffer underrun", &as.bPreUnderrunRepeat);
+                ImGui::Checkbox("Custom repeat chunk length", &as.bPreRepeatCustom);
+                if (as.bPreRepeatCustom) {
+                    ImGui::Indent();
+                    if (ImGui::DragInt("Repeat length (ms)", &as.iPreRepeatMs, 1.0f, 10, 5000))
+                        as.iPreRepeatMs = clamp(as.iPreRepeatMs, 10, 5000);
+                    ImGui::Unindent();
+                }
+                ImGui::Checkbox("Lock visuals to prerender audio clock", &as.bPreStutterOnLag);
+                ImGui::TextDisabled("Fixes sync, but may cause note hitches.");
+            }
+
+            if (PRE_MIDIAudio) {
+                PRE_MIDIAudio->SetMaxAheadMs(as.iPreBufferMs);
+                PRE_MIDIAudio->m_dFPS = as.dPreFPS;
+                PRE_MIDIAudio->m_dAttack = (double)as.iPreLMAttack / 1000.0;
+                PRE_MIDIAudio->m_dRelease = (double)as.iPreLMRelease / 1000.0;
+                PRE_MIDIAudio->m_iVelThreshLow = as.iPreVelThreshLow;
+                PRE_MIDIAudio->m_iVelThreshUpp = as.iPreVelThreshUpp;
+                PRE_MIDIAudio->m_bUnderrunRepeat = as.bPreUnderrunRepeat;
+                PRE_MIDIAudio->m_iRepeatFrames = as.bPreRepeatCustom ? as.iPreRepeatMs * 48 : 12000;
+                PRE_MIDIAudio->m_bExtendVisualsOnSkip = as.bPreStutterOnLag;
+                PRE_MIDIAudio->m_bDefaultNoFx = as.bNoFX;
+            }
+        }
+        ImGui::End();
         ImGui::PopStyleColor();
     }
 

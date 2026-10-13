@@ -185,6 +185,7 @@ void AudioSettings::LoadDefaultValues()
     this->bPreRenderAudio = false;
     this->sPreSoundfontPath = L"";
     this->sPreSoundfontDir = L"";
+    this->vSoundfonts.clear();
     this->iPreVoices = 4096;
     this->dPreFPS = 0.0;
     this->iPreLMAttack = 10;
@@ -417,6 +418,32 @@ void AudioSettings::LoadConfigValues( TiXmlElement *txRoot )
     string sPreSoundfontDir;
     if ( txAudio->QueryStringAttribute( "PreSoundfontDir", &sPreSoundfontDir ) == TIXML_SUCCESS )
         this->sPreSoundfontDir = Util::StringToWstring( sPreSoundfontDir );
+
+    TiXmlElement *txSf = txAudio->FirstChildElement( "Soundfont" );
+    if ( txSf )
+    {
+        this->vSoundfonts.clear();
+        for ( ; txSf; txSf = txSf->NextSiblingElement( "Soundfont" ) )
+        {
+            SoundfontEntry e;
+            string sPath;
+            if ( txSf->QueryStringAttribute( "Path", &sPath ) != TIXML_SUCCESS || sPath.empty() ) continue;
+            e.sPath = Util::StringToWstring( sPath );
+            int iVal = 0;
+            if ( txSf->QueryIntAttribute( "Enabled", &iVal ) == TIXML_SUCCESS )
+                e.bEnabled = (iVal != 0);
+            if ( txSf->QueryIntAttribute( "Channels", &iVal ) == TIXML_SUCCESS )
+                e.uChanMask = (unsigned)iVal & 0xFFFF;
+            this->vSoundfonts.push_back( e );
+        }
+    }
+    else if ( this->sPreSoundfontPath.length() > 0 )
+    {
+        // Older configs: a single soundfont used for every channel.
+        SoundfontEntry e;
+        e.sPath = this->sPreSoundfontPath;
+        this->vSoundfonts.push_back( e );
+    }
 
     txAudio->QueryIntAttribute( "PreAudVoices", &iPreVoices );
     txAudio->QueryDoubleAttribute( "PreAudFPS", &dPreFPS );
@@ -753,10 +780,16 @@ bool AudioSettings::SaveConfigValues( TiXmlElement *txRoot )
     if ( this->sDesiredOut.length() > 0 )
         txAudio->SetAttribute( "MIDIOutDevice", Util::WstringToString( this->sDesiredOut ) );
     txAudio->SetAttribute( "PreRenderAudio", this->bPreRenderAudio );
-    if ( this->sPreSoundfontPath.length() > 0 )
-        txAudio->SetAttribute( "PreSoundfontPath", Util::WstringToString( this->sPreSoundfontPath ) );
     if ( this->sPreSoundfontDir.length() > 0 )
         txAudio->SetAttribute( "PreSoundfontDir", Util::WstringToString( this->sPreSoundfontDir ) );
+    for ( const SoundfontEntry &e : this->vSoundfonts )
+    {
+        TiXmlElement *txSf = new TiXmlElement( "Soundfont" );
+        txSf->SetAttribute( "Path", Util::WstringToString( e.sPath ) );
+        txSf->SetAttribute( "Enabled", e.bEnabled );
+        txSf->SetAttribute( "Channels", (int)e.uChanMask );
+        txAudio->LinkEndChild( txSf );
+    }
     txAudio->SetAttribute( "PreAudVoices", iPreVoices );
     txAudio->SetAttribute( "PreAudFPS", dPreFPS );
     txAudio->SetAttribute( "PreAudLimiterAttack", iPreLMAttack );

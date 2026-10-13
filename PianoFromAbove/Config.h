@@ -53,6 +53,15 @@ struct VisualSettings : public ISettings
     unsigned int colors[16], iBkgColor;
 };
 
+// One soundfont in the prerender synth's stack. Earlier entries win over later ones;
+// uChanMask has bit N set when the font serves MIDI channel N (bit 9 = channel 10, drums).
+struct SoundfontEntry
+{
+    wstring sPath;
+    bool bEnabled = true;
+    unsigned uChanMask = 0xFFFF;
+};
+
 struct AudioSettings : public ISettings
 {
     void LoadDefaultValues();
@@ -66,6 +75,7 @@ struct AudioSettings : public ISettings
     bool bPreRenderAudio;
     wstring sPreSoundfontPath;
     wstring sPreSoundfontDir;
+    vector< SoundfontEntry > vSoundfonts;
     int iPreVoices;
     double dPreFPS;
     int iPreLMAttack;

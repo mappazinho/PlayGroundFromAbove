@@ -1,11 +1,13 @@
 #include "BASSMIDI.h"
 #include "MIDIPreRenderPlayer.h"
+#include "Config.h"
 #include <algorithm>
 #include <vector>
 #include <sstream>
 
 static WAVEFORMATEX m_wfWaveFormatStatic = WAVEFORMATEX{};
-static BASS_MIDI_FONTEX* m_bmFontArr = nullptr;
+static std::vector<BASS_MIDI_FONTEX2> m_bmFonts; // one entry per contiguous channel run of each loaded font
+static std::vector<HSOUNDFONT> m_bmFontHandles;  // one per loaded font
 static std::mutex sfLock;
 static std::mutex m_bmMutex;
 
@@ -43,8 +45,21 @@ BASSMIDI::BASSMIDI(int voices, bool nofx = true) {
 
 	{
 		sfLock.lock();
-		if (m_bmFontArr != NULL && m_bmFontArr[0].font != 0)
-			BASS_MIDI_StreamSetFonts(m_hsHandle, m_bmFontArr, 1);
+		if (!m_bmFonts.empty() &&
+			!BASS_MIDI_StreamSetFonts(m_hsHandle, m_bmFonts.data(), (DWORD)m_bmFonts.size()))
+		{
+			// Older bassmidi without per-channel mappings: use the whole-stream font list instead.
+			PRE_DbgLog("SETFONTS (per-channel) failed err=%d - falling back", BASS_ErrorGetCode());
+			std::vector<BASS_MIDI_FONTEX> plain;
+			for (const BASS_MIDI_FONTEX2& f : m_bmFonts)
+				if (f.minchan == 0 && f.numchan == 16)
+					plain.push_back(BASS_MIDI_FONTEX{ f.font, f.spreset, f.sbank, f.dpreset, f.dbank, f.dbanklsb });
+			if (plain.empty())
+				for (const BASS_MIDI_FONTEX2& f : m_bmFonts)
+					plain.push_back(BASS_MIDI_FONTEX{ f.font, f.spreset, f.sbank, f.dpreset, f.dbank, f.dbanklsb });
+			if (!BASS_MIDI_StreamSetFonts(m_hsHandle, plain.data(), (DWORD)plain.size()))
+				PRE_DbgLog("SETFONTS fallback failed err=%d", BASS_ErrorGetCode());
+		}
 		sfLock.unlock();
 	}
 	
@@ -145,33 +160,29 @@ std::wstring BASSMIDI::ResolveSoundfontPath(const std::wstring& path, const std:
 
 void BASSMIDI::FreeSoundfont()
 {
-	if (m_bmFontArr != NULL)
-	{
-		if (m_bmFontArr[0].font != 0)
-			BASS_MIDI_FontFree(m_bmFontArr[0].font);
-		free(m_bmFontArr);
-		m_bmFontArr = NULL;
-	}
+	for (HSOUNDFONT font : m_bmFontHandles)
+		BASS_MIDI_FontFree(font);
+	m_bmFontHandles.clear();
+	m_bmFonts.clear();
 }
 
 struct SfMemState { const unsigned char* p; QWORD len; QWORD pos; };
-static SfMemState g_sfMem;
 
-static void CALLBACK SfMemClose(void* user) { (void)user; g_sfMem.pos = 0; }
-static QWORD CALLBACK SfMemLen(void* user) { (void)user; return g_sfMem.len; }
+static void CALLBACK SfMemClose(void* user) { ((SfMemState*)user)->pos = 0; }
+static QWORD CALLBACK SfMemLen(void* user) { return ((SfMemState*)user)->len; }
 static DWORD CALLBACK SfMemRead(void* buffer, DWORD length, void* user)
 {
-	(void)user;
-	QWORD avail = g_sfMem.len - g_sfMem.pos;
+	SfMemState* s = (SfMemState*)user;
+	QWORD avail = s->len - s->pos;
 	DWORD n = (DWORD)((avail < (QWORD)length) ? avail : (QWORD)length);
-	if (n) { memcpy(buffer, g_sfMem.p + g_sfMem.pos, n); g_sfMem.pos += n; }
+	if (n) { memcpy(buffer, s->p + s->pos, n); s->pos += n; }
 	return n;
 }
 static BOOL CALLBACK SfMemSeek(QWORD offset, void* user)
 {
-	(void)user;
-	if (offset > g_sfMem.len) return FALSE;
-	g_sfMem.pos = offset;
+	SfMemState* s = (SfMemState*)user;
+	if (offset > s->len) return FALSE;
+	s->pos = offset;
 	return TRUE;
 }
 
@@ -189,54 +200,89 @@ static HSOUNDFONT LoadSoundfontMem(const std::wstring& path)
 	CloseHandle(hFile);
 	if (!bOk || dwRead != (DWORD)liSize.QuadPart) { free(pBuf); return 0; }
 
-	g_sfMem.p = pBuf;
-	g_sfMem.len = liSize.QuadPart;
-	g_sfMem.pos = 0;
+	// Per-font state; like the buffer it stays allocated for the font's lifetime.
+	SfMemState* state = new SfMemState{ pBuf, (QWORD)liSize.QuadPart, 0 };
 	BASS_FILEPROCS procs = { SfMemClose, SfMemLen, SfMemRead, SfMemSeek };
-	HSOUNDFONT font = BASS_MIDI_FontInitUser(&procs, NULL, 0);
-	if (font == 0) free(pBuf);
+	HSOUNDFONT font = BASS_MIDI_FontInitUser(&procs, state, 0);
+	if (font == 0) { free(pBuf); delete state; }
 	return font;
 }
 
 void BASSMIDI::LoadSoundfont(const wchar_t* path)
 {
-	std::wstring resolvedPath = ResolveSoundfontPath(path ? path : L"");
+	LoadSoundfonts({ FontSpec{ path ? path : L"", 0xFFFF } });
+}
+
+void BASSMIDI::LoadSoundfonts(const std::vector<FontSpec>& specs)
+{
+	std::wstring errors;
 	{
-		sfLock.lock();
+		std::lock_guard<std::mutex> lock(sfLock);
 		FreeSoundfont();
-		HSOUNDFONT font = 0;
-		if (!resolvedPath.empty())
+
+		// No usable entries: fall back to auto-detecting a soundfont for every channel.
+		std::vector<FontSpec> list;
+		for (const FontSpec& s : specs)
+			if (!s.path.empty() && (s.chanMask & 0xFFFF)) list.push_back(s);
+		if (list.empty())
 		{
-			font = BASS_MIDI_FontInit(resolvedPath.c_str(), 0);
-			if (font == 0)
-				font = LoadSoundfontMem(resolvedPath);
+			std::wstring autoPath = ResolveSoundfontPath(L"");
+			if (!autoPath.empty()) list.push_back(FontSpec{ autoPath, 0xFFFF });
 		}
 
-		if (font != 0)
+		for (const FontSpec& s : list)
 		{
-			BASS_MIDI_FONTEX* fonts = (BASS_MIDI_FONTEX*)calloc(1, sizeof(BASS_MIDI_FONTEX));
-			fonts[0].font = font;
-			fonts[0].spreset = -1;
-			fonts[0].sbank = -1;
-			fonts[0].dpreset = -1;
-			fonts[0].dbank = 0;
-			fonts[0].dbanklsb = 0;
+			// Don't let a missing entry get silently replaced by an auto-detected font.
+			HSOUNDFONT font = 0;
+			std::wstring resolved = s.path;
+			if (GetFileAttributesW(s.path.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				resolved = ResolveSoundfontPath(s.path);
+				font = BASS_MIDI_FontInit(resolved.c_str(), 0);
+				if (font == 0)
+					font = LoadSoundfontMem(resolved);
+			}
+			if (font == 0)
+			{
+				errors += L"\n" + s.path + L"  (err " + std::to_wstring(BASS_ErrorGetCode()) + L")";
+				continue;
+			}
 
 			BASS_MIDI_FontLoad(font, -1, -1);
-			m_bmFontArr = fonts;
-		}
-		else
-		{
-			m_bmFontArr = NULL;
-			if (!resolvedPath.empty())
+			m_bmFontHandles.push_back(font);
+
+			// One mapping per contiguous run of channels.
+			const unsigned mask = s.chanMask & 0xFFFF;
+			for (int ch = 0; ch < 16; )
 			{
-				std::wstringstream err;
-				err << L"Soundfont failed to load from: " << resolvedPath << L"\nErr Code: " << BASS_ErrorGetCode() << L"\0";
-				MessageBoxW(NULL, err.str().c_str(), L"Soundfont Load Error", MB_ICONWARNING);
+				if (!(mask & (1u << ch))) { ch++; continue; }
+				int run = 0;
+				while (ch + run < 16 && (mask & (1u << (ch + run)))) run++;
+				BASS_MIDI_FONTEX2 fx = {};
+				fx.font = font;
+				fx.spreset = -1;
+				fx.sbank = -1;
+				fx.dpreset = -1;
+				fx.dbank = 0;
+				fx.dbanklsb = 0;
+				fx.minchan = ch;
+				fx.numchan = run;
+				m_bmFonts.push_back(fx);
+				ch += run;
 			}
 		}
-		sfLock.unlock();
 	}
+	if (!errors.empty())
+		MessageBoxW(NULL, (L"Soundfont failed to load from:" + errors).c_str(), L"Soundfont Load Error", MB_ICONWARNING);
+}
+
+void BASSMIDI::LoadConfiguredSoundfonts()
+{
+	std::vector<FontSpec> specs;
+	for (const SoundfontEntry& e : Config::GetConfig().GetAudioSettings().vSoundfonts)
+		if (e.bEnabled)
+			specs.push_back(FontSpec{ e.sPath, e.uChanMask });
+	LoadSoundfonts(specs);
 }
 
 bool BASSMIDI::WriteBass(int buflen, unsigned long *progress)

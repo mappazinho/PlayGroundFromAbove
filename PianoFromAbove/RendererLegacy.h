@@ -259,6 +259,7 @@ public:
 
     // --- Shared UI/state, public for the game states to poke at --------------
     bool m_bShowPreferences = false;
+    bool m_bShowPrerenderSettings = false;
     bool m_bShowAbout = false;
     bool m_bShowSetResolution = false;
     bool m_bShowTrackSettings = false;

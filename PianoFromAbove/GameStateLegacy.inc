@@ -466,7 +466,7 @@ void MainScreen::BeginVideoRender()
     // Strip the UI for the video: close the ImGui render dialog and any other ImGui windows (the
     // captured output must stay clean), and pop up the plain Win32 progress window (progress,
     if (m_pRenderer)
-        m_pRenderer->m_bShowRenderDialog = m_pRenderer->m_bShowPreferences = m_pRenderer->m_bShowAbout = false;
+        m_pRenderer->m_bShowRenderDialog = m_pRenderer->m_bShowPreferences = m_pRenderer->m_bShowPrerenderSettings = m_pRenderer->m_bShowAbout = false;
     RequestCreateRenderProgressWindow();
 }
 
@@ -1464,7 +1464,7 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
         wfFormat.wFormatTag = WAVE_FORMAT_PCM;
         BASSMIDI::InitBASS(wfFormat);
 
-        BASSMIDI::LoadSoundfont(cAudio.sPreSoundfontPath.c_str());
+        BASSMIDI::LoadConfiguredSoundfonts();
 
         int initSecs = max(120, (cAudio.iPreBufferMs * 2 + 999) / 1000);
         PRE_MIDIAudio = new MIDIAudio(48000 * initSecs);
@@ -4878,6 +4878,7 @@ static bool StatsCoveredByUI(Renderer* renderer)
 {
     return renderer && (
         renderer->m_bShowPreferences ||
+        renderer->m_bShowPrerenderSettings ||
         renderer->m_bShowAbout ||
         renderer->m_bShowSetResolution ||
         renderer->m_bShowTrackSettings ||

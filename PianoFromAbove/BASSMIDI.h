@@ -26,8 +26,17 @@ public:
 	bool IsStreamDead() const { return m_bStreamDead; }
 	void MarkStreamDead() { m_bStreamDead = true; }
 
+	// One soundfont in the stack; earlier entries take priority. chanMask bit N = MIDI channel N (bit 9 = drums).
+	struct FontSpec {
+		std::wstring path;
+		unsigned chanMask = 0xFFFF;
+	};
+
 	static void FreeSoundfont();
 	static void LoadSoundfont(const wchar_t* path);
+	static void LoadSoundfonts(const std::vector<FontSpec>& fonts);
+	// Loads the enabled soundfonts from the audio settings (auto-detects one when none are configured).
+	static void LoadConfiguredSoundfonts();
 	static std::wstring ResolveSoundfontPath(const std::wstring& path, const std::wstring& dir = L"");
 	static std::vector<std::wstring> EnumerateSoundfonts(const std::wstring& dir);
 
