@@ -206,6 +206,16 @@ public:
     static constexpr unsigned RibbonTierCount = 8;
     static constexpr unsigned RibbonNoteCapacity = 262144;
     void SetBendCurves(const float* curves) { memcpy(m_BendCurves, curves, sizeof(m_BendCurves)); m_bBendCurvesValid = true; }
+    // The dual roll has its own time window, so its bent notes get their own curves and tiers.
+    void SetStripBendCurves(const float* curves) { memcpy(m_StripBendCurves, curves, sizeof(m_StripBendCurves)); m_bStripBendCurvesValid = true; }
+    bool PushRibbonStripNoteData(NoteData data, unsigned tier) {
+        if (tier >= RibbonTierCount || !m_bStripBendCurvesValid || m_uRibbonStripCount >= RibbonNoteCapacity)
+            return false;
+        data.channel = (uint8_t)((data.channel & 15u) | (tier << 4));
+        m_vRibbonStripNotes[tier].push_back(data);
+        m_uRibbonStripCount++;
+        return true;
+    }
     // false = over capacity, the caller draws the note through the plain path instead
     bool PushRibbonNoteData(NoteData data, unsigned tier) {
         if (tier >= RibbonTierCount || !m_bBendCurvesValid || m_uRibbonNoteCount >= RibbonNoteCapacity)
@@ -348,6 +358,11 @@ protected:
     std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
     std::vector<NoteData> m_vRibbonNotes[RibbonTierCount];
     unsigned m_uRibbonNoteCount = 0;
+    std::vector<NoteData> m_vRibbonStripNotes[RibbonTierCount];
+    unsigned m_uRibbonStripCount = 0;
+    float m_StripBendCurves[BendCurveRows * BendCurveSamples] = {};
+    bool m_bStripBendCurvesValid = false;
+    bool m_bStripDepthCleared = false; // the strip's note pass already cleared depth this frame
     float m_BendCurves[BendCurveRows * BendCurveSamples] = {};
     bool m_bBendCurvesValid = false;
     int m_iRectSplit = -1;
@@ -501,6 +516,8 @@ ComPtr<ID3D12RootSignature> m_pBackgroundRootSignature;
     ComPtr<ID3D12Resource> m_pChunkFixedUpload;
     HRESULT EnsureChunkResources(int slot, int W, int H);
     HRESULT RenderImageBuffer();
+    void DrawPianoRollStripNotes();
+    void DrawPianoRollStripRibbons();
 
     UINT m_uFrameIndex = 0;
     UINT64 m_pFenceValues[FrameCount] = {};

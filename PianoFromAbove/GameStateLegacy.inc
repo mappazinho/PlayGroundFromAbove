@@ -4269,22 +4269,27 @@ void MainScreen::BuildBendTimeline()
 // modulation (0..1) over the visible window, [now, now + timespan], so the vertex shader can bend
 // and wave each note along its own length. Returns true if any channel has a non-zero bend or
 // modulation in the window.
-bool MainScreen::BuildBendCurves()
+bool MainScreen::BuildBendCurves(bool bStrip)
 {
     constexpr unsigned N = Renderer::BendCurveSamples;
     if (m_uBendTimelineKey != (m_vProgramChange.size() ^ (m_vEvents.size() << 20)))
         BuildBendTimeline();
 
-    memset(m_bBendChanCurved, 0, sizeof(m_bBendChanCurved));
-    if (m_llTimeSpan <= 0)
+    // The main roll shows m_llTimeSpan; the dual roll shows a longer window with its own curves.
+    const long long llSpan = bStrip ? (long long)ceilf(m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY)) : m_llTimeSpan;
+    bool* aCurved = bStrip ? m_bStripBendChanCurved : m_bBendChanCurved;
+    vector<float>& vCurves = bStrip ? m_vStripBendCurves : m_vBendCurves;
+    vector<uint32_t>& vPrefix = bStrip ? m_vStripBendChangePrefix : m_vBendChangePrefix;
+    memset(aCurved, 0, 16 * sizeof(bool));
+    if (llSpan <= 0)
         return false;
 
-    m_vBendCurves.resize(Renderer::BendCurveRows * N);
-    m_vBendChangePrefix.resize(16 * N);
+    vCurves.resize(Renderer::BendCurveRows * N);
+    vPrefix.resize(16 * N);
 
     const auto& viz = Config::GetConfig().GetVizSettings();
     const long long llWindowStart = m_llRndStartTime;
-    const double dSpan = (double)m_llTimeSpan;
+    const double dSpan = (double)llSpan;
     const float fCorrupt = GetCorruptorAmount();
     auto unitOf = [&](const BendPoint& point) -> long long {
         return m_bTickMode ? (long long)m_MIDI.GetEventAbsT(m_vEvents[point.idx]) : point.time;
@@ -4361,9 +4366,9 @@ bool MainScreen::BuildBendCurves()
     bool bAny = false;
     for (unsigned ch = 0; ch < 16; ch++)
     {
-        float* bend = &m_vBendCurves[ch * N];
-        float* mod = &m_vBendCurves[(16 + ch) * N];
-        uint32_t* prefix = &m_vBendChangePrefix[ch * N];
+        float* bend = &vCurves[ch * N];
+        float* mod = &vCurves[(16 + ch) * N];
+        uint32_t* prefix = &vPrefix[ch * N];
 
         bool bBend = false, bMod = false;
         if (viz.bVisualizePitchBends)
@@ -4386,45 +4391,55 @@ bool MainScreen::BuildBendCurves()
                 uChanges++;
             prefix[k] = uChanges;
         }
-        m_bBendChanCurved[ch] = bBend || bMod;
+        aCurved[ch] = bBend || bMod;
         bAny |= bBend || bMod;
     }
 
     if (bAny)
-        m_pRenderer->SetBendCurves(m_vBendCurves.data());
+    {
+        if (bStrip)
+            m_pRenderer->SetStripBendCurves(vCurves.data());
+        else
+            m_pRenderer->SetBendCurves(vCurves.data());
+    }
     return bAny;
 }
 
 // Routes a note of a bending channel to the ribbon pipeline. Notes whose channel is not bent
 // anywhere along their length take the cheap plain path instead (unbent) or a single shifted
 // quad (constant bend); the rest get a slice count that follows their height on screen.
-bool MainScreen::PushBendRibbonNote(const NoteData& data)
+bool MainScreen::PushBendRibbonNote(const NoteData& data, bool bStrip)
 {
     constexpr unsigned N = Renderer::BendCurveSamples;
     const unsigned ch = data.channel & 15u;
-    if (!m_bBendChanCurved[ch] || m_llTimeSpan <= 0)
+    const long long llSpan = bStrip ? (long long)ceilf(m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY)) : m_llTimeSpan;
+    const bool* aCurved = bStrip ? m_bStripBendChanCurved : m_bBendChanCurved;
+    const vector<float>& vCurves = bStrip ? m_vStripBendCurves : m_vBendCurves;
+    const vector<uint32_t>& vPrefix = bStrip ? m_vStripBendChangePrefix : m_vBendChangePrefix;
+    if (!aCurved[ch] || llSpan <= 0)
         return false;
 
-    const double dSpan = (double)m_llTimeSpan;
+    const double dSpan = (double)llSpan;
     const double dFrom = min(max((double)data.pos / dSpan, 0.0), 1.0);
     const double dTo = min(max(((double)data.pos + max((double)data.length, 0.0)) / dSpan, 0.0), 1.0);
     const unsigned k0 = (unsigned)floor(dFrom * (N - 1));
     const unsigned k1 = min((unsigned)ceil(dTo * (N - 1)), N - 1);
 
     unsigned tier = 0;
-    if (m_vBendChangePrefix[ch * N + k1] == m_vBendChangePrefix[ch * N + k0])
+    if (vPrefix[ch * N + k1] == vPrefix[ch * N + k0])
     {
-        if (m_vBendCurves[ch * N + k0] == 0.0f)
+        if (vCurves[ch * N + k0] == 0.0f)
             return false;
     }
     else
     {
-        const double dRows = (dTo - dFrom) * (double)m_fNotesCY;
+        // slice count follows the on-screen length: height in the main roll, width in the strip
+        const double dRows = (dTo - dFrom) * (bStrip ? (double)m_pRenderer->GetBufferWidth() : (double)m_fNotesCY);
         const unsigned uWanted = (unsigned)min(max(ceil(dRows / 3.0), 2.0), (double)(1u << (Renderer::RibbonTierCount - 1)));
         while ((1u << tier) < uWanted)
             tier++;
     }
-    return m_pRenderer->PushRibbonNoteData(data, tier);
+    return bStrip ? m_pRenderer->PushRibbonStripNoteData(data, tier) : m_pRenderer->PushRibbonNoteData(data, tier);
 }
 
 void MainScreen::RenderNotes()
@@ -4438,7 +4453,10 @@ void MainScreen::RenderNotes()
     // Bent notes are drawn as ribbons straight from the event list. Visual Buffer Notes bakes notes
     // into cached chunks that cannot follow a bend per note, so frames that have a bend in view
     // bypass the baked chunks for the main roll (the strip below keeps using them).
-    m_bBendRibbonsFrame = (renderViz.bVisualizePitchBends || renderViz.bVisualizeModulation) && !horizontalOnly && BuildBendCurves();
+    const bool bBendViz = renderViz.bVisualizePitchBends || renderViz.bVisualizeModulation;
+    m_bBendRibbonsFrame = bBendViz && !horizontalOnly && BuildBendCurves();
+    // The dual roll (and the horizontal roll) get ribbons too, from curves over their own window.
+    m_bStripRibbonsFrame = bBendViz && hasStrip && BuildBendCurves(true);
 
     if ( m_iEndPos < 0 || m_iStartPos >= eventCount )
     {
@@ -4472,7 +4490,7 @@ void MainScreen::RenderNotes()
     }
 
     if (hasStrip) {
-    if (bImageBuffer) {
+    if (bImageBuffer && !m_bStripRibbonsFrame) {
         RenderPianoRollStripImageBuffer();
     } else {
         const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY);
@@ -4838,7 +4856,10 @@ void MainScreen::RenderPianoRollStripImageBuffer()
 
 void MainScreen::RenderPianoRollStripNote(const MIDIChannelEvent pNote)
 {
-    m_pRenderer->PushPianoRollStripNoteData(BuildRenderNoteData(pNote));
+    const NoteData data = BuildRenderNoteData(pNote);
+    if (m_bStripRibbonsFrame && PushBendRibbonNote(data, true))
+        return;
+    m_pRenderer->PushPianoRollStripNoteData(data);
 }
 
 float MainScreen::GetNoteCoord(int iNote)

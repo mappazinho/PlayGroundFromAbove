@@ -26,6 +26,10 @@ struct RibbonPSInput {
 };
 
 float4 main(RibbonPSInput input) : SV_TARGET {
+    if (stripMode > 0.5)
+        return (abs(input.position.x - input.edges.x) <= deflate ||
+                abs(input.position.x - input.edges.z) <= deflate) ? input.border : input.color;
+
     return (abs(input.position.x - input.edges.x) <= input.tol ||
             abs(input.position.x - input.edges.z) <= input.tol ||
             abs(input.position.y - input.edges.y) <= deflate ||

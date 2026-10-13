@@ -125,7 +125,119 @@ float RowY(uint row, uint slices, float yt, float yb) {
     return y;
 }
 
+// ---- Dual roll (strip) ribbons ------------------------------------------------------------------
+// The strip lays time along x and the keys along y, so a bend shifts a note vertically and a
+// modulation wave runs along its length. The curve here covers the strip's own time window.
+
+float SampleStripCurve(uint row, float x) {
+    float u = saturate(x / notes_cy);
+    float f = u * (RIBBON_CURVE_N - 1);
+    uint i0 = min((uint)f, RIBBON_CURVE_N - 2);
+    float a = bend_curve[row * RIBBON_CURVE_N + i0];
+    float b = bend_curve[row * RIBBON_CURVE_N + i0 + 1];
+    return lerp(a, b, saturate(f - (float)i0));
+}
+
+// Vertical offset of the note's centre line at x: pitch bend plus modulation wave.
+float StripOffset(uint chan, float x, float xs, float cy) {
+    float wavelength = max(cy * 12.0f, 24.0f);
+    float wave = SampleStripCurve(16u + chan, x) * cy * 1.5f * sin((x - xs) * 6.2831853f / wavelength);
+    return SampleStripCurve(chan, x) * (white_cx * (7.0f / 12.0f)) + wave;
+}
+
+float StripRowX(uint row, uint slices, float xs, float xe) {
+    float vlo = max(xs, 0.0f);
+    float vhi = min(xe, notes_cy);
+    if (vhi <= vlo) {
+        vlo = xs;
+        vhi = xe;
+    }
+    float x = lerp(vlo, vhi, (float)row / (float)slices);
+    x = row == 0 ? xs : x;
+    x = row >= slices ? xe : x;
+    return x;
+}
+
+RibbonPSInput StripMain(uint id, uint inst) {
+    RibbonPSInput result;
+
+    uint packed = note_data[inst].packed;
+    uint note = packed & 0xFF;
+    uint chanByte = (packed >> 8) & 0xFF;
+    uint chan = chanByte & 15u;
+    uint slices = 1u << ((chanByte >> 4) & 7u);
+    uint track = ((packed >> 16) & 0xFFFF) % MAX_TRACK_COLORS;
+
+    static const uint corner_right[6] = { 0u, 1u, 1u, 0u, 1u, 0u };
+    static const uint corner_bottom[6] = { 0u, 0u, 1u, 0u, 1u, 1u };
+    uint slice = id / 6u;
+    uint corner = id % 6u;
+    bool at_bottom = corner_bottom[corner] != 0u;
+    uint row = slice + corner_right[corner];
+
+    float xs = notes_cy * (note_data[inst].pos / stripTimeSpan);
+    float xe = xs + notes_cy * max(note_data[inst].length / stripTimeSpan, 0.0f);
+
+    bool sharp = ((1 << (note % 12)) & 0x54A) != 0;
+    uint r = note % 12u;
+    uint octave = note / 12u;
+    static const uint sharps_below[12] = { 0u, 0u, 1u, 1u, 2u, 2u, 2u, 3u, 3u, 4u, 4u, 5u };
+    uint whites_below = note - octave * 5u - sharps_below[r];
+    float whiteH = white_cx;
+    float y, cy;
+    if (!sharp) {
+        y = notes_y + whiteH * (float)(whites_below + 1u);
+        cy = whiteH;
+    } else {
+        float nudge = 0.0;
+        if (r == 1u || r == 6u) nudge = -0.05f;
+        else if (r == 3u || r == 10u) nudge = 0.05f;
+        float boundary = notes_y + whiteH * (float)whites_below;
+        y = boundary + whiteH * (0.325f + nudge);
+        cy = whiteH * 0.65f;
+    }
+
+    float rx = StripRowX(row, slices, xs, xe);
+    float off = StripOffset(chan, rx, xs, cy);
+    float2 p = float2(rx, (at_bottom ? y : y - cy) + off);
+
+    float qt = floor(fWarpTime * 2.0);
+    float h = WarpHash(float2(xs * 0.013, qt * 2.71));
+    float amp = NoteCorruptAmp(fWarp, NoteCorruptFactor(h));
+    float gh = WarpHash(float2(xs * 0.019, qt * 0.61 + 0.83));
+    bool gradBroken = gh > 1.0 - min(1.0, amp) * 0.65;
+    uint palette[3] = { colors[track * 16 + chan].colors[0],
+                        colors[track * 16 + chan].colors[1],
+                        colors[track * 16 + chan].colors[2] };
+    uint color = palette[at_bottom ? 0 : 1];
+    if (gradBroken) {
+        float g = WarpHash(float2(xs * 0.023, qt * 0.53 + (float)(id & 3u) * 0.37 + 0.19));
+        color = palette[(uint)(g * 3.0)];
+    }
+
+    float2 position = p + WarpOffset(p, amp, fWarpTime, fWarpSeedX, fWarpSeedY, xs * 0.013);
+
+    float edgeL = xs;
+    float edgeR = xe;
+    if (amp > 0.0) {
+        float2 pl = float2(xs, y - cy * 0.5f);
+        float2 pr = float2(xe, y - cy * 0.5f);
+        edgeL = (pl + WarpOffset(pl, amp, fWarpTime, fWarpSeedX, fWarpSeedY, xs * 0.013)).x;
+        edgeR = (pr + WarpOffset(pr, amp, fWarpTime, fWarpSeedX, fWarpSeedY, xs * 0.013)).x;
+    }
+
+    result.position = colors[track * 16 + chan].colors[2] == 0xFFFFFFFF ? float4(0, 0, 0, 0) : mul(proj, float4(position, !sharp * 0.5, 1));
+    result.color = float4(unpack_color(color), 0);
+    result.border = float4(unpack_color(colors[track * 16 + chan].colors[2]), 0);
+    result.edges = float4(edgeL, 0, edgeR, 0);
+    result.tol = deflate;
+
+    return result;
+}
+
 RibbonPSInput main(uint id : SV_VertexID, uint inst : SV_InstanceID) {
+    if (stripMode > 0.5)
+        return StripMain(id, inst);
     RibbonPSInput result;
 
     uint packed = note_data[inst].packed;

@@ -115,6 +115,8 @@ private:
     ComPtr<ID3D11Buffer> m_pChunkQuadConstants; // b0 during chunk quad pass (proj + quadPos + quadSize)
     HRESULT EnsureChunkResources(int slot, int W, int H);
     HRESULT RenderImageBuffer();
+    void DrawPianoRollStripNotes();
+    void DrawPianoRollStripRibbons();
 
     ComPtr<ID3D11InputLayout> m_pRectInputLayout;
     ComPtr<ID3D11Buffer> m_pIndexBuffer;

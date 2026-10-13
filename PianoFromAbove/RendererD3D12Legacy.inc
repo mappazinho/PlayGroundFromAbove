@@ -807,7 +807,7 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
     // Pitch-bend ribbons, one upload buffer per frame: the sampled bend curves first, then the
     // ribbon notes grouped by slice-count tier (each tier is drawn from its own offset).
     auto ribbon_buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(
-        (UINT64)(BendCurveRows * BendCurveSamples * sizeof(float)) + (UINT64)RibbonNoteCapacity * sizeof(NoteData));
+        2 * ((UINT64)(BendCurveRows * BendCurveSamples * sizeof(float)) + (UINT64)RibbonNoteCapacity * sizeof(NoteData)));
     for (uint32_t i = 0; i < FrameCount; i++) {
         res = m_pDevice->CreateCommittedResource(
             &upload_heap,
@@ -1311,6 +1311,9 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
     for (auto& tierNotes : m_vRibbonNotes)
         tierNotes.clear();
     m_uRibbonNoteCount = 0;
+    for (auto& tierNotes : m_vRibbonStripNotes)
+        tierNotes.clear();
+    m_uRibbonStripCount = 0;
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
@@ -1909,6 +1912,80 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D12Renderer::DrawPianoRollStrip() {
+    m_bStripDepthCleared = false;
+    DrawPianoRollStripNotes();
+    DrawPianoRollStripRibbons();
+}
+
+// Bent dual roll notes: instanced slice strips, drawn after the plain strip notes. They use the
+// second half of the frame's ribbon buffer (its own curves, then the notes grouped by tier).
+void D3D12Renderer::DrawPianoRollStripRibbons() {
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    const bool horizontal = stripViz.bHorizontalPianoRoll;
+    if ((!stripViz.bDualPianoRoll && !horizontal) || m_uRibbonStripCount == 0 || !m_bStripBendCurvesValid ||
+        !m_pRibbonPipelineState)
+        return;
+
+    const float stripTop = horizontal ? 0.0f : 20.0f + 35.0f;
+    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+    const float stripW = (float)m_iBufferWidth;
+    const int nKeys = 128;
+    static const int sSharpsBelow[12] = { 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5 };
+    const int nWhiteKeys = nKeys - (nKeys / 12) * 5 - sSharpsBelow[nKeys % 12];
+    const float keyH = stripH / (float)nKeys;
+    const float whiteH = stripH / (float)nWhiteKeys;
+
+    ID3D12Resource* ribbonBuffer = m_pRibbonBuffers[m_uFrameIndex].Get();
+    const UINT64 curveBytes = (UINT64)BendCurveRows * BendCurveSamples * sizeof(float);
+    const UINT64 stripBase = curveBytes + (UINT64)RibbonNoteCapacity * sizeof(NoteData);
+    const D3D12_RANGE noRead = { 0, 0 };
+    uint8_t* mapped = nullptr;
+    if (FAILED(ribbonBuffer->Map(0, &noRead, (void**)&mapped)))
+        return;
+    memcpy(mapped + stripBase, m_StripBendCurves, (size_t)curveBytes);
+    UINT64 tierOffset[RibbonTierCount] = {};
+    UINT64 written = stripBase + curveBytes;
+    for (unsigned tier = 0; tier < RibbonTierCount; tier++) {
+        tierOffset[tier] = written;
+        const auto& tierNotes = m_vRibbonStripNotes[tier];
+        if (tierNotes.empty())
+            continue;
+        memcpy(mapped + written, tierNotes.data(), tierNotes.size() * sizeof(NoteData));
+        written += tierNotes.size() * sizeof(NoteData);
+    }
+    const D3D12_RANGE writeRange = { (SIZE_T)stripBase, (SIZE_T)written };
+    ribbonBuffer->Unmap(0, &writeRange);
+
+    if (!m_bStripDepthCleared) {
+        CD3DX12_CPU_DESCRIPTOR_HANDLE stripDsv(m_pDSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+        m_pCommandList->ClearDepthStencilView(stripDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    }
+
+    RootConstants savedRoot = m_RootConstants;
+    m_RootConstants.deflate = max(1.0f, min(3.0f, round(keyH * 0.15f / 2.0f)));
+    m_RootConstants.notes_y = stripTop;
+    m_RootConstants.notes_cy = stripW;
+    m_RootConstants.white_cx = whiteH;
+    m_RootConstants.timespan = stripH;
+    m_RootConstants.stripMode = 1.0f;
+    m_RootConstants.stripTimeSpan = GetDualRollTimeSpan(savedRoot.timespan, savedRoot.notes_cy);
+
+    SetPipeline(Pipeline::NoteRibbon);
+    const D3D12_GPU_VIRTUAL_ADDRESS ribbonVA = ribbonBuffer->GetGPUVirtualAddress();
+    m_pCommandList->SetGraphicsRootShaderResourceView(4, ribbonVA + stripBase);
+    for (unsigned tier = 0; tier < RibbonTierCount; tier++) {
+        const auto& tierNotes = m_vRibbonStripNotes[tier];
+        if (tierNotes.empty())
+            continue;
+        m_pCommandList->SetGraphicsRootShaderResourceView(3, ribbonVA + tierOffset[tier]);
+        m_pCommandList->DrawInstanced(6u << tier, (UINT)tierNotes.size(), 0, 0);
+    }
+
+    m_RootConstants = savedRoot;
+    SetPipeline(Pipeline::Note);
+}
+
+void D3D12Renderer::DrawPianoRollStripNotes() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     const bool horizontal = stripViz.bHorizontalPianoRoll;
     if (!stripViz.bDualPianoRoll && !horizontal)
@@ -1938,6 +2015,7 @@ void D3D12Renderer::DrawPianoRollStrip() {
     // Reposition the depth so the strip pass starts clean; nothing after it
     CD3DX12_CPU_DESCRIPTOR_HANDLE stripDsv(m_pDSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
     m_pCommandList->ClearDepthStencilView(stripDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    m_bStripDepthCleared = true;
 
     const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripW = (float)m_iBufferWidth;

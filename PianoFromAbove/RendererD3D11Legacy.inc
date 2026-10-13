@@ -769,6 +769,9 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
     for (auto& tierNotes : m_vRibbonNotes)
         tierNotes.clear();
     m_uRibbonNoteCount = 0;
+    for (auto& tierNotes : m_vRibbonStripNotes)
+        tierNotes.clear();
+    m_uRibbonStripCount = 0;
     m_iRectSplit = -1;
 
     UpdateWarpConstants();
@@ -1608,6 +1611,66 @@ void D3D11Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D11Renderer::DrawPianoRollStrip() {
+    m_bStripDepthCleared = false;
+    DrawPianoRollStripNotes();
+    DrawPianoRollStripRibbons();
+}
+
+// Bent dual roll notes: instanced slice strips, drawn after the plain strip notes.
+void D3D11Renderer::DrawPianoRollStripRibbons() {
+    const auto& stripViz = Config::GetConfig().GetVizSettings();
+    const bool horizontal = stripViz.bHorizontalPianoRoll;
+    if ((!stripViz.bDualPianoRoll && !horizontal) || m_uRibbonStripCount == 0 || !m_bStripBendCurvesValid ||
+        !m_pRibbonVS || !m_pRibbonPS)
+        return;
+
+    const float stripTop = horizontal ? 0.0f : 20.0f + 35.0f;
+    const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
+    const float stripW = (float)m_iBufferWidth;
+    const int nKeys = 128;
+    static const int sSharpsBelow[12] = { 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5 };
+    const int nWhiteKeys = nKeys - (nKeys / 12) * 5 - sSharpsBelow[nKeys % 12];
+    const float keyH = stripH / (float)nKeys;
+    const float whiteH = stripH / (float)nWhiteKeys;
+
+    if (!m_bStripDepthCleared)
+        m_pContext->ClearDepthStencilView(m_pDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    RootConstants savedRoot = m_RootConstants;
+    m_RootConstants.deflate = max(1.0f, min(3.0f, round(keyH * 0.15f / 2.0f)));
+    m_RootConstants.notes_y = stripTop;
+    m_RootConstants.notes_cy = stripW;
+    m_RootConstants.white_cx = whiteH;
+    m_RootConstants.timespan = stripH;
+    m_RootConstants.stripMode = 1.0f;
+    m_RootConstants.stripTimeSpan = GetDualRollTimeSpan(savedRoot.timespan, savedRoot.notes_cy);
+
+    D3D11_MAPPED_SUBRESOURCE curve_map = {};
+    if (SUCCEEDED(m_pContext->Map(m_pBendCurveBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &curve_map))) {
+        memcpy(curve_map.pData, m_StripBendCurves, sizeof(m_StripBendCurves));
+        m_pContext->Unmap(m_pBendCurveBuffer.Get(), 0);
+
+        ID3D11ShaderResourceView* nullRibbonSRVs[5] = {};
+        m_pContext->VSSetShaderResources(0, 5, nullRibbonSRVs);
+        SetPipeline(Pipeline::NoteRibbon);
+        for (unsigned tier = 0; tier < RibbonTierCount; tier++) {
+            const auto& tierNotes = m_vRibbonStripNotes[tier];
+            if (tierNotes.empty())
+                continue;
+            D3D11_MAPPED_SUBRESOURCE ribbon_map = {};
+            if (FAILED(m_pContext->Map(m_pNoteBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ribbon_map)))
+                break;
+            memcpy(ribbon_map.pData, tierNotes.data(), tierNotes.size() * sizeof(NoteData));
+            m_pContext->Unmap(m_pNoteBuffer.Get(), 0);
+            m_pContext->DrawInstanced(6u << tier, (UINT)tierNotes.size(), 0, 0);
+        }
+    }
+
+    m_RootConstants = savedRoot;
+    SetPipeline(Pipeline::Note);
+}
+
+void D3D11Renderer::DrawPianoRollStripNotes() {
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     const bool horizontal = stripViz.bHorizontalPianoRoll;
     if (!stripViz.bDualPianoRoll && !horizontal)
@@ -1635,6 +1698,7 @@ void D3D11Renderer::DrawPianoRollStrip() {
     const float stripTop = horizontal ? 0.0f : menuBarHeight + toolbarHeight;
 
     m_pContext->ClearDepthStencilView(m_pDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    m_bStripDepthCleared = true;
 
     const float stripH = horizontal ? (float)m_iBufferHeight : max(190.0f, min((float)m_iBufferHeight * 0.45f, (float)m_iBufferHeight * 0.28f));
     const float stripW = (float)m_iBufferWidth;

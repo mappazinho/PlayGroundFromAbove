@@ -470,9 +470,14 @@ void RenderText();
     vector<uint32_t> m_vBendChangePrefix;   // running count of curve changes, same layout
     bool m_bBendChanCurved[16] = {};        // channel has a non-zero bend somewhere in the window
     bool m_bBendRibbonsFrame = false;       // this frame's notes may be drawn as ribbons
+    // The same for the dual roll, whose window is longer: its own curves and ribbon flag.
+    vector<float> m_vStripBendCurves;
+    vector<uint32_t> m_vStripBendChangePrefix;
+    bool m_bStripBendChanCurved[16] = {};
+    bool m_bStripRibbonsFrame = false;
     void BuildBendTimeline();
-    bool BuildBendCurves();
-    bool PushBendRibbonNote(const NoteData& data);
+    bool BuildBendCurves(bool bStrip = false);
+    bool PushBendRibbonNote(const NoteData& data, bool bStrip = false);
 
     deque<tuple<long long, long long>> m_dNPSNotes;
     deque<long long> m_dNPSHistory;
