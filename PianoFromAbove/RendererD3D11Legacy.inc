@@ -369,14 +369,14 @@ std::tuple<HRESULT, const char*> D3D11Renderer::Init(HWND hWnd, bool bLimitFPS) 
     bend_desc.Usage = D3D11_USAGE_DYNAMIC;
     bend_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     bend_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    bend_desc.ByteWidth = 16 * BendCurveSamples * sizeof(float);
+    bend_desc.ByteWidth = BendCurveRows * BendCurveSamples * sizeof(float);
     bend_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     bend_desc.StructureByteStride = sizeof(float);
     res = m_pDevice->CreateBuffer(&bend_desc, nullptr, &m_pBendCurveBuffer);
     if (FAILED(res))
         return std::make_tuple(res, "CreateBuffer (bend curves)");
     srv_desc.BufferEx.FirstElement = 0;
-    srv_desc.BufferEx.NumElements = 16 * BendCurveSamples;
+    srv_desc.BufferEx.NumElements = BendCurveRows * BendCurveSamples;
     res = m_pDevice->CreateShaderResourceView(m_pBendCurveBuffer.Get(), &srv_desc, &m_pBendCurveSRV);
     if (FAILED(res))
         return std::make_tuple(res, "CreateShaderResourceView (bend curves)");

@@ -1321,6 +1321,10 @@ static void DrawFrameTimeGraphLate(Renderer* renderer)
             s_history.pop_front();
     }
 
+    // Menus, dialogs and popups sit over the stats: keep recording the history but draw nothing.
+    if (StatsCoveredByUI(renderer))
+        return;
+
     ImDrawList* dl = renderer->GetDrawList();
     if (!dl)
         return;

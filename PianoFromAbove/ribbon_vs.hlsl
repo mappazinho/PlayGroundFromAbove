@@ -43,6 +43,23 @@ float SampleBend(uint chan, float y) {
     return lerp(a, b, saturate(f - (float)i0));
 }
 
+// Modulation (rows 16..31 of the curve, 0..1) waves the note sideways: a sine along the note,
+// anchored to its bottom so the wave travels with it, whose width follows the modulation amount.
+float SampleMod(uint chan, float y) {
+    float u = saturate(1.0 - (y - root.notes_y) / root.notes_cy);
+    float f = u * (RIBBON_CURVE_N - 1);
+    uint i0 = min((uint)f, RIBBON_CURVE_N - 2);
+    float a = bend_curve[(16u + chan) * RIBBON_CURVE_N + i0];
+    float b = bend_curve[(16u + chan) * RIBBON_CURVE_N + i0 + 1];
+    return lerp(a, b, saturate(f - (float)i0));
+}
+
+// Total horizontal offset of the note's centre line at row y: pitch bend plus modulation wave.
+float RowOffset(uint chan, float y, float yb, float scale, float cx) {
+    float wavelength = max(root.white_cx * 2.0f, 8.0f);
+    float wave = SampleMod(chan, y) * cx * 0.7f * sin((yb - y) * 6.2831853f / wavelength);
+    return SampleBend(chan, y) * scale + wave;
+}
 // y of slice boundary `row` (0 = note top ... slices = note bottom). The interior boundaries
 // are spread over the part of the note that is actually on screen so a note much taller than
 // the view still gets full resolution where it can be seen.
@@ -86,8 +103,8 @@ RibbonPSInput main(uint id : SV_VertexID, uint inst : SV_InstanceID) {
 
     float ry0 = RowY(slice, slices, yt, yb);
     float ry1 = RowY(slice + 1u, slices, yt, yb);
-    float bend0 = SampleBend(chan, ry0) * scale;
-    float bend1 = SampleBend(chan, ry1) * scale;
+    float bend0 = RowOffset(chan, ry0, yb, scale, cx);
+    float bend1 = RowOffset(chan, ry1, yb, scale, cx);
     float ry = row == slice ? ry0 : ry1;
     float bend = row == slice ? bend0 : bend1;
     float slope = (bend1 - bend0) / max(ry1 - ry0, 1.0f);
@@ -120,8 +137,8 @@ RibbonPSInput main(uint id : SV_VertexID, uint inst : SV_InstanceID) {
     if (amp > 0.0) {
         edgeL = (pl + WarpOffset(pl, amp, root.fWarpTime, root.fWarpSeedX, root.fWarpSeedY, x0 * 0.013)).x;
         edgeR = (pr + WarpOffset(pr, amp, root.fWarpTime, root.fWarpSeedX, root.fWarpSeedY, x0 * 0.013)).x;
-        float bt = SampleBend(chan, yt) * scale;
-        float bb = SampleBend(chan, yb) * scale;
+        float bt = RowOffset(chan, yt, yb, scale, cx);
+        float bb = RowOffset(chan, yb, yb, scale, cx);
         float4 wy;
         wy.x = (float2(x0 + bt, yt) + WarpOffset(float2(x0 + bt, yt), amp, root.fWarpTime, root.fWarpSeedX, root.fWarpSeedY, x0 * 0.013)).y;
         wy.y = (float2(x0 + bt + cx, yt) + WarpOffset(float2(x0 + bt + cx, yt), amp, root.fWarpTime, root.fWarpSeedX, root.fWarpSeedY, x0 * 0.013)).y;

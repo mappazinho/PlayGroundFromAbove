@@ -202,6 +202,7 @@ public:
     // 1 << tier slices (tier 0..RibbonTierCount-1); the shader reads the slice count back from
     // the channel byte, so channel is stored as chan | (tier << 4).
     static constexpr unsigned BendCurveSamples = 1024;
+    static constexpr unsigned BendCurveRows = 32; // rows 0..15: bend per channel (semitones), 16..31: modulation per channel (0..1)
     static constexpr unsigned RibbonTierCount = 8;
     static constexpr unsigned RibbonNoteCapacity = 262144;
     void SetBendCurves(const float* curves) { memcpy(m_BendCurves, curves, sizeof(m_BendCurves)); m_bBendCurvesValid = true; }
@@ -342,7 +343,7 @@ protected:
     std::vector<NoteData> m_vPianoRollStripNotesIntermediate;
     std::vector<NoteData> m_vRibbonNotes[RibbonTierCount];
     unsigned m_uRibbonNoteCount = 0;
-    float m_BendCurves[16 * BendCurveSamples] = {};
+    float m_BendCurves[BendCurveRows * BendCurveSamples] = {};
     bool m_bBendCurvesValid = false;
     int m_iRectSplit = -1;
 

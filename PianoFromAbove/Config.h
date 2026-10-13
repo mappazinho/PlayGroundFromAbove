@@ -218,6 +218,7 @@ struct VizSettings : public ISettings {
     std::wstring sSplashMIDI;
     std::vector<std::wstring> vRecentMIDIs;
     bool bVisualizePitchBends;
+    bool bVisualizeModulation;
     bool bDualPianoRoll;
     bool bHorizontalPianoRoll;
     bool bDualRollKeyboard;

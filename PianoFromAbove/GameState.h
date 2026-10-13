@@ -461,8 +461,9 @@ void RenderText();
     // bend curves sampled over the visible window that are handed to the renderer every frame.
     struct BendPoint { long long time; int idx; }; // idx: row in m_vEvents
     vector<BendPoint> m_vBendTimeline[16];
+    vector<BendPoint> m_vModTimeline[16];  // modulation (controller 1)
     size_t m_uBendTimelineKey = SIZE_MAX;
-    vector<float> m_vBendCurves;            // [16][Renderer::BendCurveSamples], semitones
+    vector<float> m_vBendCurves;            // [Renderer::BendCurveRows][BendCurveSamples]: bend (semitones), then modulation (0..1)
     vector<uint32_t> m_vBendChangePrefix;   // running count of curve changes, same layout
     bool m_bBendChanCurved[16] = {};        // channel has a non-zero bend somewhere in the window
     bool m_bBendRibbonsFrame = false;       // this frame's notes may be drawn as ribbons

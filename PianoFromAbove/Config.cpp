@@ -250,6 +250,7 @@ void VizSettings::LoadDefaultValues() {
     this->sSplashMIDI = L"";
     this->vRecentMIDIs.clear();
     this->bVisualizePitchBends = false;
+    this->bVisualizeModulation = false;
     this->bDualPianoRoll = false;
     this->bHorizontalPianoRoll = false;
     this->bDualRollKeyboard = true;
@@ -546,6 +547,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bSysStats = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("VisualizePitchBends", &iAttrVal) == TIXML_SUCCESS)
         bVisualizePitchBends = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("VisualizeModulation", &iAttrVal) == TIXML_SUCCESS)
+        bVisualizeModulation = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("DualPianoRoll", &iAttrVal) == TIXML_SUCCESS)
         bDualPianoRoll = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("HorizontalPianoRoll", &iAttrVal) == TIXML_SUCCESS)
@@ -861,6 +864,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
         }
     }
     txViz->SetAttribute("VisualizePitchBends", bVisualizePitchBends);
+    txViz->SetAttribute("VisualizeModulation", bVisualizeModulation);
     txViz->SetAttribute("DualPianoRoll", bDualPianoRoll);
     txViz->SetAttribute("HorizontalPianoRoll", bHorizontalPianoRoll);
     txViz->SetAttribute("DualRollKeyboard", bDualRollKeyboard);

@@ -133,7 +133,7 @@ private:
     ComPtr<ID3D11Buffer> m_pNoteBuffer;      // dynamic, NoteBufferCapacity elements
     ComPtr<ID3D11ShaderResourceView> m_pNoteSRV;
     ComPtr<ID3D11ShaderResourceView> m_pStripNoteSRV; // starts at PianoRollStripNoteOffset
-    ComPtr<ID3D11Buffer> m_pBendCurveBuffer;  // dynamic, 16 * BendCurveSamples floats (t4 for ribbon notes)
+    ComPtr<ID3D11Buffer> m_pBendCurveBuffer;  // dynamic, BendCurveRows * BendCurveSamples floats (t4 for ribbon notes)
     ComPtr<ID3D11ShaderResourceView> m_pBendCurveSRV;
     ComPtr<ID3D11Buffer> m_pRectVertexBuffer; // dynamic, RectsPerPass * 4 vertices
 

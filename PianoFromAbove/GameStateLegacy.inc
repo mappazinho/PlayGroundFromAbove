@@ -2568,6 +2568,8 @@ void MainScreen::Discard()
     eventvec_t().swap(m_vProgramChange);
     for (auto& timeline : m_vBendTimeline)
         vector<BendPoint>().swap(timeline);
+    for (auto& timeline : m_vModTimeline)
+        vector<BendPoint>().swap(timeline);
     m_uBendTimelineKey = SIZE_MAX;
     eventvec_t().swap(m_vTempo);
     eventvec_t().swap(m_vSignature);
@@ -4212,27 +4214,32 @@ float MainScreen::GetCorruptorAmount() const
     return (float)dRamp;
 }
 
-// Splits the pitch-bend events of the song up per channel (they arrive time-ordered in
-// m_vProgramChange together with controller and program changes).
+// Splits the pitch-bend and modulation (controller 1) events of the song up per channel (they
+// arrive time-ordered in m_vProgramChange together with other controller and program changes).
 void MainScreen::BuildBendTimeline()
 {
     for (auto& timeline : m_vBendTimeline)
+        timeline.clear();
+    for (auto& timeline : m_vModTimeline)
         timeline.clear();
     for (const auto& change : m_vProgramChange)
     {
         if (change.second < 0 || (size_t)change.second >= m_vEvents.size())
             continue;
         const MIDIChannelEvent pEvent = m_vEvents[change.second];
-        if (m_MIDI.GetEventChannelEventType(pEvent) != MIDI::PitchBend)
-            continue;
-        m_vBendTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
+        const MIDI::ChannelEventType eType = m_MIDI.GetEventChannelEventType(pEvent);
+        if (eType == MIDI::PitchBend)
+            m_vBendTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
+        else if (eType == MIDI::Controller && m_MIDI.GetEventParam1(pEvent) == 1)
+            m_vModTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
     }
     m_uBendTimelineKey = m_vProgramChange.size() ^ (m_vEvents.size() << 20);
 }
 
-// Samples every channel's bend (in semitones, as the old sliding visualization used) over the
-// visible window, [now, now + timespan], so the vertex shader can bend each note along its own
-// length. Returns true if any channel has a non-zero bend in the window.
+// Samples every channel's pitch bend (in semitones, as the old sliding visualization used) and
+// modulation (0..1) over the visible window, [now, now + timespan], so the vertex shader can bend
+// and wave each note along its own length. Returns true if any channel has a non-zero bend or
+// modulation in the window.
 bool MainScreen::BuildBendCurves()
 {
     constexpr unsigned N = Renderer::BendCurveSamples;
@@ -4243,9 +4250,10 @@ bool MainScreen::BuildBendCurves()
     if (m_llTimeSpan <= 0)
         return false;
 
-    m_vBendCurves.resize(16 * N);
+    m_vBendCurves.resize(Renderer::BendCurveRows * N);
     m_vBendChangePrefix.resize(16 * N);
 
+    const auto& viz = Config::GetConfig().GetVizSettings();
     const long long llWindowStart = m_llRndStartTime;
     const double dSpan = (double)m_llTimeSpan;
     const float fCorrupt = GetCorruptorAmount();
@@ -4258,21 +4266,23 @@ bool MainScreen::BuildBendCurves()
             (m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent));
         return ((short)(iBend - 8192)) / (8192.0f / 12.0f);
     };
+    auto modulationOf = [&](const BendPoint& point) -> float {
+        const MIDIChannelEvent pEvent = m_vEvents[point.idx];
+        return CorruptValue(fCorrupt, CorruptSeed(pEvent, UINT32_MAX), m_MIDI.GetEventParam2(pEvent)) / 127.0f;
+    };
 
-    bool bAny = false;
-    for (unsigned ch = 0; ch < 16; ch++)
-    {
-        float* curve = &m_vBendCurves[ch * N];
-        uint32_t* prefix = &m_vBendChangePrefix[ch * N];
-        const auto& timeline = m_vBendTimeline[ch];
+    // Fills one channel's curve from its event timeline; returns true if any sample is non-zero.
+    // The wheel/controller holds its value until the next event, but both are usually streams of
+    // closely spaced events: those are joined by straight segments so the note bends smoothly. A
+    // longer gap is a genuine jump and stays a step.
+    auto fillCurve = [&](const vector<BendPoint>& timeline, float* curve, auto&& valueOf) -> bool {
         if (timeline.empty())
         {
             memset(curve, 0, N * sizeof(float));
-            memset(prefix, 0, N * sizeof(uint32_t));
-            continue;
+            return false;
         }
 
-        // First bend after the window start; the one before it is the value the window opens with.
+        // First event after the window start; the one before it is the value the window opens with.
         size_t lo = 0, hi = timeline.size();
         while (lo < hi)
         {
@@ -4282,24 +4292,20 @@ bool MainScreen::BuildBendCurves()
             else
                 hi = mid;
         }
-        // The wheel holds its value until the next event, but bends are usually streams of closely
-        // spaced events: those are joined by straight segments so the note bends smoothly. A longer
-        // gap is a genuine jump and stays a step.
         constexpr long long llSmoothGapUs = 100000;
         size_t next = lo;
         bool bHasPrev = next > 0;
-        float fPrev = bHasPrev ? semitonesOf(timeline[next - 1]) : 0.0f;
+        float fPrev = bHasPrev ? valueOf(timeline[next - 1]) : 0.0f;
         long long llPrevUnit = bHasPrev ? unitOf(timeline[next - 1]) : 0;
         long long llPrevTime = bHasPrev ? timeline[next - 1].time : 0;
         long long llNextUnit = LLONG_MAX;
         float fNext = 0.0f;
         auto loadNext = [&]() {
             llNextUnit = next < timeline.size() ? unitOf(timeline[next]) : LLONG_MAX;
-            fNext = next < timeline.size() ? semitonesOf(timeline[next]) : 0.0f;
+            fNext = next < timeline.size() ? valueOf(timeline[next]) : 0.0f;
         };
         loadNext();
 
-        uint32_t uChanges = 0;
         bool bNonZero = false;
         for (unsigned k = 0; k < N; k++)
         {
@@ -4317,14 +4323,42 @@ bool MainScreen::BuildBendCurves()
             if (bHasPrev && next < timeline.size() && llNextUnit > llPrevUnit &&
                 timeline[next].time - llPrevTime <= llSmoothGapUs)
                 fValue = fPrev + (fNext - fPrev) * (float)((double)(llSample - llPrevUnit) / (double)(llNextUnit - llPrevUnit));
-            if (k > 0 && fValue != curve[k - 1])
-                uChanges++;
             curve[k] = fValue;
-            prefix[k] = uChanges;
             bNonZero |= fValue != 0.0f;
         }
-        m_bBendChanCurved[ch] = bNonZero;
-        bAny |= bNonZero;
+        return bNonZero;
+    };
+
+    bool bAny = false;
+    for (unsigned ch = 0; ch < 16; ch++)
+    {
+        float* bend = &m_vBendCurves[ch * N];
+        float* mod = &m_vBendCurves[(16 + ch) * N];
+        uint32_t* prefix = &m_vBendChangePrefix[ch * N];
+
+        bool bBend = false, bMod = false;
+        if (viz.bVisualizePitchBends)
+            bBend = fillCurve(m_vBendTimeline[ch], bend, semitonesOf);
+        else
+            memset(bend, 0, N * sizeof(float));
+        if (viz.bVisualizeModulation)
+            bMod = fillCurve(m_vModTimeline[ch], mod, modulationOf);
+        else
+            memset(mod, 0, N * sizeof(float));
+
+        // A sample counts as a change where the bend moves, or wherever there is any modulation (a
+        // modulated note waves even while the wheel and the controller stand still).
+        uint32_t uChanges = 0;
+        for (unsigned k = 0; k < N; k++)
+        {
+            if (k > 0 && bend[k] != bend[k - 1])
+                uChanges++;
+            if (mod[k] > 0.0f)
+                uChanges++;
+            prefix[k] = uChanges;
+        }
+        m_bBendChanCurved[ch] = bBend || bMod;
+        bAny |= bBend || bMod;
     }
 
     if (bAny)
@@ -4375,7 +4409,7 @@ void MainScreen::RenderNotes()
     // Bent notes are drawn as ribbons straight from the event list. Visual Buffer Notes bakes notes
     // into cached chunks that cannot follow a bend per note, so frames that have a bend in view
     // bypass the baked chunks for the main roll (the strip below keeps using them).
-    m_bBendRibbonsFrame = renderViz.bVisualizePitchBends && !horizontalOnly && BuildBendCurves();
+    m_bBendRibbonsFrame = (renderViz.bVisualizePitchBends || renderViz.bVisualizeModulation) && !horizontalOnly && BuildBendCurves();
 
     if ( m_iEndPos < 0 || m_iStartPos >= eventCount )
     {

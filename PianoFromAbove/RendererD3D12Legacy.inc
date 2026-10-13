@@ -807,7 +807,7 @@ std::tuple<HRESULT, const char*> D3D12Renderer::Init(HWND hWnd, bool bLimitFPS) 
     // Pitch-bend ribbons, one upload buffer per frame: the sampled bend curves first, then the
     // ribbon notes grouped by slice-count tier (each tier is drawn from its own offset).
     auto ribbon_buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(
-        (UINT64)(16 * BendCurveSamples * sizeof(float)) + (UINT64)RibbonNoteCapacity * sizeof(NoteData));
+        (UINT64)(BendCurveRows * BendCurveSamples * sizeof(float)) + (UINT64)RibbonNoteCapacity * sizeof(NoteData));
     for (uint32_t i = 0; i < FrameCount; i++) {
         res = m_pDevice->CreateCommittedResource(
             &upload_heap,
@@ -1540,7 +1540,7 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     // Pitch-bend ribbon notes: one instanced draw per slice-count tier (6 << tier vertices a note).
     if (m_uRibbonNoteCount > 0 && m_bBendCurvesValid && m_pRibbonPipelineState) {
         ID3D12Resource* ribbonBuffer = m_pRibbonBuffers[m_uFrameIndex].Get();
-        const UINT64 curveBytes = (UINT64)16 * BendCurveSamples * sizeof(float);
+        const UINT64 curveBytes = (UINT64)BendCurveRows * BendCurveSamples * sizeof(float);
         const D3D12_RANGE noRead = { 0, 0 };
         uint8_t* mapped = nullptr;
         res = ribbonBuffer->Map(0, &noRead, (void**)&mapped);
