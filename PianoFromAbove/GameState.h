@@ -351,6 +351,7 @@ void RenderText();
     void RenderStatusLine(int line, float width, float yOffset, float rightEdge, const char* left, const char* format, ...);
     void RenderStatus(int lines);
     void RenderSysStats();
+    void RenderCCStats();
     float GetStatsBounceScale() const;
     void RenderMarker(const char* str);
     void RenderMessage( LPRECT prcMsg, TCHAR *sMsg );
@@ -462,6 +463,8 @@ void RenderText();
     struct BendPoint { long long time; int idx; }; // idx: row in m_vEvents
     vector<BendPoint> m_vBendTimeline[16];
     vector<BendPoint> m_vModTimeline[16];  // modulation (controller 1)
+    static constexpr int CCStatCount = 11;
+    vector<BendPoint> m_vCCTimeline[16][CCStatCount]; // the controllers shown by the CC stats card
     size_t m_uBendTimelineKey = SIZE_MAX;
     vector<float> m_vBendCurves;            // [Renderer::BendCurveRows][BendCurveSamples]: bend (semitones), then modulation (0..1)
     vector<uint32_t> m_vBendChangePrefix;   // running count of curve changes, same layout

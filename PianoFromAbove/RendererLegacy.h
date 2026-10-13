@@ -216,6 +216,7 @@ public:
         return true;
     }
     float GetDualRollTimeSpan(float normalTimeSpan, float normalRollPixels) const;
+    unsigned GetRibbonNoteCount() const { return m_uRibbonNoteCount; }
     size_t GetRenderedNotesCount() { return m_vNotesIntermediate.size() + m_uRibbonNoteCount; };
     void SplitRect() { m_iRectSplit = (int)m_vRectsIntermediate.size(); }
 

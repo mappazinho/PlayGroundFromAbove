@@ -2570,6 +2570,9 @@ void MainScreen::Discard()
         vector<BendPoint>().swap(timeline);
     for (auto& timeline : m_vModTimeline)
         vector<BendPoint>().swap(timeline);
+    for (auto& channel : m_vCCTimeline)
+        for (auto& timeline : channel)
+            vector<BendPoint>().swap(timeline);
     m_uBendTimelineKey = SIZE_MAX;
     eventvec_t().swap(m_vTempo);
     eventvec_t().swap(m_vSignature);
@@ -4214,6 +4217,9 @@ float MainScreen::GetCorruptorAmount() const
     return (float)dRamp;
 }
 
+// The controllers the CC stats card shows, in column order (see MainScreen::RenderCCStats).
+static const int s_aCCStatNumbers[11] = { 1, 7, 10, 11, 64, 71, 72, 73, 74, 91, 93 };
+
 // Splits the pitch-bend and modulation (controller 1) events of the song up per channel (they
 // arrive time-ordered in m_vProgramChange together with other controller and program changes).
 void MainScreen::BuildBendTimeline()
@@ -4222,6 +4228,9 @@ void MainScreen::BuildBendTimeline()
         timeline.clear();
     for (auto& timeline : m_vModTimeline)
         timeline.clear();
+    for (auto& channel : m_vCCTimeline)
+        for (auto& timeline : channel)
+            timeline.clear();
     for (const auto& change : m_vProgramChange)
     {
         if (change.second < 0 || (size_t)change.second >= m_vEvents.size())
@@ -4230,8 +4239,16 @@ void MainScreen::BuildBendTimeline()
         const MIDI::ChannelEventType eType = m_MIDI.GetEventChannelEventType(pEvent);
         if (eType == MIDI::PitchBend)
             m_vBendTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
-        else if (eType == MIDI::Controller && m_MIDI.GetEventParam1(pEvent) == 1)
-            m_vModTimeline[m_MIDI.GetEventChannel(pEvent) & 15].push_back({ change.first, change.second });
+        else if (eType == MIDI::Controller)
+        {
+            const int iCC = m_MIDI.GetEventParam1(pEvent);
+            const unsigned ch = m_MIDI.GetEventChannel(pEvent) & 15;
+            if (iCC == 1)
+                m_vModTimeline[ch].push_back({ change.first, change.second });
+            for (int i = 0; i < CCStatCount; i++)
+                if (s_aCCStatNumbers[i] == iCC)
+                    m_vCCTimeline[ch][i].push_back({ change.first, change.second });
+        }
     }
     m_uBendTimelineKey = m_vProgramChange.size() ^ (m_vEvents.size() << 20);
 }
@@ -5164,6 +5181,8 @@ void MainScreen::RenderText()
     RenderStatus(iLines);
     if (viz.bSysStats && !StatsCoveredByUI(m_pRenderer))
         RenderSysStats();
+    if (viz.bCCStats && !StatsCoveredByUI(m_pRenderer))
+        RenderCCStats();
     if (!m_sMarker.empty() && viz.bShowMarkers)
         RenderMarker(m_sMarker.c_str());
     if (m_bZoomMove)
@@ -5632,6 +5651,150 @@ void MainScreen::RenderSysStats()
             HeartbeatLog("sysstats:exception skipped");
         }
     }
+}
+
+// Diagnostic card above the keyboard: the controllers and pitch bend each channel currently holds,
+// and what the ribbon visualization sees (Wave = the largest modulation in the visible window).
+void MainScreen::RenderCCStats()
+{
+    if (StatsCoveredByUI(m_pRenderer))
+        return;
+    if (m_uBendTimelineKey != (m_vProgramChange.size() ^ (m_vEvents.size() << 20)))
+        BuildBendTimeline();
+
+    Renderer* r = m_pRenderer;
+    auto dl = r->GetDrawList();
+    if (!dl)
+        return;
+    const auto& viz = Config::GetConfig().GetVizSettings();
+    const float scale = (std::max)(viz.fUIScale, 0.5f);
+    constexpr unsigned N = Renderer::BendCurveSamples;
+    constexpr int kCols = 3 + (CCStatCount - 1); // Bend, Mod, Wave, then every other controller
+
+    auto lastBefore = [&](const vector<BendPoint>& timeline) -> const BendPoint* {
+        auto it = std::upper_bound(timeline.begin(), timeline.end(), m_llStartTime,
+            [](long long llTime, const BendPoint& point) { return llTime < point.time; });
+        return it == timeline.begin() ? nullptr : &*(it - 1);
+    };
+
+    bool aUsed[16] = {};
+    int iUsed = 0;
+    for (int ch = 0; ch < 16; ch++)
+    {
+        bool bUsed = !m_vBendTimeline[ch].empty();
+        for (int i = 0; i < CCStatCount; i++)
+            bUsed |= !m_vCCTimeline[ch][i].empty();
+        aUsed[ch] = bUsed;
+        iUsed += bUsed;
+    }
+
+    const float lineH = ImGui::GetTextLineHeight() + 3.0f * scale;
+    const float chW = ImGui::CalcTextSize("Ch 00").x + 8.0f * scale;
+    const float colW = ImGui::CalcTextSize("-8192").x + 8.0f * scale;
+    const float padX = 8.0f * scale, padY = 6.0f * scale;
+    const float panelW = padX * 2 + chW + colW * kCols;
+    const float panelH = padY * 2 + lineH * (2 + (iUsed > 0 ? iUsed : 1));
+    const float panelLeft = 10.0f;
+    const float panelBottom = m_fNotesY + m_fNotesCY - 8.0f * scale;
+    const float panelTop = (std::max)(0.0f, panelBottom - panelH);
+    const float panelRight = panelLeft + panelW;
+
+    DrawBlurPanel(r, panelLeft, panelTop, panelRight, panelTop + panelH, 10.0f);
+
+    const ImU32 cLabel = 0xFF9A9A9A, cValue = 0xFFFFFFFF, cDim = 0xFF606060, cOn = 0xFF60FF60, cOff = 0xFF6060FF;
+    float y = panelTop + padY;
+    char buf[64];
+
+    // What the visualization is doing
+    float x = panelLeft + padX;
+    auto flag = [&](const char* name, bool bOn) {
+        dl->AddText(ImVec2(x, y), cLabel, name);
+        x += ImGui::CalcTextSize(name).x + 4.0f * scale;
+        dl->AddText(ImVec2(x, y), bOn ? cOn : cOff, bOn ? "ON" : "OFF");
+        x += ImGui::CalcTextSize("OFF").x + 12.0f * scale;
+    };
+    flag("Bend viz:", viz.bVisualizePitchBends);
+    flag("Mod viz:", viz.bVisualizeModulation);
+    flag("Ribbons now:", m_bBendRibbonsFrame);
+    snprintf(buf, sizeof(buf) - 1, "ribbon notes: %u", r->GetRibbonNoteCount());
+    dl->AddText(ImVec2(x, y), cValue, buf);
+    y += lineH;
+
+    // Column headers
+    x = panelLeft + padX;
+    dl->AddText(ImVec2(x, y), cLabel, "Ch");
+    x += chW;
+    const char* aHead[kCols] = { "Bend", "Mod", "Wave", "Vol", "Pan", "Exp", "Sus", "Res", "Rel", "Atk", "Cut", "Rev", "Cho" };
+    for (int c = 0; c < kCols; c++)
+    {
+        dl->AddText(ImVec2(x, y), cLabel, aHead[c]);
+        x += colW;
+    }
+    y += lineH;
+
+    if (iUsed == 0)
+        dl->AddText(ImVec2(panelLeft + padX, y), cDim, "no pitch bend or controller events in this song");
+    for (int ch = 0; ch < 16; ch++)
+    {
+        if (!aUsed[ch])
+            continue;
+        x = panelLeft + padX;
+        snprintf(buf, sizeof(buf) - 1, "%d", ch + 1);
+        dl->AddText(ImVec2(x, y), cValue, buf);
+        x += chW;
+
+        auto cell = [&](const char* text, bool bActive) {
+            dl->AddText(ImVec2(x, y), bActive ? cValue : cDim, text);
+            x += colW;
+        };
+
+        // Bend: signed distance from centre of the last bend event (0 = centred)
+        if (const BendPoint* pBend = lastBefore(m_vBendTimeline[ch]))
+        {
+            const MIDIChannelEvent pEvent = m_vEvents[pBend->idx];
+            const int iBend = ((m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent)) - 8192;
+            snprintf(buf, sizeof(buf) - 1, "%+d", iBend);
+            cell(buf, iBend != 0);
+        }
+        else
+            cell("-", false);
+
+        // Mod (controller 1), then Wave: the largest modulation the ribbon curve holds in view
+        const BendPoint* pMod = lastBefore(m_vCCTimeline[ch][0]);
+        if (pMod)
+        {
+            snprintf(buf, sizeof(buf) - 1, "%d", m_MIDI.GetEventParam2(m_vEvents[pMod->idx]));
+            cell(buf, m_MIDI.GetEventParam2(m_vEvents[pMod->idx]) != 0);
+        }
+        else
+            cell("-", false);
+        if (!viz.bVisualizeModulation)
+            cell("off", false);
+        else if (!m_bBendRibbonsFrame || m_vBendCurves.size() < (size_t)Renderer::BendCurveRows * N)
+            cell("-", false);
+        else
+        {
+            float fMax = 0.0f;
+            for (unsigned k = 0; k < N; k++)
+                fMax = (std::max)(fMax, m_vBendCurves[(16 + ch) * N + k]);
+            snprintf(buf, sizeof(buf) - 1, "%d", (int)(fMax * 127.0f + 0.5f));
+            cell(buf, fMax > 0.0f);
+        }
+
+        for (int i = 1; i < CCStatCount; i++)
+        {
+            if (const BendPoint* pCC = lastBefore(m_vCCTimeline[ch][i]))
+            {
+                const int iValue = m_MIDI.GetEventParam2(m_vEvents[pCC->idx]);
+                snprintf(buf, sizeof(buf) - 1, "%d", iValue);
+                cell(buf, true);
+            }
+            else
+                cell("-", false);
+        }
+        y += lineH;
+    }
+
 }
 
 void MainScreen::RenderMarker(const char* str) {

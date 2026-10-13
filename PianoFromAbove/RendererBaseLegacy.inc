@@ -1294,6 +1294,7 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                     ImGui::Combo("Marker Encoding", (int*)&viz.eMarkerEncoding, "CP-1252 (Western)\0CP-932 (Japanese)\0UTF-8\0");
                     ImGui::Checkbox("Nerd Stats", &viz.bNerdStats);
                     ImGui::Checkbox("Sys Stats", &viz.bSysStats);
+                    ImGui::Checkbox("CC Stats", &viz.bCCStats);
                     ImGui::Checkbox("Bounce stats to the beat", &viz.bBounceStats);
                     if (viz.bBounceStats) {
                         ImGui::Indent();

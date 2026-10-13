@@ -247,6 +247,7 @@ void VizSettings::LoadDefaultValues() {
     this->eMarkerEncoding = MarkerEncoding::CP1252;
     this->bNerdStats = false;
     this->bSysStats = false;
+    this->bCCStats = false;
     this->sSplashMIDI = L"";
     this->vRecentMIDIs.clear();
     this->bVisualizePitchBends = false;
@@ -545,6 +546,8 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bNerdStats = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("SysStats", &iAttrVal) == TIXML_SUCCESS)
         bSysStats = (iAttrVal != 0);
+    if (txViz->QueryIntAttribute("CCStats", &iAttrVal) == TIXML_SUCCESS)
+        bCCStats = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("VisualizePitchBends", &iAttrVal) == TIXML_SUCCESS)
         bVisualizePitchBends = (iAttrVal != 0);
     if (txViz->QueryIntAttribute("VisualizeModulation", &iAttrVal) == TIXML_SUCCESS)
@@ -852,6 +855,7 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     txViz->SetAttribute("MarkerEncoding", eMarkerEncoding);
     txViz->SetAttribute("NerdStats", bNerdStats);
     txViz->SetAttribute("SysStats", bSysStats);
+    txViz->SetAttribute("CCStats", bCCStats);
     txViz->SetAttribute("SplashMIDI", Util::WstringToString(sSplashMIDI));
     const std::vector<std::wstring> recentMIDIs = GetRecentMIDIs();
     if (!recentMIDIs.empty()) {
