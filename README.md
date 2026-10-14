@@ -1,15 +1,3 @@
-## ⚠️ Note: Currently in BETA stage. You WILL experience bugs or crashes.
-If you experience a crash or bug, and know how to replicate it then follow these steps.
-1. Enable logging in Settings > Viz
-2. Restart PGFA
-3. Replicate bug
-4. Create a new issue in this repo, explain how it happened and include logs such as:
-   * **pfa_heartbeat** - located in %temp%
-   * **pfa_msgs** - located in %temp%
-   * **pfa_prerender** - located in %temp%
-   * **crash_log** - located in root folder where PGFA lives      
-*If you are unable to launch PGFA due to a startup crash, then you only need to include **startup_log**, which also exists in the root folder of PGFA.*
-
 # PlayGroundFromAbove
 *Absolutely diabolical.*
 
@@ -38,6 +26,18 @@ CPU, RAM, etc is kept the same as stock PFA.
 * Retarget project to your installed Windows SDK version
 * Cross fingers
 * Build! (Release, x64)
+
+## Bug Reporting
+If you experience a crash or bug, and know how to replicate it then follow these steps.
+1. Enable logging in Settings > Viz
+2. Restart PGFA
+3. Replicate bug
+4. Create a new issue in this repo, explain how it happened and include logs such as:
+   * **pfa_heartbeat** - located in %temp%
+   * **pfa_msgs** - located in %temp%
+   * **pfa_prerender** - located in %temp%
+   * **crash_log** - located in root folder where PGFA lives      
+*If you are unable to launch PGFA due to a startup crash, then you only need to include **startup_log**, which also exists in the root folder of PGFA.*
 
 ## Credits
 
