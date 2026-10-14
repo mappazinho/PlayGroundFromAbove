@@ -75,14 +75,17 @@ class Util
 public:
     static wchar_t* StringToWstring( const string &s );
     static char* WstringToString( const wstring &s );
+    // A path whose UTF-8 bytes were once re-read as CP-1252 ("her00EF00BC0178" for "herFF1F"): returns the
+    // repaired path when the damaged one does not exist but the repaired one does.
+    static bool RepairMojibakePath( const wstring &path, wstring &repaired );
     static void ParseLongHex( const string &sText, string &sVal );
     static unsigned RandColor();
     static void RGBtoHSV( int R, int G, int B, int &H, int &S, int &V );
     static void HSVtoRGB( int H, int S, int V, int &R, int &G, int &B );
     static void CommaPrintf( TCHAR buf[32], int iVal );
 private:
-    static char m_sBuf[16384];
-    static wchar_t m_wsBuf[16384];
+    static thread_local char m_sBuf[16384];
+    static thread_local wchar_t m_wsBuf[16384];
 };
 
 //-----------------------------------------------------------------------------

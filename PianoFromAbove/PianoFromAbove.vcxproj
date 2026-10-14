@@ -127,7 +127,7 @@
     <LibraryPath>$(ProjectDir)lzma\lib;$(ProjectDir)freetype\lib;$(ProjectDir)bassmidi\lib;$(ProjectDir)sdl2;$(LibraryPath)</LibraryPath>
     <OutDir>$(SolutionDir)\$(Configuration)\</OutDir>
     <IntDir>$(Configuration)\$(Platform)\</IntDir>
-    <TargetName>PGFA-Beta-AVX2</TargetName>
+    <TargetName>PGFA-v1.0.0-AVX2</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseSSE|x64'">
     <LinkIncremental>false</LinkIncremental>
@@ -135,7 +135,7 @@
     <LibraryPath>$(ProjectDir)lzma\lib;$(ProjectDir)freetype\lib;$(ProjectDir)bassmidi\lib;$(ProjectDir)sdl2;$(LibraryPath)</LibraryPath>
     <OutDir>$(SolutionDir)\$(Configuration)\</OutDir>
     <IntDir>$(Configuration)\$(Platform)\</IntDir>
-    <TargetName>PGFA-Beta-SSE42</TargetName>
+    <TargetName>PGFA-v1.0.0-SSE42</TargetName>
   </PropertyGroup>
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnabled>false</VcpkgEnabled>
@@ -375,6 +375,8 @@
     <ClInclude Include="StartupLog.h" />
     <ClInclude Include="MIDI.h" />
     <ClInclude Include="MIDIAudio.h" />
+    <ClInclude Include="Bench.h" />
+    <ClInclude Include="SlidingNoteWindow.h" />
     <ClInclude Include="MIDIPreRenderPlayer.h" />
     <ClInclude Include="Misc.h" />
     <ClInclude Include="Renderer.h" />

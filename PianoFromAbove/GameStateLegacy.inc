@@ -1430,6 +1430,44 @@ static const int s_iPreRestartsLimit = 4;
 static int s_iPreRestarts = 0;
 static bool s_bPreFailed = false;
 
+// Creates the BASS synth, loads the soundfonts and opens the SDL device. This takes seconds (soundfont
+// preload, buffer allocation, WASAPI open), so PlayFile starts it while the song is still parsing instead
+// of freezing the game thread on the first frame. Safe to call repeatedly and from any thread.
+void PGFA_EnsurePreRenderAudio()
+{
+    static std::mutex s_mtx;
+    static std::atomic<bool> s_bDone{ false };
+    if (s_bDone.load(std::memory_order_acquire))
+        return;
+    std::lock_guard<std::mutex> lock(s_mtx);
+    if (s_bDone.load(std::memory_order_relaxed))
+        return;
+
+    const AudioSettings& cAudio = Config::GetConfig().GetAudioSettings();
+    if (!PRE_MIDIAudio)
+    {
+        PRE_DbgLog("UPA: init (create MIDIAudio/BASS/SDL)");
+        WAVEFORMATEX wfFormat;
+        memset(&wfFormat, 0, sizeof(wfFormat));
+        wfFormat.nSamplesPerSec = 48000;
+        wfFormat.nChannels = 2;
+        wfFormat.nBlockAlign = (32 * 2) / 8;
+        wfFormat.wBitsPerSample = 32;
+        wfFormat.nAvgBytesPerSec = wfFormat.nSamplesPerSec * (32 * 2) / 8;
+        wfFormat.wFormatTag = WAVE_FORMAT_PCM;
+        BASSMIDI::InitBASS(wfFormat);
+
+        BASSMIDI::LoadConfiguredSoundfonts();
+
+        int initSecs = max(120, (cAudio.iPreBufferMs * 2 + 999) / 1000);
+        PRE_MIDIAudio = new MIDIAudio(48000 * initSecs);
+        PRE_MIDIAudio->m_bPaused = true;
+        PRE_InitAudio();
+        PRE_DbgLog("UPA: init done");
+    }
+    s_bDone.store(true, std::memory_order_release);
+}
+
 static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, const MIDI& midi, long long llStartTime, int iStartPos, bool& bAudioStarted)
 {
     static Config &config = Config::GetConfig();
@@ -1452,26 +1490,7 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
         return;
     }
 
-    if (!PRE_MIDIAudio)
-    {
-        PRE_DbgLog("UPA: init (create MIDIAudio/BASS/SDL)");
-        WAVEFORMATEX wfFormat;
-        memset(&wfFormat, 0, sizeof(wfFormat));
-        wfFormat.nSamplesPerSec = 48000;
-        wfFormat.nChannels = 2;
-        wfFormat.nBlockAlign = (32 * 2) / 8;
-        wfFormat.wBitsPerSample = 32;
-        wfFormat.nAvgBytesPerSec = wfFormat.nSamplesPerSec * (32 * 2) / 8;
-        wfFormat.wFormatTag = WAVE_FORMAT_PCM;
-        BASSMIDI::InitBASS(wfFormat);
-
-        BASSMIDI::LoadConfiguredSoundfonts();
-
-        int initSecs = max(120, (cAudio.iPreBufferMs * 2 + 999) / 1000);
-        PRE_MIDIAudio = new MIDIAudio(48000 * initSecs);
-        PRE_MIDIAudio->m_bPaused = true;
-        PRE_InitAudio();
-    }
+    PGFA_EnsurePreRenderAudio(); // normally already done while the song loaded
 
     bool bPaused = cPlayback.GetPaused();
     PRE_MIDIAudio->m_bPaused = bPaused;
@@ -1551,6 +1570,18 @@ static void UpdatePreRenderAudio(const std::vector<MIDIChannelEvent>& vEvents, c
         // so resume cannot be mistaken for a multi-second device stall.
         PRE_TouchAudio();
     }
+}
+
+// Teardown is logged step by step: a hang here freezes the window right after "ChangeState: SplashScreen -> MainScreen".
+SplashScreen::~SplashScreen()
+{
+    HeartbeatLog("splash-dtor:begin");
+    if (m_pRenderer) m_pRenderer->m_bSuppressStrip = false;
+    m_OutDevice.FullReset(); // the splash's notes, controllers and programs must not leak into the next song
+    m_OutDevice.Close();
+    HeartbeatLog("splash-dtor:outdevice-closed");
+    m_MIDI.clear();
+    HeartbeatLog("splash-dtor:midi-cleared");
 }
 
 GameState::GameError SplashScreen::Logic()
@@ -2185,6 +2216,10 @@ GameState::GameError SplashScreen::Render()
 {
     if (g_bResetPending || g_bInSizeMove) return Success;
     if ( FAILED( m_pRenderer->ResetDeviceIfNeeded() ) ) return DirectXError;
+    m_pRenderer->m_bSuppressStrip = true;
+    // Ribbon bloom glow (drawn in the renderer's bloom pass) along the bottom edge, where the splash notes land.
+    m_pRenderer->SetRibbonArea(0.0f, static_cast< float >( m_pRenderer->GetBufferHeight() ) - 4.0f,
+                               static_cast< float >( m_pRenderer->GetBufferWidth() ), 4.0f);
 
     m_pRenderer->ClearAndBeginScene( D3DCOLOR_XRGB( 0, 0, 0 ) );
     m_pRenderer->DrawRect( 0.0f, 0.0f, static_cast< float >( m_pRenderer->GetBufferWidth() ),
@@ -2303,6 +2338,161 @@ float SplashScreen::GetNoteX(int iNote) {
 }
 
 
+// Per-frame cost breakdown (PGFA_FRAME_BREAKDOWN=1): where a frame's time goes - advancing events in
+// Logic, collecting visible notes, queueing/uploading them, ending the scene, presenting. One FRAMEBD
+// line per second in the prerender log / startup log. Off by default; a disabled scope is one branch.
+struct FrameBreakdown
+{
+    enum Slot { Logic, Advance, Notes, Batch, EndScene, Present, Build, Push, Cull, Emit, SlotCount };
+    bool enabled = false;
+    bool bench = false; // -bench: keep accumulating, the bench prints the averages itself
+    double ms[SlotCount] = {};
+    uint64_t rows = 0, pushed = 0, frames = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+
+    FrameBreakdown()
+    {
+        char aEnv[8] = {};
+        enabled = GetEnvironmentVariableA("PGFA_FRAME_BREAKDOWN", aEnv, sizeof(aEnv)) > 0 && aEnv[0] != '0';
+    }
+    void EndFrame()
+    {
+        if (!enabled) return;
+        frames++;
+        if (bench) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double, std::milli>(now - last).count();
+        if (elapsed < 1000.0) return;
+        const double f = (double)frames;
+        const double frameMs = elapsed / f;
+        const double sum = (ms[Logic] + ms[Notes] + ms[EndScene] + ms[Present]) / f;
+        char line[512];
+        snprintf(line, sizeof(line), "FRAMEBD fps=%.0f frame=%.2fms | logic=%.2f (advance=%.2f) | notes=%.2f (collect=%.2f [build=%.2f push=%.2f] batch=%.2f) | endscene=%.2f present=%.2f | other=%.2f | rows/frame=%.0f pushed/frame=%.0f",
+            1000.0 / frameMs, frameMs, ms[Logic] / f, ms[Advance] / f, ms[Notes] / f, (ms[Notes] - ms[Batch]) / f, ms[Build] / f, ms[Push] / f, ms[Batch] / f,
+            ms[EndScene] / f, ms[Present] / f, frameMs - sum, (double)rows / f, (double)pushed / f);
+        PRE_DbgLog("%s", line);
+        // Own file: the startup log only covers the first seconds of playback.
+        wchar_t path[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, path);
+        wcscat_s(path, L"pfa_framebd.log");
+        FILE* file = nullptr;
+        if (_wfopen_s(&file, path, L"a") == 0 && file)
+        {
+            fprintf(file, "[%llu] %s\n", (unsigned long long)GetTickCount64() / 1000ull, line);
+            fclose(file);
+        }
+        for (double& m : ms) m = 0.0;
+        rows = pushed = frames = 0;
+        last = now;
+    }
+};
+static FrameBreakdown g_FBD;
+struct FbdScope
+{
+    FrameBreakdown::Slot slot;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    explicit FbdScope(FrameBreakdown::Slot s) : slot(s), on(g_FBD.enabled) { if (on) t0 = std::chrono::steady_clock::now(); }
+    ~FbdScope() { if (on) g_FBD.ms[slot] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+};
+
+// Measurement only (PGFA_NOTE_RUN_STATS=1): how many note rows sit in "note trains" - runs of >= 8 notes on
+// one track/channel/key with identical length, velocity, repeat count and a constant start-to-start spacing.
+// Such a train could be stored as one {start, period, count} record instead of one row per note.
+// "tick-exact" needs the spacing to be equal in ticks; "time-exact" also needs it equal in microseconds
+// (+-2), which splits trains at tempo changes - that is the stricter, renderable number.
+static void PGFAMeasureNoteRuns(const MIDI& midi, const std::vector<MIDIChannelEvent>& events, size_t numTracks)
+{
+    const size_t kMinRun = 8;
+    if (numTracks == 0 || numTracks * 2048 > (size_t)8 << 20)
+    {
+        PRE_DbgLog("RUNSTATS skipped: %zu tracks", numTracks);
+        return;
+    }
+    const auto tStart = std::chrono::steady_clock::now();
+
+    struct RunState
+    {
+        int64_t lastTick = 0, lastTime = 0, periodTick = 0, periodTime = 0;
+        uint32_t lenTick = 0, lenTime = 0, n = 0;
+        uint8_t vel = 0, rep = 0;
+    };
+    struct RunStats
+    {
+        uint64_t runs = 0, inRuns = 0, longest = 0, hist[4] = {};
+    };
+    std::vector<RunState> tickState(numTracks * 2048), timeState(numTracks * 2048);
+    RunStats tickStats, timeStats;
+
+    auto flush = [&](const RunState& s, RunStats& st) {
+        if (s.n < kMinRun) return;
+        st.runs++;
+        st.inRuns += s.n;
+        st.longest = (std::max)(st.longest, (uint64_t)s.n);
+        st.hist[s.n < 16 ? 0 : s.n < 64 ? 1 : s.n < 256 ? 2 : 3]++;
+    };
+    auto step = [&](RunState& s, RunStats& st, bool useTime, int64_t tick, int64_t time,
+                    uint32_t lenTick, uint32_t lenTime, uint8_t vel, uint8_t rep) {
+        auto begin = [&]() {
+            s.n = 1; s.lastTick = tick; s.lastTime = time; s.lenTick = lenTick; s.lenTime = lenTime;
+            s.vel = vel; s.rep = rep; s.periodTick = s.periodTime = 0;
+        };
+        if (s.n == 0) { begin(); return; }
+        const int64_t dTick = tick - s.lastTick, dTime = time - s.lastTime;
+        bool same = lenTick == s.lenTick && vel == s.vel && rep == s.rep && dTick > 0;
+        if (same && useTime) same = llabs((int64_t)lenTime - (int64_t)s.lenTime) <= 2;
+        if (same && s.n >= 2)
+            same = dTick == s.periodTick && (!useTime || llabs(dTime - s.periodTime) <= 2);
+        if (!same) { flush(s, st); begin(); return; }
+        if (s.n == 1) { s.periodTick = dTick; s.periodTime = dTime; }
+        s.n++; s.lastTick = tick; s.lastTime = time;
+    };
+
+    uint64_t rows = 0, notes = 0;
+    for (size_t i = 0; i < events.size(); i++)
+    {
+        const MIDIChannelEvent e = events[i];
+        if (midi.GetEventChannelEventType(e) != MIDI::NoteOn || midi.GetEventParam2(e) <= 0 || !midi.EventHasSister(e))
+            continue;
+        const unsigned sisterIdx = midi.GetEventSisterIdx(e);
+        if (sisterIdx >= events.size()) continue;
+        const unsigned track = midi.GetEventTrack(e);
+        if (track >= numTracks) continue;
+        const unsigned rep = midi.GetEventRepeat(e);
+        rows++;
+        notes += rep;
+        const size_t g = ((size_t)track << 11) | ((size_t)midi.GetEventChannel(e) << 7) | (size_t)(midi.GetEventParam1(e) & 0x7F);
+        const int64_t tick = midi.GetEventAbsT(e);
+        const int64_t time = midi.GetEventTime(e);
+        const int64_t lenTickSigned = (int64_t)midi.GetEventAbsT(events[sisterIdx]) - tick;
+        const uint32_t lenTick = lenTickSigned > 0 ? (uint32_t)lenTickSigned : 0;
+        const uint32_t lenTime = midi.GetEventLength(e);
+        const uint8_t vel = (uint8_t)midi.GetEventParam2(e);
+        step(tickState[g], tickStats, false, tick, time, lenTick, lenTime, vel, (uint8_t)rep);
+        step(timeState[g], timeStats, true, tick, time, lenTick, lenTime, vel, (uint8_t)rep);
+    }
+    for (const RunState& s : tickState) flush(s, tickStats);
+    for (const RunState& s : timeState) flush(s, timeStats);
+
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
+    PRE_DbgLog("RUNSTATS rows=%llu notes=%llu scan=%.0fms (trains: >=%zu notes, same track/channel/key/length/velocity, constant spacing)",
+        (unsigned long long)rows, (unsigned long long)notes, ms, kMinRun);
+    const char* names[2] = { "tick-exact", "time-exact" };
+    const RunStats* stats[2] = { &tickStats, &timeStats };
+    for (int m = 0; m < 2; m++)
+    {
+        const RunStats& st = *stats[m];
+        const double pct = rows ? 100.0 * (double)st.inRuns / (double)rows : 0.0;
+        // GPU row is 16 B (NoteData); a train record would be ~24 B (start, period, length, count, key/track).
+        const double nowMB = (double)rows * 16.0 / 1048576.0;
+        const double runsMB = ((double)(rows - st.inRuns) * 16.0 + (double)st.runs * 24.0) / 1048576.0;
+        PRE_DbgLog("RUNSTATS %s: trains=%llu rowsInTrains=%llu (%.1f%% of rows) longest=%llu hist[8-15]=%llu [16-63]=%llu [64-255]=%llu [256+]=%llu | note data %.1f MB -> %.1f MB (%.1f%%)",
+            names[m], (unsigned long long)st.runs, (unsigned long long)st.inRuns, pct, (unsigned long long)st.longest,
+            (unsigned long long)st.hist[0], (unsigned long long)st.hist[1], (unsigned long long)st.hist[2], (unsigned long long)st.hist[3],
+            nowMB, runsMB, nowMB > 0.0 ? 100.0 * runsMB / nowMB : 0.0);
+    }
+}
+
 MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer *pRenderer ) :
     GameState( hWnd, pRenderer ), m_MIDI( sMIDIFile ), m_eGameMode( eGameMode )
 {
@@ -2338,6 +2528,10 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
     // The loading overlay only goes away on Stage::Done. Every exit from here on, including
     // an exception, must reach it or the UI sits on the last stage forever.
     struct LoadingDoneGuard { ~LoadingDoneGuard() { g_LoadingProgress.stage = MIDILoadingProgress::Stage::Done; } } loadingDoneGuard;
+
+    // Normally finished long ago (started with the parse); this just guarantees the game thread never pays for it.
+    if (Config::GetConfig().GetAudioSettings().bPreRenderAudio)
+        PGFA_EnsurePreRenderAudio();
 
     try
     {
@@ -2382,6 +2576,11 @@ MainScreen::MainScreen( wstring sMIDIFile, State eGameMode, HWND hWnd, Renderer 
             }
             PRE_DbgLog("EVENTTYPES on=%zu off=%zu cc=%zu prog=%zu bend=%zu atouch=%zu catouch=%zu other=%zu",
                 aTypes[0], aTypes[1], aTypes[2], aTypes[3], aTypes[4], aTypes[5], aTypes[6], aTypes[7]);
+            {
+                char aRunEnv[8] = {};
+                if (GetEnvironmentVariableA("PGFA_NOTE_RUN_STATS", aRunEnv, sizeof(aRunEnv)) > 0 && aRunEnv[0] != '0')
+                    PGFAMeasureNoteRuns(m_MIDI, m_vEvents, (size_t)m_MIDI.GetInfo().iNumTracks);
+            }
 
             // Precompute maximum Notes-Per-Second for the song
             m_llMaxNPS = 1;
@@ -2589,6 +2788,8 @@ void MainScreen::Discard()
     vector<TrackSettings>().swap(m_vTrackSettings);
     m_sMarker.clear();
     m_sCurBackground.clear();
+    m_snw.ReleaseMemory(); // the song is gone; give the window's memory back
+    m_gw.ReleaseMemory();
     m_dNPSNotes.clear();
     m_dNPSHistory.clear();
     vector<long long>().swap(m_vImageBufferMaxEndTime);
@@ -2707,9 +2908,12 @@ GameState::GameError MainScreen::Init()
     }
 
     m_OutDevice.Reset();
+    m_OutDevice.FullReset();
     m_OutDevice.SetVolume( 1.0 );
-    m_Timer.Init(config.m_bManualTimer || m_bDumpFrames);
-    if (m_bDumpFrames) {
+    m_Timer.Init(config.m_bManualTimer || m_bDumpFrames || g_Bench.active);
+    if (g_Bench.active) {
+        m_Timer.SetFrameRate((unsigned)g_Bench.fps); // fixed time step: the bench never reads a clock
+    } else if (m_bDumpFrames) {
         m_Timer.SetFrameRate(60);
     } else if (m_Timer.m_bManualTimer) {
         // get the screen's refresh rate
@@ -3048,6 +3252,7 @@ GameState::GameError MainScreen::MsgProc( HWND, UINT msg, WPARAM wParam, LPARAM 
 
 GameState::GameError MainScreen::Logic( void )
 {
+    FbdScope fbdLogic(FrameBreakdown::Logic);
     if (m_bDiscarded)
     {
         // Song data is freed; keep the ImGui loading modal animating while the
@@ -3072,6 +3277,8 @@ GameState::GameError MainScreen::Logic( void )
     static const AudioSettings &cAudio = config.GetAudioSettings();
     static const VizSettings &cViz = config.GetVizSettings();
     const MIDI::MIDIInfo &mInfo = m_MIDI.GetInfo();
+    if (g_Bench.active)
+        BenchPreFrame();
 
     // Custom audio (user-provided wav/mp3/ogg) fully bypasses the prerender; the
     // MIDI device is skipped too so the file is the only audible track.
@@ -3106,10 +3313,18 @@ GameState::GameError MainScreen::Logic( void )
     long long llTimeSpan = static_cast< long long >( 3.0 * dNSpeed * 1000000 );
     bool bPausedChanged = ( bPaused != m_bPaused );
     bool bMuteChanged = ( bMute != m_bMute );
-    // The prerender ring remains paused at its old read position.  Rebuild it
-    // from the visual clock when playback resumes, and do not use that stale
-    // read position for this frame's drift correction.
-    const bool bResumePreRender = bPausedChanged && !bPaused && bPreAudio && !m_bRenderVideo;
+    // The prerender ring stays paused at its old read position. Normally that is exactly where the song
+    // clock is, so resuming can just keep playing from the audio already generated. Only when the
+    // clock moved (seek while paused, speed edit, ...) or the generator died is the ring rebuilt from
+    // the visual clock, and that frame's drift correction skips the stale read position.
+    bool bResumePreRender = bPausedChanged && !bPaused && bPreAudio && !m_bRenderVideo;
+    if ( bResumePreRender && m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->IsGeneratorRunning()
+         && !g_bGenDead && PRE_MIDIAudio->GetBufferReadPos() > 0 )
+    {
+        const long long llAudioUs = (long long)( PRE_MIDIAudio->GetPlayerTime() * 1000000.0 );
+        if ( llabs( llAudioUs - m_llStartTime ) <= 50000 )
+            bResumePreRender = false; // audio and clock still agree: keep the buffer
+    }
 
     if ( bResumePreRender )
         m_bAudioStarted = false;
@@ -3139,7 +3354,7 @@ GameState::GameError MainScreen::Logic( void )
     m_iStartNote = min( cVisual.iFirstKey, cVisual.iLastKey );
     m_iEndNote = max( cVisual.iFirstKey, cVisual.iLastKey );
     m_bShowFPS = cVideo.bShowFPS;
-    if (m_bDumpFrames || m_bRenderVideo)
+    if (m_bDumpFrames || m_bRenderVideo || g_Bench.active)
         m_pRenderer->SetLimitFPS(false);
     else if (m_Timer.m_bManualTimer)
         m_pRenderer->SetLimitFPS(true);
@@ -3212,6 +3427,25 @@ GameState::GameError MainScreen::Logic( void )
     if ( m_bPackedHold )
         llNextStartTime = m_llStartTime; // outside the expanded window: wait for the next one
 
+    // The prerender audio needs a moment after (re)starting before the first sample plays. Without
+    // this the visuals run ahead on the wall clock and then get snapped back to the audio, which
+    // makes the first notes vanish and reappear. Hold the song clock until the audio is actually
+    // being consumed (bounded, so a dead audio device cannot freeze playback).
+    static long long s_llAudioGateHeldUs = 0;
+    bool bAudioGate = false;
+    if ( bPreAudio && !m_bRenderVideo && !m_bPaused )
+    {
+        const bool bAudioPlaying = m_bAudioStarted && PRE_MIDIAudio && PRE_MIDIAudio->GetBufferReadPos() > 0;
+        if ( bAudioPlaying )
+            s_llAudioGateHeldUs = 0;
+        else if ( s_llAudioGateHeldUs < 3000000 )
+        {
+            s_llAudioGateHeldUs += llElapsed;
+            bAudioGate = true;
+            llNextStartTime = m_llStartTime;
+        }
+    }
+
     if ( !m_bPaused && m_llStartTime < llMaxTime )
     {
         // advance to a fixed slew would break speed changes; instead cap the
@@ -3251,11 +3485,12 @@ GameState::GameError MainScreen::Logic( void )
         }
     }
     if ( !m_bPaused && m_llStartTime < llMaxTime
-         && bPreAudio && !m_bPackedHold )
+         && bPreAudio && !m_bPackedHold && !bAudioGate )
         m_llDisplayTime += static_cast< long long >( llElapsed * m_dSpeed + 0.5 );
     else
         m_llDisplayTime = m_llStartTime;
     m_iStartTick = GetCurrentTick( m_llStartTime );
+    UpdateWindowBounce();
     long long llEndTime = 0;
     if (m_bTickMode)
         llEndTime = m_iStartTick + m_llTimeSpan;
@@ -3290,6 +3525,7 @@ GameState::GameError MainScreen::Logic( void )
 
     if ( !m_bPaused )
     {
+        FbdScope fbdAdvance(FrameBreakdown::Advance);
         long long notes_played = 0;
         long long events_processed = 0;
         float fCorruptor = GetCorruptorAmount();
@@ -3303,7 +3539,14 @@ GameState::GameError MainScreen::Logic( void )
             int iCorruptPitch = m_MIDI.GetEventParam1(pEvent);
             int iCorruptValue = m_MIDI.GetEventParam2(pEvent);
             uint64_t hCorrupt = 0;
-            switch (m_MIDI.GetEventChannelEventType(pEvent))
+            // Without corruption every Corrupt* call returns its input unchanged, so skip the hashing (and the
+            // random read of the sister event it needs) - only the pitch bend value has to be assembled.
+            if (fCorruptor <= 0.0f)
+            {
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::PitchBend)
+                    iCorruptValue = (m_MIDI.GetEventParam2(pEvent) << 7) | m_MIDI.GetEventParam1(pEvent);
+            }
+            else switch (m_MIDI.GetEventChannelEventType(pEvent))
             {
             case MIDI::NoteOn:
             case MIDI::NoteOff:
@@ -3402,7 +3645,10 @@ GameState::GameError MainScreen::Logic( void )
             m_dNPSHistory.pop_front();
     }
 
-    AdvanceIterators( m_llStartTime, false );
+    {
+        FbdScope fbdAdvance2(FrameBreakdown::Advance);
+        AdvanceIterators( m_llStartTime, false );
+    }
 
     long long llFirstTime = GetMinTime();
     long long llLastTime = GetMaxTime();
@@ -3469,13 +3715,20 @@ void MainScreen::JumpTo(long long llStartTime, bool bUpdateGUI)
             (double)m_llStartTime / 1e6, (int)bUpdateGUI);
         HeartbeatLog(b);
     }
+    m_snw.Invalidate(); // the window no longer matches the playhead
+    m_gw.Invalidate();
     m_dNPSNotes.clear();
     m_dNPSHistory.clear();
 
     if (Config::GetConfig().GetAudioSettings().bPreRenderAudio && PRE_MIDIAudio)
     {
-        PRE_DbgLog("JumpTo: reset start t=%.2f r=%.2f w=%.2f", (double)llStartTime / 1e6, (double)PRE_MIDIAudio->GetPlayerTime(), (double)PRE_MIDIAudio->GetBufferSeconds());
-        m_bAudioStarted = false;
+        // A seek into audio that is already rendered only moves the read position (what was skipped is
+        // simply dropped from the buffer); anything else restarts the generator at the new time.
+        const long long llTarget = min(max(llStartTime, GetMinTime()), GetMaxTime());
+        const bool bKept = m_bAudioStarted && !g_bGenDead && PRE_MIDIAudio->TrySeekWithinBuffer((double)llTarget / 1e6);
+        PRE_DbgLog("JumpTo: %s start t=%.2f r=%.2f w=%.2f", bKept ? "kept buffer" : "reset", (double)llStartTime / 1e6, (double)PRE_MIDIAudio->GetPlayerTime(), (double)PRE_MIDIAudio->GetBufferSeconds());
+        if (!bKept)
+            m_bAudioStarted = false;
     }
 
     m_OutDevice.AllNotesOff();
@@ -3886,7 +4139,10 @@ GameState::GameError MainScreen::Render()
         auto t0b = std::chrono::steady_clock::now();
         if (!cViz.bHorizontalPianoRoll) RenderLines();
         auto t1 = std::chrono::steady_clock::now();
-        RenderNotes();
+        {
+            FbdScope fbdNotes(FrameBreakdown::Notes);
+            RenderNotes();
+        }
         auto t2 = std::chrono::steady_clock::now();
         if (!cViz.bHorizontalPianoRoll && m_bShowKB) RenderKeys();
         if (!cViz.bHorizontalPianoRoll) RenderBorder();
@@ -3945,6 +4201,7 @@ GameState::GameError MainScreen::Render()
     m_pRenderer->DrawPianoRollStripKeyboard();
 
     m_pRenderer->SetPlaybackPosition((float)((double)(m_llDisplayTime - GetMinTime()) / (double)(GetMaxTime() - GetMinTime())));
+    m_pRenderer->SetPlaybackTimes((double)m_llDisplayTime / 1e6, (double)m_MIDI.GetInfo().llTotalMicroSecs / 1e6);
     m_pRenderer->SetPianoRollView(m_iStartNote, m_iEndNote,
         (float)((double)(m_llStartTime - m_llRndStartTime) / (double)m_llTimeSpan));
 
@@ -3954,8 +4211,20 @@ GameState::GameError MainScreen::Render()
         auto t0 = std::chrono::steady_clock::now();
         m_pRenderer->DrawPianoRollStripKeyboard();
         auto t1 = std::chrono::steady_clock::now();
-        m_pRenderer->EndScene(m_bBackgroundLoaded);
+        {
+            FbdScope fbdEnd(FrameBreakdown::EndScene);
+            m_pRenderer->EndScene(m_bBackgroundLoaded);
+        }
         auto t2 = std::chrono::steady_clock::now();
+
+        if (g_Bench.active && (g_Bench.dump.count(g_Bench.frame) ||
+                               (g_Bench.hashEvery > 0 && g_Bench.frame % g_Bench.hashEvery == 0))) {
+            const auto tCap = std::chrono::steady_clock::now();
+            if (const char* px = m_pRenderer->Screenshot())
+                BenchCaptureFrame(g_Bench.frame, (const uint8_t*)px, (int)m_pRenderer->GetBufferWidth(), (int)m_pRenderer->GetBufferHeight());
+            g_Bench.captureNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tCap).count();
+            g_Bench.capturedThisFrame = true;
+        }
 
         if (m_bDumpFrames) {
             auto* frame = m_pRenderer->Screenshot();
@@ -4008,7 +4277,10 @@ GameState::GameError MainScreen::Render()
         }
 
         if (!m_bRenderVideo || Config::GetConfig().GetVizSettings().bRenderShowPreview)
+        {
+            FbdScope fbdPresent(FrameBreakdown::Present);
             m_pRenderer->Present();
+        }
 
         auto t3 = std::chrono::steady_clock::now();
         tStrip += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -4020,7 +4292,119 @@ GameState::GameError MainScreen::Render()
             tStrip = tEnd = 0;
         }
     }
+    g_FBD.EndFrame();
+    if (g_Bench.active)
+        BenchPostFrame();
     return Success;
+}
+
+// ---- -bench (see Bench.h) ------------------------------------------------------------------------------
+void MainScreen::BenchPreFrame()
+{
+    BenchState& b = g_Bench;
+    PlaybackSettings& cPlayback = Config::GetConfig().GetPlaybackSettings();
+    if (!b.started)
+    {
+        b.started = true;
+        g_FBD.enabled = true;
+        g_FBD.bench = true;
+        JumpTo((long long)(b.startSec * 1e6), false);
+        cPlayback.SetPaused(false, false);
+        m_pRenderer->m_fCorruption = (float)b.corrupt;
+        HeartbeatLog("bench:started");
+        for (int t : b.hide)
+            if (t >= 0 && (size_t)t < m_vTrackSettings.size())
+                for (auto& chan : m_vTrackSettings[(size_t)t].aChannels)
+                    chan.bHidden = true;
+    }
+    const double t = b.frames > 1 ? (double)b.frame / (double)(b.frames - 1) : 0.0;
+    cPlayback.SetNSpeed((b.nspeed0 + (b.nspeed1 - b.nspeed0) * t) / 100.0, false);
+    cPlayback.SetSpeed((b.speed0 + (b.speed1 - b.speed0) * t) / 100.0, false);
+    for (const auto& h : b.hideAt)
+        if (h.first == b.frame && h.second >= 0 && (size_t)h.second < m_vTrackSettings.size())
+            for (auto& chan : m_vTrackSettings[(size_t)h.second].aChannels)
+                chan.bHidden = true;
+    for (const BenchJump& j : b.jumps)
+        if (j.frame == b.frame)
+            JumpTo((long long)(j.songSec * 1e6), false);
+    b.capturedThisFrame = false;
+    b.tFrameStart = std::chrono::steady_clock::now();
+}
+
+void MainScreen::BenchPostFrame()
+{
+    BenchState& b = g_Bench;
+    if (b.finished)
+        return;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b.tFrameStart).count();
+    b.frameWall.push_back(ms);
+    b.frameCap.push_back(b.capturedThisFrame ? 1 : 0);
+    b.frameRows.push_back(g_FBD.rows - b.prevRows);
+    b.prevRows = g_FBD.rows;
+    if (b.frame >= b.warmup && !b.capturedThisFrame)
+        b.wallMs.push_back(ms);
+    if (b.frame + 1 == b.warmup)
+    {
+        for (double& m : g_FBD.ms) m = 0.0;
+        g_FBD.rows = g_FBD.pushed = g_FBD.frames = 0;
+        b.prevRows = 0;
+        g_SnwStats.rows = g_SnwStats.scanned = g_SnwStats.blockSkips = g_SnwStats.owners = g_SnwStats.frames = 0;
+    }
+    b.frame++;
+    if (b.frame < b.frames)
+        return;
+
+    b.finished = true;
+    const double n = (double)(std::max)((uint64_t)1, g_FBD.frames);
+    std::vector<double> sorted = b.wallMs;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double p) { return sorted.empty() ? 0.0 : sorted[(size_t)((double)(sorted.size() - 1) * p)]; };
+    double mean = 0.0;
+    for (double v : sorted) mean += v;
+    mean = sorted.empty() ? 0.0 : mean / (double)sorted.size();
+
+    std::string out;
+    char line[640];
+    auto add = [&](const char* s) { out += s; out += "\n"; };
+    snprintf(line, sizeof(line), "label=%s", b.label.c_str()); add(line);
+    snprintf(line, sizeof(line), "midi=%s", BenchNarrow(b.midi).c_str()); add(line);
+    snprintf(line, sizeof(line), "renderer=%s buffer=%ux%u frames=%d warmup=%d measured=%zu step=1/%d s start=%.2f s",
+        b.renderer ? "DX12" : "DX11", (unsigned)m_pRenderer->GetBufferWidth(), (unsigned)m_pRenderer->GetBufferHeight(),
+        b.frames, b.warmup, sorted.size(), b.fps, b.startSec); add(line);
+    snprintf(line, sizeof(line), "zoom=%.0f..%.0f%% speed=%.0f..%.0f%% sliding=%d jumps=%zu", b.nspeed0, b.nspeed1, b.speed0, b.speed1, b.sliding, b.jumps.size()); add(line);
+    snprintf(line, sizeof(line), "frame_ms: mean=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f  (%.1f fps avg)",
+        mean, pct(0.5), pct(0.95), pct(0.99), pct(1.0), mean > 0.0 ? 1000.0 / mean : 0.0); add(line);
+    snprintf(line, sizeof(line), "phase_ms(avg/frame): logic=%.2f advance=%.2f | notes=%.2f collect=%.2f (build=%.2f push=%.2f) | endscene=%.2f present=%.2f",
+        g_FBD.ms[FrameBreakdown::Logic] / n, g_FBD.ms[FrameBreakdown::Advance] / n, g_FBD.ms[FrameBreakdown::Notes] / n,
+        (g_FBD.ms[FrameBreakdown::Notes] - g_FBD.ms[FrameBreakdown::Batch]) / n, g_FBD.ms[FrameBreakdown::Build] / n,
+        g_FBD.ms[FrameBreakdown::Push] / n, g_FBD.ms[FrameBreakdown::EndScene] / n, g_FBD.ms[FrameBreakdown::Present] / n); add(line);
+    snprintf(line, sizeof(line), "snw_ms(avg/frame): sync=%.2f cull=%.2f emit=%.2f", g_FBD.ms[FrameBreakdown::Build] / n, g_FBD.ms[FrameBreakdown::Cull] / n, g_FBD.ms[FrameBreakdown::Emit] / n); add(line);
+    snprintf(line, sizeof(line), "rows/frame=%.0f notes_built/frame=%.0f capture_ms_total=%.0f",
+        (double)g_FBD.rows / n, (double)g_FBD.pushed / n, (double)b.captureNs / 1e6); add(line);
+    if (g_SnwStats.frames.load() > 0)
+    {
+        const double sf = (double)g_SnwStats.frames.load();
+        snprintf(line, sizeof(line), "snw(avg/frame): row_searches=%.0f notes_examined=%.0f block_skips=%.0f owners=%.0f frames=%.0f",
+            (double)g_SnwStats.rows.load() / sf, (double)g_SnwStats.scanned.load() / sf, (double)g_SnwStats.blockSkips.load() / sf,
+            (double)g_SnwStats.owners.load() / sf, sf); add(line);
+    }
+    if (!b.baselineDir.empty())
+    {
+        snprintf(line, sizeof(line), "compare: %d identical, %d different (baseline %s)", b.compareSame, b.compareDiff, BenchNarrow(b.baselineDir).c_str()); add(line);
+        for (const std::string& l : b.compareLines) add(l.c_str());
+    }
+    add(b.compareDiff ? "status=DIFFERENT" : "status=OK");
+    BenchWriteFile(b.outDir + L"/result.txt", out.data(), out.size());
+
+    std::string hashes;
+    for (const std::string& l : b.hashLines) { hashes += l; hashes += "\n"; }
+    BenchWriteFile(b.outDir + L"/hashes.txt", hashes.data(), hashes.size());
+    std::string csv = "frame,wall_ms,rows,captured\n";
+    for (size_t i = 0; i < b.frameWall.size(); i++) { snprintf(line, sizeof(line), "%zu,%.3f,%llu,%d\n", i, b.frameWall[i], (unsigned long long)b.frameRows[i], (int)b.frameCap[i]); csv += line; }
+    BenchWriteFile(b.outDir + L"/frames.csv", csv.data(), csv.size());
+
+    HeartbeatLog("bench:finished");
+    PostMessage(g_hWnd, WM_CLOSE, 0, 0);
 }
 
 void MainScreen::RenderGlobals()
@@ -4446,6 +4830,652 @@ bool MainScreen::PushBendRibbonNote(const NoteData& data, bool bStrip)
     return bStrip ? m_pRenderer->PushRibbonStripNoteData(data, tier) : m_pRenderer->PushRibbonNoteData(data, tier);
 }
 
+// ---- sliding note window: which notes are drawn (see SlidingNoteWindow.h) --------------------------------------
+// The settings checkbox decides; PGFA_SLIDING in the environment overrides it (0 = off, 1 = on, 2 = force, also for
+// light frames, which is only useful for testing).
+static const int kSnwMaxRows = 1536; // = ImageBufferPreparedMaxRows (the row table of the occlusion filter)
+
+static int SnwMode()
+{
+    static const int s_env = []() {
+        char aEnv[8] = {};
+        if (GetEnvironmentVariableA("PGFA_SLIDING", aEnv, sizeof(aEnv)) > 0)
+            return aEnv[0] == '2' ? 2 : (aEnv[0] != '0' ? 1 : 0);
+        return -1;
+    }();
+    if (s_env >= 0)
+        return s_env;
+    return Config::GetConfig().GetVizSettings().bSlidingNotes ? 1 : 0;
+}
+
+struct SnwParams
+{
+    int rows;
+    double span, noteRows;
+    float deflate;
+    int64_t rnd;     // m_llRndStartTime
+    int64_t lo;      // m_iStartPos: a note whose NoteOff index is below it has ended
+    const TrackColor* colors;
+};
+
+// The exact row arithmetic of DirectNoteCullContributes / note_vs.hlsl (float position and length first).
+static inline void SnwRows(const SnwNote& n, const SnwParams& P, int& row0, int& row1)
+{
+    const float pos = static_cast<float>(n.start - P.rnd);
+    const float len = static_cast<float>((long long)n.length);
+    const double length = (std::max)(0.0, (double)len);
+    const double y = std::round(P.noteRows * (1.0 - (double)pos / P.span));
+    const double cy = (std::max)(std::round(P.noteRows * length / P.span), (double)P.deflate);
+    row0 = (int)std::floor(y - cy);
+    row1 = (int)std::ceil(y);
+    row0 = (std::max)(0, (std::min)(row0, P.rows));
+    row1 = (std::max)(0, (std::min)(row1, P.rows));
+}
+
+static inline bool SnwRow1Gt(const SnwNote& n, const SnwParams& P, int r)
+{
+    const float pos = static_cast<float>(n.start - P.rnd);
+    const double y = std::round(P.noteRows * (1.0 - (double)pos / P.span));
+    int row1 = (int)std::ceil(y);
+    row1 = (std::max)(0, (std::min)(row1, P.rows));
+    return row1 > r;
+}
+
+// The notes of one key that own at least one screen row: for every row the newest note that covers it. This is
+// exactly the set the occlusion filter keeps (it walks newest -> oldest and keeps a note when it still finds a row
+// nobody newer has taken), but found without visiting the notes that are completely hidden.
+static void SnwCullKey(SnwKey& K, const SnwParams& P, int key, std::vector<NoteData>& out)
+{
+    out.clear();
+    if (K.head >= K.notes.size())
+        return;
+    int owners[kSnwMaxRows];
+    int ownerCount = 0;
+    uint64_t statRows = 0, statScanned = 0, statSkips = 0;
+    size_t pHint = K.notes.size() - 1;
+    const double deflateD = (double)P.deflate;
+
+    for (int r = 0; r < P.rows; r++)
+    {
+        // p = newest note whose bottom edge is below row r (rows grow downward; older notes sit lower).
+        // row1(note) > r  <=>  round(noteRows * (1 - pos / span)) >= r + 1  <=>  pos <= posThr, so a plain integer
+        // search on the start times finds the boundary; only notes within a few microseconds of it (the float
+        // rounding of pos) need the exact test.
+        statRows++;
+        const double posThr = P.span * (1.0 - ((double)r + 0.5) / P.noteRows);
+        const int64_t tLo = (int64_t)std::floor(posThr) - 16; // pos <= tLo: certainly row1 > r
+        const int64_t tHi = (int64_t)std::ceil(posThr) + 16;  // pos >= tHi: certainly row1 <= r
+        // first index with start - rnd > tLo: gallop down from the previous row's answer (it moves only a little
+        // per row, and the notes next to it are already in cache), then bisect the bracket
+        size_t hiEx = pHint + 1, left = K.head, probe = pHint, step = 1;
+        for (;;)
+        {
+            if (K.notes[probe].start - P.rnd <= tLo) { left = probe + 1; break; }
+            hiEx = probe;
+            if (probe == K.head) { left = K.head; break; }
+            probe = (probe - K.head > step) ? probe - step : K.head;
+            step <<= 1;
+        }
+        while (left < hiEx)
+        {
+            const size_t mid = left + (hiEx - left) / 2;
+            if (K.notes[mid].start - P.rnd <= tLo) left = mid + 1; else hiEx = mid;
+        }
+        const size_t lo = left;
+        ptrdiff_t pSigned = (ptrdiff_t)lo - 1; // last note certainly below the row
+        for (size_t j = lo; j <= pHint && K.notes[j].start - P.rnd < tHi; j++)
+            if (SnwRow1Gt(K.notes[j], P, r))
+                pSigned = (ptrdiff_t)j;
+        if (pSigned < (ptrdiff_t)K.head)
+            break; // not even the oldest note reaches this row, nor any later one
+        const size_t p = (size_t)pSigned;
+        pHint = p;
+
+        // newest note at or below p that covers row r. A note can only reach row r if it ends late enough:
+        // end - rnd > Ecut(r) (with a few rows of slack for the rounding), which lets whole blocks be skipped.
+        const double eCut = P.span * (1.0 - ((double)r + 3.0 + deflateD) / P.noteRows);
+        int owner = -1;
+        size_t j = p;
+        bool blockCheck = true;
+        for (;;)
+        {
+            if (blockCheck || (j & 63) == 63)
+            {
+                blockCheck = false;
+                const size_t b = j >> SnwKey::BlockShift;
+                if ((double)(K.blockPrefMax[b] - P.rnd) <= eCut)
+                    break; // nothing this old can reach the row
+                if ((double)(K.blockMax[b] - P.rnd) <= eCut)
+                {
+                    statSkips++;
+                    const size_t blockStart = b << SnwKey::BlockShift;
+                    if (blockStart <= K.head)
+                        break;
+                    j = blockStart - 1;
+                    blockCheck = true;
+                    continue;
+                }
+            }
+            statScanned++;
+            const SnwNote& n = K.notes[j];
+            if ((int64_t)n.sister >= P.lo &&
+                P.colors[(size_t)n.track * 16 + n.channel].darker != 0xFFFFFFFFu)
+            {
+                int row0, row1;
+                SnwRows(n, P, row0, row1);
+                if (row0 <= r && r < row1)
+                {
+                    owner = (int)j;
+                    break;
+                }
+            }
+            if (j == K.head)
+                break;
+            j--;
+        }
+        if (owner >= 0 && (ownerCount == 0 || owners[ownerCount - 1] != owner))
+            owners[ownerCount++] = owner;
+    }
+
+    g_SnwStats.rows.fetch_add(statRows, std::memory_order_relaxed);
+    g_SnwStats.scanned.fetch_add(statScanned, std::memory_order_relaxed);
+    g_SnwStats.blockSkips.fetch_add(statSkips, std::memory_order_relaxed);
+    g_SnwStats.owners.fetch_add((uint64_t)ownerCount, std::memory_order_relaxed);
+    if (ownerCount == 0)
+        return;
+    std::sort(owners, owners + ownerCount, std::greater<int>()); // newest first: that is the draw order within a key
+    ownerCount = (int)(std::unique(owners, owners + ownerCount) - owners);
+    out.reserve((size_t)ownerCount);
+    for (int i = 0; i < ownerCount; i++)
+    {
+        const SnwNote& n = K.notes[(size_t)owners[i]];
+        out.push_back(NoteData{
+            .key = (uint8_t)key,
+            .channel = n.channel,
+            .track = n.track,
+            .pos = static_cast<float>(n.start - P.rnd),
+            .length = static_cast<float>((long long)n.length),
+        });
+    }
+}
+
+void MainScreen::SnwAddNote(long long evIdx)
+{
+    const MIDIChannelEvent e = m_vEvents[(size_t)evIdx];
+    SnwNote n;
+    n.start = m_MIDI.GetEventTime(e);
+    n.length = m_MIDI.GetEventLength(e);
+    n.evIdx = (uint32_t)evIdx;
+    n.sister = m_MIDI.GetEventSisterIdx(e);
+    n.track = (uint16_t)m_MIDI.GetEventTrack(e);
+    n.channel = (uint8_t)m_MIDI.GetEventChannel(e);
+    n.key = (uint8_t)(m_MIDI.GetEventParam1(e) & 0x7F); // key (the strip sampling needs it)
+    m_snw.keys[m_MIDI.GetEventParam1(e) & 0x7F].Append(n);
+}
+
+// Appends the NoteOns among events [from, to] (ascending, so every key stays sorted). Big ranges - a rebuild after
+// a seek - are split across threads and merged in order.
+void MainScreen::SnwAppendRange(long long from, long long to)
+{
+    if (to < from)
+        return;
+    const long long count = to - from + 1;
+    auto isNote = [&](long long i) {
+        const MIDIChannelEvent e = m_vEvents[(size_t)i];
+        return m_MIDI.GetEventChannelEventType(e) == MIDI::NoteOn && m_MIDI.GetEventParam2(e) > 0 && m_MIDI.EventHasSister(e);
+    };
+    unsigned workers = 1;
+    if (count >= 400000)
+    {
+        workers = std::thread::hardware_concurrency();
+        workers = (std::min)((std::max)(workers, 1u), 8u);
+    }
+    if (workers < 2)
+    {
+        for (long long i = from; i <= to; i++)
+            if (isNote(i))
+                SnwAddNote(i);
+        return;
+    }
+    struct Part { std::vector<SnwNote> keys[128]; std::exception_ptr err; };
+    std::vector<Part> parts(workers);
+    auto build = [&](unsigned w) {
+        Part& part = parts[w];
+        try
+        {
+            const long long a = from + count * w / workers, b = from + count * (w + 1) / workers - 1;
+            for (long long i = a; i <= b; i++)
+            {
+                if (!isNote(i))
+                    continue;
+                const MIDIChannelEvent e = m_vEvents[(size_t)i];
+                SnwNote n;
+                n.start = m_MIDI.GetEventTime(e);
+                n.length = m_MIDI.GetEventLength(e);
+                n.evIdx = (uint32_t)i;
+                n.sister = m_MIDI.GetEventSisterIdx(e);
+                n.track = (uint16_t)m_MIDI.GetEventTrack(e);
+                n.channel = (uint8_t)m_MIDI.GetEventChannel(e);
+                n.key = (uint8_t)(m_MIDI.GetEventParam1(e) & 0x7F);
+                part.keys[m_MIDI.GetEventParam1(e) & 0x7F].push_back(n);
+            }
+        }
+        catch (...) { part.err = std::current_exception(); }
+    };
+    std::vector<std::thread> threads;
+    try
+    {
+        for (unsigned w = 1; w < workers; w++)
+            threads.emplace_back(build, w);
+    }
+    catch (...) {}
+    const unsigned started = (unsigned)threads.size() + 1;
+    build(0);
+    for (unsigned w = started; w < workers; w++)
+        build(w);
+    for (auto& t : threads)
+        t.join();
+    for (auto& part : parts)
+        if (part.err) std::rethrow_exception(part.err);
+    for (int key = 0; key < 128; key++)
+        for (auto& part : parts)
+            for (const SnwNote& n : part.keys[key])
+                m_snw.keys[key].Append(n);
+}
+
+void MainScreen::SnwSync(long long lo, long long hi)
+{
+    if (!m_snw.valid)
+    {
+        m_snw.Reset();
+        // notes that are sounding right now (their NoteOn is already behind the window), oldest first
+        for (int key = 0; key < 128; key++)
+            for (int idx : m_vState[key])
+                SnwAddNote(idx);
+        SnwAppendRange(lo, hi);
+        m_snw.builtHi = (std::max)(hi, lo - 1);
+        m_snw.valid = true;
+        return;
+    }
+    if (hi > m_snw.builtHi)
+    {
+        SnwAppendRange(m_snw.builtHi + 1, hi);
+        m_snw.builtHi = hi;
+    }
+    else if (hi < m_snw.builtHi)
+    {
+        for (SnwKey& k : m_snw.keys)
+        {
+            if (hi < 0) k.Clear();
+            else k.PopNewerThan((uint32_t)hi);
+        }
+        m_snw.builtHi = hi;
+    }
+    for (SnwKey& k : m_snw.keys)
+        k.TrimFront(lo);
+}
+
+// Draws the main roll's notes from the sliding window. Returns false when the regular path has to be used (light
+// frames, and every mode whose note data the window does not model: tick based, corrupted, bent, warped, ...).
+bool MainScreen::SnwRender()
+{
+    if (!SnwMode())
+    {
+        m_snw.valid = false;
+        return false;
+    }
+    auto& root = m_pRenderer->GetRootConstants();
+    const long long lo = (std::max<long long>)(m_iStartPos, 0), hi = m_iEndPos;
+    const long long nRows = hi - lo + 1;
+    const bool eligible = !m_bTickMode && !m_bBendRibbonsFrame && GetCorruptorAmount() <= 0.0f &&
+        m_vTrackSettings.size() <= MaxTrackColors && root.fWarp <= 0.0f && root.timespan > 0.0f && root.notes_cy > 0.0f;
+    if (!eligible || (SnwMode() != 2 && nRows < (m_snw.valid ? 80000 : 150000)))
+    {
+        m_snw.valid = false;
+        if (++m_iSnwIdleFrames == 300) // long idle: give the memory back
+        {
+            m_snw.ReleaseMemory();
+        }
+        return false;
+    }
+    m_iSnwIdleFrames = 0;
+
+    {
+        FbdScope fbdSync(FrameBreakdown::Build);
+        SnwSync(lo, hi);
+    }
+    FbdScope fbdCull(FrameBreakdown::Push);
+
+    SnwParams P;
+    P.rows = (std::min)((std::max)((int)std::ceil(std::fabs(root.notes_cy)), 64), kSnwMaxRows);
+    P.span = (double)root.timespan;
+    P.noteRows = (double)root.notes_cy;
+    P.deflate = root.deflate;
+    P.rnd = m_llRndStartTime;
+    P.lo = lo;
+    P.colors = m_pRenderer->GetTrackColors();
+
+    static std::vector<NoteData> s_perKey[128];
+    {
+        FbdScope fbdC(FrameBreakdown::Cull);
+        concurrency::parallel_for(0, 128, [&](int key) {
+            SnwCullKey(m_snw.keys[key], P, key, s_perKey[key]);
+        });
+    }
+    FbdScope fbdE(FrameBreakdown::Emit);
+
+    g_SnwStats.frames.fetch_add(1, std::memory_order_relaxed);
+    static std::vector<NoteData> s_all;
+    s_all.clear();
+    for (int key = 0; key < 128; key++)
+        s_all.insert(s_all.end(), s_perKey[key].begin(), s_perKey[key].end());
+    if (g_FBD.enabled)
+    {
+        g_FBD.rows += (uint64_t)nRows;
+        g_FBD.pushed += s_all.size();
+    }
+    m_pRenderer->AppendCulledNotes(s_all);
+    return true;
+}
+
+// First event at or after `stripEnd` (events are sorted by time, so this is a binary search; ticks are scanned as before).
+long long MainScreen::StripEventEnd(long long lo0, long long stripEnd) const
+{
+    const long long eventCount = (long long)m_vEvents.size();
+    if (m_bTickMode)
+    {
+        long long hi = lo0;
+        while (hi < eventCount && m_MIDI.GetEventAbsT(m_vEvents[(size_t)hi]) < stripEnd)
+            ++hi;
+        return hi;
+    }
+    long long a = lo0, b = eventCount;
+    while (a < b)
+    {
+        const long long mid = a + (b - a) / 2;
+        if (m_MIDI.GetEventTime(m_vEvents[(size_t)mid]) < stripEnd) a = mid + 1; else b = mid;
+    }
+    return a;
+}
+
+// Appends the NoteOns among events [from, to] to the global window (split over threads for big ranges).
+void MainScreen::GwAppend(long long from, long long to)
+{
+    if (to < from)
+        return;
+    const long long count = to - from + 1;
+    auto buildNote = [&](long long i, SnwNote& n) {
+        const MIDIChannelEvent e = m_vEvents[(size_t)i];
+        if (!(m_MIDI.GetEventChannelEventType(e) == MIDI::NoteOn && m_MIDI.GetEventParam2(e) > 0 && m_MIDI.EventHasSister(e)))
+            return false;
+        n.start = m_MIDI.GetEventTime(e);
+        n.length = m_MIDI.GetEventLength(e);
+        n.evIdx = (uint32_t)i;
+        n.sister = m_MIDI.GetEventSisterIdx(e);
+        n.track = (uint16_t)m_MIDI.GetEventTrack(e);
+        n.channel = (uint8_t)m_MIDI.GetEventChannel(e);
+        n.key = (uint8_t)(m_MIDI.GetEventParam1(e) & 0x7F);
+        return true;
+    };
+    unsigned workers = 1;
+    if (count >= 400000)
+    {
+        workers = std::thread::hardware_concurrency();
+        workers = (std::min)((std::max)(workers, 1u), 8u);
+    }
+    if (workers < 2)
+    {
+        SnwNote n;
+        for (long long i = from; i <= to; i++)
+            if (buildNote(i, n))
+                m_gw.notes.push_back(n);
+        return;
+    }
+    struct Part { std::vector<SnwNote> notes; std::exception_ptr err; };
+    std::vector<Part> parts(workers);
+    auto build = [&](unsigned w) {
+        Part& part = parts[w];
+        try
+        {
+            const long long a = from + count * w / workers, b = from + count * (w + 1) / workers - 1;
+            part.notes.reserve((size_t)((b - a + 1) / 2 + 16));
+            SnwNote n;
+            for (long long i = a; i <= b; i++)
+                if (buildNote(i, n))
+                    part.notes.push_back(n);
+        }
+        catch (...) { part.err = std::current_exception(); }
+    };
+    std::vector<std::thread> threads;
+    try
+    {
+        for (unsigned w = 1; w < workers; w++)
+            threads.emplace_back(build, w);
+    }
+    catch (...) {}
+    const unsigned started = (unsigned)threads.size() + 1;
+    build(0);
+    for (unsigned w = started; w < workers; w++)
+        build(w);
+    for (auto& t : threads)
+        t.join();
+    size_t total = 0;
+    for (auto& part : parts)
+    {
+        if (part.err) std::rethrow_exception(part.err);
+        total += part.notes.size();
+    }
+    m_gw.notes.reserve(m_gw.notes.size() + total);
+    for (auto& part : parts)
+        m_gw.notes.insert(m_gw.notes.end(), part.notes.begin(), part.notes.end());
+}
+
+// The dual / horizontal roll from the global window: the list the renderer samples (every stride-th note, newest
+// first) is simply read out of the window's array. Returns false when the data cannot come from the window.
+bool MainScreen::StripCollectGlobal(long long lo0, long long hi)
+{
+    static const size_t kGwMaxNotes = (size_t)24 << 20; // ~600 MB: beyond that the two-pass path is used
+    if (m_bTickMode || m_bStripRibbonsFrame || GetCorruptorAmount() > 0.0f || hi - lo0 > 2 * (long long)kGwMaxNotes)
+        return false;
+
+    if (!m_gw.valid)
+    {
+        m_gw.notes.clear();
+        m_gw.head = 0;
+        GwAppend(lo0, hi - 1);
+        m_gw.hi = hi;
+        m_gw.valid = true;
+    }
+    else
+    {
+        if (hi > m_gw.hi)
+            GwAppend(m_gw.hi, hi - 1);
+        else if (hi < m_gw.hi)
+            m_gw.PopFrom(hi);
+        m_gw.hi = hi;
+        m_gw.TrimFront(lo0);
+    }
+    if (m_gw.Size() > kGwMaxNotes)
+    {
+        m_gw.ReleaseMemory();
+        return false;
+    }
+
+    const uint64_t windowNotes = m_gw.Size();
+    uint64_t stateNotes = 0;
+    for (size_t k = 0; k < 128; ++k)
+        for (int idx : m_vState[k])
+            if (idx >= 0 && (size_t)idx < m_vEvents.size())
+                ++stateNotes;
+    const uint64_t listSize = windowNotes + stateNotes;
+    const uint64_t stripCount = (std::min)(listSize, (uint64_t)m_pRenderer->StripNoteCap());
+    if (stripCount == 0)
+        return true;
+    const uint64_t budget = (uint64_t)m_pRenderer->StripBudget();
+    const uint64_t stride = (stripCount + budget - 1) / budget;
+
+    const uint64_t fromWindow = (std::min)(windowNotes, stripCount);
+    const size_t outCount = (size_t)((fromWindow + stride - 1) / stride);
+    std::vector<std::vector<NoteData>> parts(2);
+    parts[0].resize(outCount);
+    const SnwNote* base = m_gw.notes.data();
+    const size_t newest = m_gw.notes.size() - 1; // the list starts at the newest note
+    const int64_t rnd = m_llRndStartTime;
+    NoteData* out = parts[0].data();
+    const size_t chunk = 1u << 15;
+    concurrency::parallel_for(size_t(0), (outCount + chunk - 1) / chunk, [&](size_t c) {
+        const size_t s0 = c * chunk, s1 = (std::min)(outCount, s0 + chunk);
+        for (size_t s = s0; s < s1; s++)
+        {
+            const SnwNote& n = base[newest - (size_t)((uint64_t)s * stride)];
+            out[s] = NoteData{
+                .key = n.key,
+                .channel = n.channel,
+                .track = n.track,
+                .pos = static_cast<float>(n.start - rnd),
+                .length = static_cast<float>((long long)n.length),
+            };
+        }
+    });
+    {
+        uint64_t p = windowNotes;
+        for (size_t k = 0; k < 128 && p < stripCount; ++k)
+            for (auto it = m_vState[k].rbegin(); it != m_vState[k].rend(); ++it)
+            {
+                if (*it < 0 || (size_t)*it >= m_vEvents.size())
+                    continue;
+                if (p >= stripCount)
+                    break;
+                if (p % stride == 0)
+                    parts[1].push_back(BuildRenderNoteData(m_vEvents[(size_t)*it]));
+                ++p;
+            }
+    }
+    if (g_FBD.enabled)
+    {
+        g_FBD.rows += (uint64_t)(hi - lo0);
+        g_FBD.pushed += parts[0].size() + parts[1].size();
+    }
+    m_pRenderer->AppendStripNotesPresampled(parts);
+    return true;
+}
+
+// Collects the notes of the dual / horizontal roll. The regular path pushes every NoteOn of events [lo0, hi) newest
+// first, then the sounding ones, and the renderer then draws every stride-th note of that list (stride > 1 once there
+// are more than StripBudget). Here the list positions are worked out first (a parallel count), and only the notes that
+// are going to be drawn get built, in parallel, in the same order: the result is the same set of notes, in the same
+// order, for a fraction of the work. Returns false when the regular path has to run.
+bool MainScreen::StripCollect(long long lo0, long long hi)
+{
+    if (!SnwMode() || m_bStripRibbonsFrame || hi - lo0 < 200000)
+        return false;
+    if (StripCollectGlobal(lo0, hi))
+        return true;
+    const long long count = hi - lo0;
+    unsigned workers = std::thread::hardware_concurrency();
+    workers = (std::min)((std::max)(workers, 1u), 8u);
+    if (workers < 2)
+        return false;
+
+    auto isNote = [&](long long i) {
+        const MIDIChannelEvent e = m_vEvents[(size_t)i];
+        return m_MIDI.GetEventChannelEventType(e) == MIDI::NoteOn && m_MIDI.GetEventParam2(e) > 0 && m_MIDI.EventHasSister(e);
+    };
+    // part 0 holds the highest event indices (the list is newest first)
+    auto partRange = [&](unsigned w, long long& a, long long& b) {
+        b = (hi - 1) - count * (long long)w / workers;
+        a = (hi - 1) - count * (long long)(w + 1) / workers + 1;
+    };
+    std::vector<std::exception_ptr> errors(workers);
+    auto runParallel = [&](auto&& fn) {
+        std::vector<std::thread> threads;
+        try
+        {
+            for (unsigned w = 1; w < workers; w++)
+                threads.emplace_back([&, w]() { try { fn(w); } catch (...) { errors[w] = std::current_exception(); } });
+        }
+        catch (...) {}
+        const unsigned started = (unsigned)threads.size() + 1;
+        try { fn(0); } catch (...) { errors[0] = std::current_exception(); }
+        for (unsigned w = started; w < workers; w++)
+            try { fn(w); } catch (...) { errors[w] = std::current_exception(); }
+        for (auto& t : threads)
+            t.join();
+        for (auto& e : errors)
+            if (e) std::rethrow_exception(e);
+    };
+
+    std::vector<uint64_t> counts(workers, 0);
+    runParallel([&](unsigned w) {
+        long long a, b;
+        partRange(w, a, b);
+        uint64_t n = 0;
+        for (long long i = b; i >= a; --i)
+            n += isNote(i) ? 1 : 0;
+        counts[w] = n;
+    });
+    uint64_t windowNotes = 0;
+    for (uint64_t c : counts) windowNotes += c;
+    uint64_t stateNotes = 0;
+    for (size_t k = 0; k < 128; ++k)
+        for (int idx : m_vState[k])
+            if (idx >= 0 && (size_t)idx < m_vEvents.size())
+                ++stateNotes;
+
+    const uint64_t listSize = windowNotes + stateNotes;
+    const size_t cap = m_pRenderer->StripNoteCap();
+    const uint64_t stripCount = (std::min)(listSize, (uint64_t)cap);
+    if (stripCount == 0)
+        return true; // nothing to draw (the regular path would not have pushed anything either)
+    const uint64_t budget = (uint64_t)m_pRenderer->StripBudget();
+    const uint64_t stride = (stripCount + budget - 1) / budget;
+
+    std::vector<std::vector<NoteData>> parts(workers + 1);
+    std::vector<uint64_t> rankBase(workers, 0);
+    for (unsigned w = 1; w < workers; w++)
+        rankBase[w] = rankBase[w - 1] + counts[w - 1];
+    runParallel([&](unsigned w) {
+        long long a, b;
+        partRange(w, a, b);
+        std::vector<NoteData>& out = parts[w];
+        out.reserve((size_t)(counts[w] / stride + 16));
+        uint64_t rank = rankBase[w];
+        for (long long i = b; i >= a && rank < stripCount; --i)
+        {
+            if (!isNote(i))
+                continue;
+            const uint64_t p = rank++;
+            if (p % stride == 0)
+                out.push_back(BuildRenderNoteData(m_vEvents[(size_t)i]));
+        }
+    });
+    {
+        // the sounding notes follow the window notes in the list: key by key, newest first
+        uint64_t p = windowNotes;
+        for (size_t k = 0; k < 128 && p < stripCount; ++k)
+            for (auto it = m_vState[k].rbegin(); it != m_vState[k].rend(); ++it)
+            {
+                if (*it < 0 || (size_t)*it >= m_vEvents.size())
+                    continue;
+                if (p >= stripCount)
+                    break;
+                if (p % stride == 0)
+                    parts[workers].push_back(BuildRenderNoteData(m_vEvents[(size_t)*it]));
+                ++p;
+            }
+    }
+    if (g_FBD.enabled)
+    {
+        g_FBD.rows += (uint64_t)count;
+        for (const auto& part : parts) g_FBD.pushed += part.size();
+    }
+    m_pRenderer->AppendStripNotesPresampled(parts);
+    return true;
+}
+
+// Frames with at least this many event rows in view build their notes on several threads.
+static const int64_t kParallelCollectMinRows = 100000;
+
 void MainScreen::RenderNotes()
 {
     IB_TRACE(IB_RNOTES);
@@ -4476,7 +5506,85 @@ void MainScreen::RenderNotes()
     if (!horizontalOnly) {
         if (bImageBuffer && !m_bBendRibbonsFrame) {
             RenderNotesImageBuffer();
-        } else {
+        } else if (!SnwRender()) {
+            if (g_FBD.enabled)
+                g_FBD.rows += (uint64_t)(std::max<int64_t>)(0, (int64_t)m_iEndPos - (int64_t)m_iStartPos + 1);
+            const int64_t nRows = (int64_t)m_iEndPos - (int64_t)m_iStartPos + 1;
+            // Building a note (tick->time, sister lookup, corruptor) is ~50 ns of pure, read-only work, and
+            // dense sections have millions of rows per frame. Split the range into contiguous slices, build
+            // each on its own thread, then push the slices in order so the draw (depth) order is unchanged.
+            unsigned collectWorkers = 1;
+            if (nRows >= kParallelCollectMinRows)
+            {
+                unsigned hw = std::thread::hardware_concurrency();
+                if (hw == 0) hw = 2;
+                collectWorkers = (unsigned)(std::min<int64_t>)((std::min<unsigned>)(hw, 8u), nRows / (kParallelCollectMinRows / 2));
+            }
+            if (collectWorkers > 1)
+            {
+                struct Slice { std::vector<NoteData> notes; std::exception_ptr err; };
+                std::vector<Slice> slices(collectWorkers);
+                auto collectSlice = [&](unsigned w) {
+                    Slice& slice = slices[w];
+                    try
+                    {
+                        // slice 0 holds the highest indices (the loop runs newest -> oldest)
+                        const int64_t hi = (int64_t)m_iEndPos - nRows * w / collectWorkers;
+                        const int64_t lo = (int64_t)m_iEndPos - nRows * (w + 1) / collectWorkers + 1;
+                        slice.notes.reserve((size_t)((hi - lo + 1) / 2 + 16));
+                        for (int64_t i = hi; i >= lo; i--) {
+                            MIDIChannelEvent pEvent = m_vEvents[i];
+                            if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                                m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
+                                slice.notes.push_back(BuildRenderNoteData(pEvent));
+                        }
+                    }
+                    catch (...) { slice.err = std::current_exception(); }
+                };
+                std::vector<std::thread> threads;
+                {
+                FbdScope fbdBuild(FrameBreakdown::Build);
+                try
+                {
+                    threads.reserve(collectWorkers);
+                    for (unsigned w = 1; w < collectWorkers; w++)
+                        threads.emplace_back(collectSlice, w);
+                }
+                catch (...) {}
+                const unsigned started = (unsigned)threads.size() + 1;
+                collectSlice(0);
+                for (unsigned w = started; w < collectWorkers; w++) // threads that could not be created
+                    collectSlice(w);
+                for (auto& t : threads)
+                    t.join();
+                } // build phase ends
+                for (auto& slice : slices)
+                    if (slice.err) std::rethrow_exception(slice.err);
+                {
+                FbdScope fbdPush(FrameBreakdown::Push);
+                if (!m_bBendRibbonsFrame) {
+                    // The renderer filters hidden notes (in parallel) and keeps the original order.
+                    std::vector<std::vector<NoteData>> parts;
+                    parts.reserve(slices.size());
+                    for (auto& slice : slices) {
+                        if (g_FBD.enabled)
+                            g_FBD.pushed += slice.notes.size();
+                        parts.push_back(std::move(slice.notes));
+                    }
+                    m_pRenderer->PushNoteSlices(parts);
+                } else
+                for (auto& slice : slices) {
+                    if (g_FBD.enabled)
+                        g_FBD.pushed += slice.notes.size();
+                    for (const NoteData& data : slice.notes) {
+                        if (m_bBendRibbonsFrame && PushBendRibbonNote(data))
+                            continue;
+                        m_pRenderer->PushNoteData(data);
+                    }
+                }
+                }
+            }
+            else
             for (auto i = m_iEndPos; i >= m_iStartPos; i--) {
                 MIDIChannelEvent pEvent = m_vEvents[i];
                 if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
@@ -4493,36 +5601,37 @@ void MainScreen::RenderNotes()
         }
     }
 
+    if (!hasStrip && m_gw.valid)
+        m_gw.ReleaseMemory();
     if (hasStrip) {
     if (bImageBuffer && !m_bStripRibbonsFrame) {
         RenderPianoRollStripImageBuffer();
     } else {
         const float stripTimeSpan = m_pRenderer->GetDualRollTimeSpan((float)m_llTimeSpan, m_fNotesCY);
         const long long stripEnd = m_llRndStartTime + (long long)ceilf(stripTimeSpan);
-        int64_t hi = max<int64_t>(m_iStartPos, 0);
-        while (hi < eventCount) {
-            MIDIChannelEvent pEvent = m_vEvents[hi];
-            const long long eventTime = m_bTickMode ? m_MIDI.GetEventAbsT(pEvent) : m_MIDI.GetEventTime(pEvent);
-            if (eventTime >= stripEnd)
-                break;
-            ++hi;
-        }
-        for (int64_t i = hi - 1; i >= max<int64_t>(m_iStartPos, 0); --i) {
-            MIDIChannelEvent pEvent = m_vEvents[i];
-            if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
-                m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
-                RenderPianoRollStripNote(pEvent);
-        }
-        for (size_t i = 0; i < 128; ++i) {
-            for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it) {
-                if (*it >= 0 && (size_t)*it < m_vEvents.size())
-                    RenderPianoRollStripNote(m_vEvents[*it]);
+        const int64_t lo0 = max<int64_t>(m_iStartPos, 0);
+        const int64_t hi = StripEventEnd(lo0, stripEnd);
+        if (!StripCollect(lo0, hi)) {
+            for (int64_t i = hi - 1; i >= lo0; --i) {
+                MIDIChannelEvent pEvent = m_vEvents[i];
+                if (m_MIDI.GetEventChannelEventType(pEvent) == MIDI::NoteOn &&
+                    m_MIDI.GetEventParam2(pEvent) > 0 && m_MIDI.EventHasSister(pEvent))
+                    RenderPianoRollStripNote(pEvent);
+            }
+            for (size_t i = 0; i < 128; ++i) {
+                for (auto it = m_vState[i].rbegin(); it != m_vState[i].rend(); ++it) {
+                    if (*it >= 0 && (size_t)*it < m_vEvents.size())
+                        RenderPianoRollStripNote(m_vEvents[*it]);
+                }
             }
         }
     }
 }
 
-    m_pRenderer->RenderBatch(true);
+    {
+        FbdScope fbdBatch(FrameBreakdown::Batch);
+        m_pRenderer->RenderBatch(true);
+    }
 }
 
 NoteData MainScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
@@ -4551,6 +5660,8 @@ NoteData MainScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
 
 void MainScreen::RenderNote(const MIDIChannelEvent pNote)
 {
+    if (g_FBD.enabled)
+        g_FBD.pushed++;
     const NoteData data = BuildRenderNoteData(pNote);
     if (m_bBendRibbonsFrame && PushBendRibbonNote(data))
         return;
@@ -4860,6 +5971,8 @@ void MainScreen::RenderPianoRollStripImageBuffer()
 
 void MainScreen::RenderPianoRollStripNote(const MIDIChannelEvent pNote)
 {
+    if (g_FBD.enabled)
+        g_FBD.pushed++;
     const NoteData data = BuildRenderNoteData(pNote);
     if (m_bStripRibbonsFrame && PushBendRibbonNote(data, true))
         return;
@@ -5280,13 +6393,35 @@ static void Apply3DTilt(ImDrawList* dl, int vtx_start, int vtx_end, const ImVec2
 
 float MainScreen::GetStatsBounceScale() const
 {
-    const VizSettings& viz = Config::GetConfig().GetVizSettings();
-    if (!viz.bBounceStats || m_bPaused)
+    if (!Config::GetConfig().GetVizSettings().bBounceStats)
         return 1.0f;
+    return 1.0f + ComputeBeatBounce();
+}
+
+// Hops the OS window on the beat. The window belongs to the UI thread, so the game thread only posts
+// the hop height (when it changes) and the UI thread moves it. 0 puts the window back at rest.
+void MainScreen::UpdateWindowBounce()
+{
+    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    int px = 0;
+    if (viz.bBounceWindow && !m_bRenderVideo && !m_bDumpFrames)
+        px = (int)(ComputeBeatBounce() / 0.06f * (float)viz.iBounceWindowPx + 0.5f);
+    if (px != m_iWindowBouncePx)
+    {
+        m_iWindowBouncePx = px;
+        PostMessage(g_hWnd, ID_BOUNCE_WINDOW, 0, (LPARAM)px);
+    }
+}
+
+float MainScreen::ComputeBeatBounce() const
+{
+    const VizSettings& viz = Config::GetConfig().GetVizSettings();
+    if (m_bPaused)
+        return 0.0f;
 
     // Start bouncing only once the first notes have been played
     if (!IsFreePlay() && m_MIDI.IsValid() && m_llStartTime < m_MIDI.GetInfo().llFirstNote)
-        return 1.0f;
+        return 0.0f;
 
     long long curNps = 0;
     for (size_t i = 0; i < m_dNPSNotes.size(); i++)
@@ -5341,8 +6476,7 @@ float MainScreen::GetStatsBounceScale() const
 
     // Zoom in and out very slightly with an exponent of fast to slow (cubic ease-out decay)
     const float amplitude = 0.06f; // subtle ~6% peak zoom
-    float bounce = amplitude * powf(1.0f - phase, 3.0f);
-    return 1.0f + bounce;
+    return amplitude * powf(1.0f - phase, 3.0f);
 }
 
 void MainScreen::RenderStatus(int lines)
@@ -5361,6 +6495,9 @@ void MainScreen::RenderStatus(int lines)
     if (!bFreePlay)
         llTotalMicroSecs = m_MIDI.GetInfo().llTotalMicroSecs;
     auto starttime = ((m_llDisplayTime >= 0) ? m_llDisplayTime : -m_llDisplayTime);
+    // After a long stall the clock can run past the song's end; never show more than the total.
+    if (!bFreePlay && m_llDisplayTime >= 0 && starttime > llTotalMicroSecs)
+        starttime = llTotalMicroSecs;
 
     auto min = starttime / 60000000;
     auto sec = (starttime % 60000000) / 1000000;
@@ -5555,7 +6692,7 @@ static void DrawBlurPanel(Renderer* r, float left, float top, float right, float
     quad(ImVec2(blurL, blurT), ImVec2(left, blurT), ImVec2(left, top), ImVec2(blurL, top), tr, tr, op, tr);
     quad(ImVec2(right, blurT), ImVec2(blurR, blurT), ImVec2(blurR, top), ImVec2(right, top), tr, tr, tr, op);
     quad(ImVec2(blurL, bottom), ImVec2(left, bottom), ImVec2(left, blurB), ImVec2(blurL, blurB), tr, op, tr, tr);
-    quad(ImVec2(right, bottom), ImVec2(blurR, bottom), ImVec2(blurR, blurB), ImVec2(right, bottom), op, tr, tr, tr);
+    quad(ImVec2(right, bottom), ImVec2(blurR, bottom), ImVec2(blurR, blurB), ImVec2(right, blurB), op, tr, tr, tr);
 
     dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom), 0x40000000);
 }
@@ -5879,7 +7016,7 @@ FreePlayScreen::FreePlayScreen(HWND hWnd, Renderer* pRenderer)
     InitColors();
 
     m_vTrackSettings.resize(MaxTrackColors);
-    for (int i = 0; i < MaxTrackColors; i++)
+    for (int i = 0; i < (int)(MaxTrackColors * 16); i++)
         m_vFreeSlots.push_back(i);
 
     static Config& config = Config::GetConfig();
@@ -5996,6 +7133,19 @@ int FreePlayScreen::NoteFromMousePos(int mx, int my) const
     return -1;
 }
 
+int FreePlayScreen::AllocEvent(MIDIChannelEvent* out)
+{
+    if (!m_vFreeEvents.empty()) {
+        const int idx = m_vFreeEvents.back();
+        m_vFreeEvents.pop_back();
+        *out = m_vEvents[idx];
+        return idx;
+    }
+    *out = m_MIDI.AppendChannelEvent(0, 0);
+    m_vEvents.push_back(*out);
+    return (int)m_vEvents.size() - 1;
+}
+
 void FreePlayScreen::NoteOn(int note, int velocity, long long llStamp)
 {
     int iRange = max(1, min(128, m_iFreePlayRange));
@@ -6005,7 +7155,7 @@ void FreePlayScreen::NoteOn(int note, int velocity, long long llStamp)
         int n = iStart + i;
         if (n < 0 || n >= 128) continue;
         NoteOnSingle(n, velocity, llStamp);
-        m_iChordEvent[n] = (int)m_vEvents.size() - 1;
+        m_iChordEvent[n] = m_iLastOnIdx;
         bHit[n] = true;
     }
     if (m_bMirrorKeys) {
@@ -6014,7 +7164,7 @@ void FreePlayScreen::NoteOn(int note, int velocity, long long llStamp)
             int n = iStart + i;
             if (n < 0 || n >= 128 || bHit[n]) continue;
             NoteOnSingle(n, velocity, llStamp);
-            m_iChordEvent[n] = (int)m_vEvents.size() - 1;
+            m_iChordEvent[n] = m_iLastOnIdx;
         }
     }
     if (m_bRainbow) m_iRainbowOffset++;
@@ -6031,7 +7181,7 @@ void FreePlayScreen::NoteOnSingle(int note, int velocity, long long llStamp)
         while (!m_dReleaseOrder.empty()) {
             int cand = m_dReleaseOrder.front();
             m_dReleaseOrder.pop_front();
-            if (m_mReleasedNotes.find(cand) != m_mReleasedNotes.end()) {
+            if (m_Released.find(cand)) {
                 slot = cand;
                 break;
             }
@@ -6040,12 +7190,18 @@ void FreePlayScreen::NoteOnSingle(int note, int velocity, long long llStamp)
             int nOld = m_MIDI.GetEventParam1(m_vEvents[slot]);
             auto& st = m_vState[nOld];
             st.erase(std::remove(st.begin(), st.end(), slot), st.end());
-            m_mReleasedNotes.erase(slot);
-            slot = m_MIDI.GetEventTrack(m_vEvents[slot]);
+            m_Released.erase(slot);
+            {
+                const unsigned sis = m_MIDI.GetEventSisterIdx(m_vEvents[slot]);
+                m_vFreeEvents.push_back(slot);
+                if (sis != UINT32_MAX) m_vFreeEvents.push_back((int)sis);
+                if (m_iChordEvent[nOld] == slot) m_iChordEvent[nOld] = -1;
+            }
+            slot = (m_MIDI.GetEventTrack(m_vEvents[slot]) << 4) | m_MIDI.GetEventChannel(m_vEvents[slot]);
         }
         else slot = 0; // all notes held; should not happen at 65536 slots
     }
-    else { slot = m_vFreeSlots.back(); m_vFreeSlots.pop_back(); }
+    else { slot = m_vFreeSlots.front(); m_vFreeSlots.pop_front(); }
     unsigned int ulColor;
     if (m_bPlaybackColorPinned) {
         ulColor = m_uPlaybackColor;
@@ -6060,22 +7216,25 @@ void FreePlayScreen::NoteOnSingle(int note, int velocity, long long llStamp)
         unsigned int b = (unsigned int)(m_fFreePlayColor[2] * 255.0f);
         ulColor = (0x00 << 24) | (b << 16) | (g << 8) | r;
     }
-    m_vTrackSettings[slot].aChannels[0].SetColor(ulColor, 0.6f, 0.2f);
-    m_pRenderer->MarkTrackColorsDirty(slot);
+    auto& cs = m_vTrackSettings[slot >> 4].aChannels[slot & 15];
+    cs.SetColor(ulColor, 0.6f, 0.2f);
+    // Straight into the renderer's color table (index == track * 16 + channel == slot) instead of
+    // rescanning every slot each frame.
+    m_pRenderer->GetTrackColors()[slot] = { cs.iPrimaryRGB, cs.iDarkRGB, cs.iVeryDarkRGB };
+    m_pRenderer->MarkTrackColorsDirty(slot >> 4);
 
-    m_pNoteState[note] = (int)m_vEvents.size();
-
-    MIDIChannelEvent pEvent = m_MIDI.AppendChannelEvent(0, 0);
-    m_MIDI.SetEventTrack(pEvent, (unsigned short)slot);
-    m_MIDI.SetEventChannel(pEvent, 0);
+    MIDIChannelEvent pEvent = 0;
+    const int iOnIdx = AllocEvent(&pEvent);
+    m_iLastOnIdx = iOnIdx;
+    m_pNoteState[note] = iOnIdx;
+    m_MIDI.SetEventTrack(pEvent, (unsigned short)(slot >> 4));
+    m_MIDI.SetEventChannel(pEvent, (unsigned char)(slot & 15));
     m_MIDI.SetEventParam1(pEvent, (unsigned char)note);
     m_MIDI.SetEventParam2(pEvent, (unsigned char)velocity);
     m_MIDI.SetEventTime(pEvent, ts);
     m_MIDI.SetEventSisterIdx(pEvent, UINT32_MAX);
-    m_vEvents.push_back(pEvent);
 
-    m_vState[note].push_back((int)m_vEvents.size() - 1);
-    m_vThreadWork[note].push_back({ .idx = (unsigned)(m_vEvents.size() - 1), .sister_idx = UINT32_MAX });
+    m_vState[note].push_back(iOnIdx);
 
     if (m_bRecording && !m_bPlayback && ts >= m_llRecordStart)
         m_vRecordingEvents.push_back({ true, (unsigned char)note, (unsigned char)velocity, ulColor, ts - m_llRecordStart });
@@ -6138,8 +7297,8 @@ void FreePlayScreen::SlideTo(int note)
     }
     for (int n = 0; n < 128; n++) {
         if (bNew[n] && m_iChordEvent[n] < 0) {
-            m_iChordEvent[n] = (int)m_vEvents.size();
             NoteOnSingle(n, 100);
+            m_iChordEvent[n] = m_iLastOnIdx;
         }
     }
 }
@@ -6166,18 +7325,18 @@ void FreePlayScreen::NoteOffSingle(int note, bool bStretch, long long llStamp, i
         if (length < 5000) length = 5000;
         m_MIDI.SetEventLength(pEvent, (unsigned)length);
 
-        m_mReleasedNotes[idx] = { llRel, length };
+        m_Released.set(idx, llRel, length);
         m_dReleaseOrder.push_back(idx);
 
-        MIDIChannelEvent pOff = m_MIDI.AppendChannelEvent(0, 0);
+        MIDIChannelEvent pOff = 0;
+        const int iOffIdx = AllocEvent(&pOff);
         m_MIDI.SetEventTrack(pOff, m_MIDI.GetEventTrack(pEvent));
-        m_MIDI.SetEventChannel(pOff, 0);
+        m_MIDI.SetEventChannel(pOff, m_MIDI.GetEventChannel(pEvent));
         m_MIDI.SetEventParam1(pOff, (unsigned char)note);
         m_MIDI.SetEventParam2(pOff, 0);
         m_MIDI.SetEventTime(pOff, llRel);
         m_MIDI.SetEventSisterIdx(pOff, (unsigned)idx);
-        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)m_vEvents.size());
-        m_vEvents.push_back(pOff);
+        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)iOffIdx);
 
         // it scrolls off; the scroll-off cleanup reclaims it later.
         m_pNoteState[note] = -1;
@@ -6196,18 +7355,18 @@ void FreePlayScreen::NoteOffSingle(int note, bool bStretch, long long llStamp, i
         else if (length < 5000) length = 5000;
         m_MIDI.SetEventLength(pEvent, (unsigned)length);
 
-        m_mReleasedNotes[idx] = { llRel, length };
+        m_Released.set(idx, llRel, length);
         m_dReleaseOrder.push_back(idx);
 
-        MIDIChannelEvent pOff = m_MIDI.AppendChannelEvent(0, 0);
+        MIDIChannelEvent pOff = 0;
+        const int iOffIdx = AllocEvent(&pOff);
         m_MIDI.SetEventTrack(pOff, m_MIDI.GetEventTrack(pEvent));
-        m_MIDI.SetEventChannel(pOff, 0);
+        m_MIDI.SetEventChannel(pOff, m_MIDI.GetEventChannel(pEvent));
         m_MIDI.SetEventParam1(pOff, (unsigned char)note);
         m_MIDI.SetEventParam2(pOff, 0);
         m_MIDI.SetEventTime(pOff, llRel);
         m_MIDI.SetEventSisterIdx(pOff, (unsigned)idx);
-        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)m_vEvents.size());
-        m_vEvents.push_back(pOff);
+        m_MIDI.SetEventSisterIdx(pEvent, (unsigned)iOffIdx);
 
     }
 
@@ -6319,10 +7478,9 @@ void FreePlayScreen::TickLooper()
                 m_bPlaybackColorPinned = true;
                 m_uPlaybackColor = L.bColorOverride ? L.uColorOverride : e.color;
                 int v = max(1, min(127, (int)(e.velocity * L.velocity)));
-                int iIdx = (int)m_vEvents.size(); // the event NoteOnSingle is about to push
                 NoteOnSingle(e.note, v, llDue);
                 m_bPlaybackColorPinned = false;
-                L.held[e.note] = iIdx;
+                L.held[e.note] = m_iLastOnIdx;
             } else {
                 NoteOffSingle(e.note, false, llDue, L.held[e.note]);
                 L.held[e.note] = -1;
@@ -6469,7 +7627,11 @@ GameState::GameError FreePlayScreen::Logic()
     memcpy(&fixed_consts.note_x, &notex_table, sizeof(float) * 128);
     memset(&fixed_consts.bends, 0, sizeof(float) * 16);
 
-    SyncTrackColors(m_pRenderer, m_vTrackSettings);
+    // Colors are written per note (NoteOnSingle); one full sync covers the initial defaults.
+    if (!m_bFreePlayColorsSynced) {
+        SyncTrackColors(m_pRenderer, m_vTrackSettings);
+        m_bFreePlayColorsSynced = true;
+    }
 
     ImGui::SetNextWindowPos(ImVec2(4.0f, 24.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340.0f, 660.0f), ImGuiCond_FirstUseEver);
@@ -6576,7 +7738,38 @@ GameState::GameError FreePlayScreen::Logic()
         ImGui::End();
     }
 
+    m_bAudioBatching = true; // repeater and looper fire many events per frame
     const bool bHolding = m_bSlamHeld || (m_bMouseDown && m_iLastClickedNote >= 0);
+    // The repeater's sound is fired by the audio thread on its own clock, so lag in this frame loop does
+    // not delay or bunch up the notes you hear. Here we only tell it what to repeat and keep the
+    // visual notes in step; those must not queue sound a second time.
+    {
+        const bool bRepeatAudio = m_fRepeaterNPS > 0.0f && bHolding;
+        uint64_t keys[2] = { 0, 0 };
+        if (bRepeatAudio) {
+            if (m_bSlamHeld) {
+                keys[0] = keys[1] = ~0ULL;
+            } else {
+                const int iRange = max(1, min(128, m_iFreePlayRange));
+                auto addRange = [&](int center) {
+                    const int iFirst = center - (iRange - 1) / 2;
+                    for (int i = 0; i < iRange; i++) {
+                        const int n = iFirst + i;
+                        if (n >= 0 && n < 128)
+                            keys[n >> 6] |= 1ULL << (n & 63);
+                    }
+                };
+                addRange(m_iLastClickedNote);
+                if (m_bMirrorKeys)
+                    addRange(127 - m_iLastClickedNote);
+            }
+            m_dRepeatPeriodUs.store(1000000.0 / (double)m_fRepeaterNPS, std::memory_order_relaxed);
+            m_uRepeatKeys[0].store(keys[0], std::memory_order_relaxed);
+            m_uRepeatKeys[1].store(keys[1], std::memory_order_relaxed);
+        }
+        m_bRepeatActive.store(bRepeatAudio, std::memory_order_release);
+    }
+    m_bQueueMuted = m_fRepeaterNPS > 0.0f && bHolding;
     if (m_fRepeaterNPS > 0.0f && bHolding) {
         const long long llPeriod = (long long)(1000000.0 / m_fRepeaterNPS);
         if (llPeriod > 0) {
@@ -6602,26 +7795,54 @@ GameState::GameError FreePlayScreen::Logic()
         m_llRepeaterLast = m_llFreePlayTime;
     }
 
+    m_bQueueMuted = false;
     TickLooper();
-
-    for (int n = 0; n < 128; n++) {
-        auto& state = m_vState[n];
-        for (auto it = state.begin(); it != state.end(); ) {
-            auto relIt = m_mReleasedNotes.find(*it);
-            if (relIt != m_mReleasedNotes.end()) {
-                float elapsed = (float)(m_llFreePlayTime - relIt->second.releaseTime);
-                if (elapsed * m_fFreePlaySpeed >= (float)m_llTimeSpan) {
-                    m_vFreeSlots.push_back(m_MIDI.GetEventTrack(m_vEvents[*it]));
-                    m_mReleasedNotes.erase(relIt);
-                    it = state.erase(it);
+    FlushFreePlayAudioStage();
+    {
+        // Scroll-off: one compaction pass per key (expired notes sit at the front, and erasing them one at
+        // a time shifted the whole vector for each). Keys are independent, so heavy frames fan out across
+        // the cores; the freed color slots and event rows are collected per key and merged serially.
+        size_t liveNotes = 0;
+        for (int n = 0; n < 128; n++)
+            liveNotes += m_vState[n].size();
+        auto scrollOff = [&](int n) {
+            auto& state = m_vState[n];
+            KeyFreed& freed = m_aKeyFreed[n];
+            size_t keep = 0;
+            for (size_t i = 0; i < state.size(); ++i) {
+                const int idx = state[i];
+                const auto* rel = m_Released.find(idx);
+                if (rel && (float)(m_llFreePlayTime - rel->releaseTime) * m_fFreePlaySpeed >= (float)m_llTimeSpan) {
+                    const MIDIChannelEvent ev = m_vEvents[idx];
+                    freed.slots.push_back((m_MIDI.GetEventTrack(ev) << 4) | m_MIDI.GetEventChannel(ev));
+                    const unsigned sis = m_MIDI.GetEventSisterIdx(ev);
+                    freed.events.push_back(idx);
+                    if (sis != UINT32_MAX)
+                        freed.events.push_back((int)sis);
+                    if (m_iChordEvent[n] == idx)
+                        m_iChordEvent[n] = -1;
+                    m_Released.erase(idx);
                     continue;
                 }
+                state[keep++] = idx;
             }
-            ++it;
+            state.resize(keep);
+        };
+        if (liveNotes >= 20000)
+            concurrency::parallel_for(0, 128, scrollOff);
+        else
+            for (int n = 0; n < 128; n++)
+                scrollOff(n);
+        for (int n = 0; n < 128; n++) {
+            KeyFreed& freed = m_aKeyFreed[n];
+            m_vFreeSlots.insert(m_vFreeSlots.end(), freed.slots.begin(), freed.slots.end());
+            m_vFreeEvents.insert(m_vFreeEvents.end(), freed.events.begin(), freed.events.end());
+            freed.slots.clear();
+            freed.events.clear();
         }
     }
     while (!m_dReleaseOrder.empty() &&
-        m_mReleasedNotes.find(m_dReleaseOrder.front()) == m_mReleasedNotes.end())
+        !m_Released.find(m_dReleaseOrder.front()))
         m_dReleaseOrder.pop_front();
 
     m_dNPSNotes.push_back(make_tuple(m_llFreePlayTime, m_iFreePlayNoteCount));
@@ -6642,11 +7863,22 @@ GameState::GameError FreePlayScreen::Logic()
     m_pRenderer->ClearAndBeginScene(0xFF000000);
     RenderLines();
     m_pRenderer->SplitRect();
-    for (int n = 0; n < 128; n++) {
-        for (auto it = m_vState[n].rbegin(); it != m_vState[n].rend(); it++)
-            RenderNoteIdx(*it);
+    {
+        // Build every key's notes in parallel (newest first, as before), then hand them over in key order.
+        concurrency::parallel_for(0, 128, [&](int n) {
+            const auto& state = m_vState[n];
+            auto& out = m_vRenderSlices[n];
+            out.clear();
+            out.reserve(state.size());
+            for (auto it = state.rbegin(); it != state.rend(); ++it)
+                out.push_back(MakeNoteData(*it));
+        });
+        m_pRenderer->PushNoteSlices(m_vRenderSlices);
     }
-    m_pRenderer->RenderBatch(true);
+    {
+        FbdScope fbdBatch(FrameBreakdown::Batch);
+        m_pRenderer->RenderBatch(true);
+    }
     if (m_bShowKB) RenderKeys();
     RenderBorder();
     RenderText();
@@ -6664,15 +7896,15 @@ NoteData FreePlayScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
         if (m_vEvents[i] == pNote) { idx = i; break; }
     }
 
-    auto relIt = (idx >= 0) ? m_mReleasedNotes.find(idx) : m_mReleasedNotes.end();
-    if (relIt != m_mReleasedNotes.end()) {
-        long long elapsed = m_llFreePlayTime - relIt->second.releaseTime;
+    const auto* rel = m_Released.find(idx);
+    if (rel) {
+        long long elapsed = m_llFreePlayTime - rel->releaseTime;
         return NoteData{
             .key = (uint8_t)note,
-            .channel = 0,
+            .channel = (uint8_t)m_MIDI.GetEventChannel(pNote),
             .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
             .pos = static_cast<float>(elapsed) * m_fFreePlaySpeed,
-            .length = static_cast<float>(relIt->second.finalLength) * m_fFreePlaySpeed,
+            .length = static_cast<float>(rel->finalLength) * m_fFreePlaySpeed,
         };
     }
 
@@ -6681,40 +7913,36 @@ NoteData FreePlayScreen::BuildRenderNoteData(const MIDIChannelEvent pNote) const
 
     return NoteData{
         .key = (uint8_t)note,
-        .channel = 0,
+        .channel = (uint8_t)m_MIDI.GetEventChannel(pNote),
         .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
         .pos = 0.0f,
         .length = static_cast<float>(llNoteLength),
     };
 }
 
-void FreePlayScreen::RenderNoteIdx(int idx)
+NoteData FreePlayScreen::MakeNoteData(int idx) const
 {
-    auto relIt = m_mReleasedNotes.find(idx);
-    if (relIt != m_mReleasedNotes.end()) {
-        MIDIChannelEvent pNote = m_vEvents[idx];
-        int note = m_MIDI.GetEventParam1(pNote);
-        long long elapsed = m_llFreePlayTime - relIt->second.releaseTime;
-        m_pRenderer->PushNoteData(NoteData{
-            .key = (uint8_t)note,
-            .channel = 0,
-            .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
-            .pos = static_cast<float>(elapsed) * m_fFreePlaySpeed,
-            .length = static_cast<float>(relIt->second.finalLength) * m_fFreePlaySpeed,
-        });
+    const MIDIChannelEvent pNote = m_vEvents[idx];
+    NoteData data{
+        .key = (uint8_t)m_MIDI.GetEventParam1(pNote),
+        .channel = (uint8_t)m_MIDI.GetEventChannel(pNote),
+        .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
+    };
+    if (const auto* rel = m_Released.find(idx)) {
+        data.pos = static_cast<float>(m_llFreePlayTime - rel->releaseTime) * m_fFreePlaySpeed;
+        data.length = static_cast<float>(rel->finalLength) * m_fFreePlaySpeed;
     } else {
-        MIDIChannelEvent pNote = m_vEvents[idx];
-        int note = m_MIDI.GetEventParam1(pNote);
         long long llNoteLength = (m_llFreePlayTime - m_MIDI.GetEventTime(pNote)) * (long long)m_fFreePlaySpeed;
         if (llNoteLength < 5000) llNoteLength = 5000;
-        m_pRenderer->PushNoteData(NoteData{
-            .key = (uint8_t)note,
-            .channel = 0,
-            .track = (uint16_t)m_MIDI.GetEventTrack(pNote),
-            .pos = 0.0f,
-            .length = static_cast<float>(llNoteLength),
-        });
+        data.pos = 0.0f;
+        data.length = static_cast<float>(llNoteLength);
     }
+    return data;
+}
+
+void FreePlayScreen::RenderNoteIdx(int idx)
+{
+    m_pRenderer->PushNoteData(MakeNoteData(idx));
 }
 
 // Crash recovery: silence the abandoned state. Only flags and output resets - the state itself is

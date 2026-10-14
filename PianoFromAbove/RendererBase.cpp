@@ -6,6 +6,8 @@
 #include "ImageBufferGpuPins.h"
 #include <cmath>
 #include <unordered_map>
+#include <thread>
+#include <exception>
 
 // Direct rendering is exact and intentionally untouched for ordinary frames. Once a frame
 // exceeds 100k submitted notes, however, millions of same-key bars can be completely hidden
@@ -375,4 +377,173 @@ bool Renderer::ImageBufferRenderChunk(long long chunk, const NoteData* notes, un
     state.frameNotes += passCount;
 
     return state.requestFinalize;
+}
+
+void Renderer::PushNoteSlices(std::vector<std::vector<NoteData>>& slices)
+{
+    size_t total = 0;
+    for (const auto& slice : slices)
+        total += slice.size();
+
+    static constexpr size_t kDirectCullThreshold = 100000; // same as PushNoteDataFiltered
+    auto pushSerially = [&]() {
+        for (const auto& slice : slices)
+            for (const NoteData& note : slice)
+                PushNoteData(note);
+    };
+
+    auto& state = DirectNoteCullStates()[this];
+    // The bulk path assumes it is the frame's first and only submission; anything else keeps the exact serial behaviour.
+    const bool warpOrDegenerate = m_RootConstants.fWarp > 0.0f || m_RootConstants.timespan <= 0.0f ||
+        m_RootConstants.notes_cy <= 0.0f;
+    if (total <= kDirectCullThreshold || !m_vNotesIntermediate.empty() || warpOrDegenerate ||
+        (state.frame == m_uImageBufferFrame && (state.raw != 0 || state.active || state.disabled))) {
+        pushSerially();
+        return;
+    }
+
+    if (state.frame != m_uImageBufferFrame) {
+        if (state.active && ((state.frame & 31u) == 0u)) {
+            char log[160];
+            sprintf_s(log, "direct:cull raw=%zu kept=%zu dropped=%zu rows=%d",
+                state.raw, state.kept, state.dropped, state.rows);
+            HeartbeatLog(log);
+        }
+        state.frame = m_uImageBufferFrame;
+        state.active = false;
+        state.disabled = false;
+        state.rows = 0;
+        state.raw = 0;
+        state.kept = 0;
+        state.dropped = 0;
+        state.next.clear();
+    }
+
+    // Notes of different keys never share cull state (it is indexed by key), so each worker owns the
+    // keys of one class (key % workers) and walks its notes in their original order: the same decisions
+    // as the serial filter. Classifying, filtering and compacting each cost a fraction of the serial pass.
+    unsigned workers = std::thread::hardware_concurrency();
+    workers = (std::min)((std::max)(workers, 1u), 8u);
+    if (workers < 2) {
+        pushSerially();
+        return;
+    }
+
+    struct SliceClasses {
+        std::vector<NoteData> notes[8];
+        std::vector<uint8_t> keep[8];
+    };
+    std::vector<SliceClasses> classes(slices.size());
+    std::vector<std::exception_ptr> errors(workers);
+    auto runParallel = [&](auto&& fn) {
+        std::vector<std::thread> threads;
+        try {
+            for (unsigned w = 1; w < workers; w++)
+                threads.emplace_back([&, w]() { try { fn(w); } catch (...) { errors[w] = std::current_exception(); } });
+        } catch (...) {}
+        const unsigned started = (unsigned)threads.size() + 1;
+        try { fn(0); } catch (...) { errors[0] = std::current_exception(); }
+        for (unsigned w = started; w < workers; w++) // threads that could not be created
+            try { fn(w); } catch (...) { errors[w] = std::current_exception(); }
+        for (auto& t : threads)
+            t.join();
+        for (auto& e : errors)
+            if (e) std::rethrow_exception(e);
+    };
+
+    try {
+        state.rows = (std::min)((std::max)((int)std::ceil(std::fabs(m_RootConstants.notes_cy)), 64),
+            ImageBufferPreparedMaxRows);
+        state.next.resize((size_t)128 * (size_t)(state.rows + 1));
+        for (int key = 0; key < 128; ++key) {
+            const size_t base = (size_t)key * (size_t)(state.rows + 1);
+            for (int row = 0; row <= state.rows; ++row)
+                state.next[base + row] = row;
+        }
+
+        // A: split every slice into per-key-class lists, in order (slices are handled round-robin).
+        runParallel([&](unsigned w) {
+            for (size_t s = w; s < slices.size(); s += workers) {
+                SliceClasses& sc = classes[s];
+                for (unsigned c = 0; c < workers; c++)
+                    sc.notes[c].reserve(slices[s].size() / workers + 16);
+                for (const NoteData& note : slices[s])
+                    sc.notes[note.key % workers].push_back(note);
+            }
+        });
+
+        // B: each worker filters its key class across all slices, in slice order.
+        runParallel([&](unsigned w) {
+            for (size_t s = 0; s < slices.size(); s++) {
+                SliceClasses& sc = classes[s];
+                sc.keep[w].resize(sc.notes[w].size());
+                for (size_t i = 0; i < sc.notes[w].size(); i++)
+                    sc.keep[w][i] = DirectNoteCullContributes(state, m_RootConstants, m_TrackColors, sc.notes[w][i]) ? 1 : 0;
+            }
+        });
+    } catch (...) {
+        // Purely an optimization: fall back to the exact serial path.
+        state.next.clear();
+        state.rows = 0;
+        state.disabled = true;
+        state.active = false;
+        pushSerially();
+        return;
+    }
+
+    // C: emit the survivors in the original order (each class's n-th note is the n-th entry of its list).
+    size_t kept = 0;
+    for (const auto& sc : classes)
+        for (unsigned c = 0; c < workers; c++)
+            for (uint8_t k : sc.keep[c])
+                kept += k;
+    m_vNotesIntermediate.reserve(kept);
+    for (size_t s = 0; s < slices.size(); s++) {
+        size_t cursor[8] = {};
+        const SliceClasses& sc = classes[s];
+        for (const NoteData& note : slices[s]) {
+            const unsigned c = note.key % workers;
+            if (sc.keep[c][cursor[c]++])
+                m_vNotesIntermediate.push_back(note);
+        }
+        slices[s].clear();
+        slices[s].shrink_to_fit();
+    }
+    state.raw = total;
+    state.kept = kept;
+    state.dropped = total - kept;
+    state.active = true;
+}
+
+void Renderer::AppendCulledNotes(const std::vector<NoteData>& notes)
+{
+    // The caller already removed every note the filter would have; keep the filter out of the way for this frame.
+    auto& state = DirectNoteCullStates()[this];
+    if (state.frame != m_uImageBufferFrame) {
+        state.frame = m_uImageBufferFrame;
+        state.active = false;
+        state.rows = 0;
+        state.raw = 0;
+        state.kept = 0;
+        state.dropped = 0;
+        state.next.clear();
+    }
+    state.disabled = true;
+    m_vNotesIntermediate.insert(m_vNotesIntermediate.end(), notes.begin(), notes.end());
+}
+
+void Renderer::AppendStripNotesPresampled(std::vector<std::vector<NoteData>>& parts)
+{
+    size_t total = 0;
+    for (const auto& part : parts)
+        total += part.size();
+    m_vPianoRollStripNotesIntermediate.reserve(m_vPianoRollStripNotesIntermediate.size() + total);
+    for (auto& part : parts)
+    {
+        m_vPianoRollStripNotesIntermediate.insert(m_vPianoRollStripNotesIntermediate.end(), part.begin(), part.end());
+        part.clear();
+        part.shrink_to_fit();
+    }
+    if (total != 0)
+        m_bStripPresampled = true; // an empty strip list falls back to the main notes in the draw call: keep that behavior
 }

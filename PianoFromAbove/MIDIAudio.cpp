@@ -425,6 +425,7 @@ bool MIDIAudio::WriteAudioChunked(BASSMIDI* bass, int frames)
 {
 	while (frames > 0)
 	{
+		ApplyPendingBufferResize(); // generator thread: the only safe place to move the ring
 		int chunk = min(frames, kGenWriteChunkFrames);
 		if (!BassWriteWrapped(bass, m_iBufferWritePos, chunk))
 		{
@@ -701,6 +702,7 @@ void MIDIAudio::KillLastGenerator()
 void MIDIAudio::Start(double time, std::vector<MIDIChannelEvent>* events, double speed, int start)
 {
 	KillLastGenerator();
+	ApplyPendingBufferResize(); // no generator is running now
 	stopGenerator = false;
 	g_bGenDead = false;
 	m_qLastSynthPos = 0;
@@ -808,6 +810,30 @@ void MIDIAudio::EnsureBufferCapacity(int minFrames)
 	int minFloats = minFrames * 2;
 	if (m_iBufferLength < minFloats)
 	{
+		// The generator thread writes straight into m_fAudioBuffer (BASS_ChannelGetData) without holding
+		// m_maMtx, so a realloc from this thread would free the block under it. While a generator is
+		// attached, hand the resize to it; it applies it between chunks.
+		if (m_tGeneratorThread != nullptr)
+		{
+			int pending = m_iPendingBufferFloats.load();
+			while (pending < minFloats && !m_iPendingBufferFloats.compare_exchange_weak(pending, minFloats)) {}
+			return;
+		}
+		GrowBuffer(minFloats);
+	}
+}
+
+void MIDIAudio::ApplyPendingBufferResize()
+{
+	int want = m_iPendingBufferFloats.exchange(0);
+	if (want > m_iBufferLength)
+		GrowBuffer(want);
+}
+
+void MIDIAudio::GrowBuffer(int minFloats)
+{
+	if (m_iBufferLength < minFloats)
+	{
 		m_maMtx.lock();
 		int oldLength = m_iBufferLength;
 		int newLength = minFloats;
@@ -820,4 +846,32 @@ void MIDIAudio::EnsureBufferCapacity(int minFrames)
 		}
 		m_maMtx.unlock();
 	}
+}
+bool MIDIAudio::IsGeneratorRunning() const
+{
+	return m_tGeneratorThread != nullptr && !stopGenerator;
+}
+
+bool MIDIAudio::TrySeekWithinBuffer(double timeSec)
+{
+	if (!IsGeneratorRunning() || m_bAwaitingReset)
+		return false;
+	std::lock_guard<std::mutex> lock(m_maMtx);
+	// Ring positions are canonical 1x frames: GetPlayerTime() == m_dStartTime + readPos / 48000.
+	const double frameD = (timeSec - m_dStartTime) * 48000.0;
+	if (frameD < 0.0 || frameD > 2e9)
+		return false;
+	const long long target = (long long)(frameD + 0.5);
+	const long long written = m_iBufferWritePos;
+	const long long capFrames = m_iBufferLength / 2;
+	const long long lowest = (std::max)(0LL, written - capFrames + 48000); // older audio has been overwritten (1 s margin)
+	const long long highest = written - 12000;                            // keep ~250 ms of runway ahead of the new position
+	if (target < lowest || target > highest)
+		return false;
+	m_iBufferReadPos = (int)target;
+	m_dReadFraction = 0.0;
+	m_bInUnderrunStall = false;
+	m_iRepeatOffset = 0;
+	m_bStallActive = false;
+	return true;
 }

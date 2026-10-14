@@ -12,6 +12,7 @@
 #include <CommCtrl.h>
 #include <Shlobj.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <dbghelp.h>
 #include <wincodec.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -239,10 +240,11 @@ static void DescribeAddress(DWORD64 addr, wchar_t* out, size_t cch) {
 
 // Walks the faulting thread from its exception context with the x64 unwind tables. StackWalk64
 // without a function-table callback cannot unwind x64 frames and printed raw stack data instead.
-static int UnwindFromContext(const CONTEXT* start, DWORD64* frames, int maxFrames) {
+static int UnwindFromContext(const CONTEXT* start, DWORD64* frames, int maxFrames,
+                             ULONG_PTR stackLow = 0, ULONG_PTR stackHigh = 0) {
     CONTEXT c = *start;
-    ULONG_PTR stackLow = 0, stackHigh = 0;
-    GetCurrentThreadStackLimits(&stackLow, &stackHigh);
+    if (!stackHigh) // default: the calling thread's own stack
+        GetCurrentThreadStackLimits(&stackLow, &stackHigh);
     int n = 0;
     __try {
         while (n < maxFrames && c.Rip) {
@@ -676,9 +678,170 @@ DWORD WINAPI UpdateCheckProc(LPVOID) {
     return 0;
 }
 
+// ---- Shutdown watchdog ------------------------------------------------------------------------
+// Closing PGFA can hang (a worker thread that never joins, a device that never closes, a static
+// destructor, ...) and leave a windowless process behind. Shutdown steps record where they are; once
+// closing begins a watchdog gives the process kShutdownGraceMs to exit, then reports the stuck step and
+// every thread's stack, and offers to terminate the process.
+static const DWORD kShutdownGraceMs = 10000;
+// Like CRASH_APPEND, for a buffer reached through a pointer.
+#define CRASH_APPEND_W(buf, cch, len, ...) \
+    do { if ((len) < (cch)) { int _n = _snwprintf_s((buf) + (len), (cch) - (len), _TRUNCATE, __VA_ARGS__); \
+         (len) = _n < 0 ? (cch) - 1 : (len) + (size_t)_n; } } while (0)
+static const char* volatile g_pShutdownStage = "";
+static volatile LONG g_bShutdownWatchdog = 0;
+
+void ShutdownStage(const char* stage) {
+    g_pShutdownStage = stage;
+    HeartbeatLog(stage);
+}
+
+struct HangThread {
+    DWORD tid = 0;
+    DWORD64 frames[24] = {};
+    int count = 0;
+};
+
+// Suspends each thread just long enough to capture its raw return addresses (no allocation or
+// formatting while a thread that may hold the heap lock is stopped).
+static int CaptureAllThreads(HangThread* out, int maxThreads) {
+    typedef LONG (NTAPI *NtQueryInformationThreadFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    struct ThreadBasicInfo { LONG status; PVOID teb; PVOID pid; PVOID tid; ULONG_PTR affinity; LONG prio; LONG basePrio; };
+    static NtQueryInformationThreadFn NtQueryInformationThread =
+        (NtQueryInformationThreadFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || n >= maxThreads)
+                continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!h)
+                continue;
+            HangThread& t = out[n];
+            t.tid = te.th32ThreadID;
+            if (SuspendThread(h) != (DWORD)-1) {
+                CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (GetThreadContext(h, &ctx)) {
+                    ULONG_PTR high = 0;
+                    ThreadBasicInfo tbi = {};
+                    if (NtQueryInformationThread && NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) >= 0 && tbi.teb)
+                        high = (ULONG_PTR)((NT_TIB*)tbi.teb)->StackBase;
+                    if (high)
+                        t.count = UnwindFromContext(&ctx, t.frames, _countof(t.frames), 0, high);
+                }
+                ResumeThread(h);
+            }
+            CloseHandle(h);
+            n++;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+static void FormatHangThread(const HangThread& t, int maxFrames, wchar_t* buf, size_t cch, size_t& len) {
+    const wchar_t* role = t.tid == g_dwMainThreadId ? L" (UI thread)" : t.tid == g_dwGameThreadId ? L" (game thread)" : L"";
+    CRASH_APPEND_W(buf, cch, len, L"  thread %lu%s:\r\n", t.tid, role);
+    for (int i = 0; i < t.count && i < maxFrames; i++) {
+        wchar_t d[300];
+        DescribeAddress(t.frames[i], d, _countof(d));
+        if (d[0])
+            CRASH_APPEND_W(buf, cch, len, L"    %s\r\n", d);
+    }
+}
+
+static DWORD WINAPI ShutdownWatchdogProc(LPVOID) {
+    DWORD waitedMs = 0;
+    for (;;) {
+        Sleep(kShutdownGraceMs);
+        waitedMs += kShutdownGraceMs;
+
+        HangThread threads[64];
+        const int n = CaptureAllThreads(threads, _countof(threads));
+        const char* stage = g_pShutdownStage;
+
+        static wchar_t full[24 * 1024];
+        size_t len = 0;
+        CRASH_APPEND_W(full, _countof(full), len, L"PGFA did not exit within %lu seconds of closing.\r\nLast shutdown step reached: %S\r\n\r\nThreads:\r\n",
+                       waitedMs / 1000, stage && stage[0] ? stage : "(closing started, no step recorded)");
+        for (int i = 0; i < n; i++)
+            FormatHangThread(threads[i], 24, full, _countof(full), len);
+
+        // The log goes next to the exe (or %TEMP%), like the crash log.
+        wchar_t logPath[MAX_PATH] = L"";
+        if (GetModuleFileNameW(NULL, logPath, MAX_PATH)) {
+            if (wchar_t* slash = wcsrchr(logPath, L'\\'))
+                wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - logPath), L"shutdown_hang_log.txt");
+        }
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE") != 0 || !f) {
+            GetTempPathW(MAX_PATH, logPath);
+            wcscat_s(logPath, L"PGFA_shutdown_hang_log.txt");
+            _wfopen_s(&f, logPath, L"wb, ccs=UTF-16LE");
+        }
+        if (f) {
+            fwrite(full, sizeof(wchar_t), len, f);
+            fclose(f);
+        }
+
+        // The dialog shows the stuck step and the UI/game threads; the rest is in the log.
+        static wchar_t msg[4096];
+        size_t mlen = 0;
+        CRASH_APPEND_W(msg, _countof(msg), mlen, L"PGFA did not exit within %lu seconds of closing.\r\n\r\nLast shutdown step reached:\r\n  %S\r\n\r\n",
+                       waitedMs / 1000, stage && stage[0] ? stage : "(closing started, no step recorded)");
+        for (int i = 0; i < n; i++)
+            if (threads[i].tid == g_dwMainThreadId || threads[i].tid == g_dwGameThreadId)
+                FormatHangThread(threads[i], 6, msg, _countof(msg), mlen);
+        CRASH_APPEND_W(msg, _countof(msg), mlen, L"\r\nAll thread stacks were saved to:\r\n%s\r\n\r\nTerminate PGFA now?\r\nYes = terminate    No = keep waiting", logPath);
+
+        const int answer = MessageBoxW(NULL, msg, L"PGFA is not closing",
+                                       MB_YESNO | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND | MB_DEFBUTTON2);
+        if (answer == IDYES)
+            TerminateProcess(GetCurrentProcess(), 1);
+        // Keep waiting: report again (with fresh stacks) if it is still alive.
+    }
+}
+
+// Begins the countdown; safe to call repeatedly and from any thread.
+void ShutdownWatchdogStart() {
+    if (InterlockedExchange(&g_bShutdownWatchdog, 1))
+        return;
+    g_pShutdownStage = "close requested";
+    HANDLE h = CreateThread(NULL, 0, ShutdownWatchdogProc, NULL, 0, NULL);
+    if (h)
+        CloseHandle(h);
+}
+
 INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdShow )
 {
     g_dwMainThreadId = GetCurrentThreadId();
+    {
+        // -bench <script>: deterministic headless benchmark (see Bench.h). Decided before anything reads the config.
+        int argc = 0;
+        if (LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+            for (int i = 1; i + 1 < argc; i++) {
+                if (wcscmp(argv[i], L"-bench") == 0) {
+                    if (BenchParseScript(argv[i + 1], g_Bench)) {
+                        g_Bench.active = true;
+                        g_bBenchMode = true;
+                    } else {
+                        MessageBoxW(NULL, (std::wstring(L"Could not read the bench script (needs midi= and out=):\n") + argv[i + 1]).c_str(), L"-bench", MB_ICONERROR);
+                        return 2;
+                    }
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+    }
     StartupLog_Begin();
     StartupLog("cmdline: %s", lpszCmdLine ? lpszCmdLine : "");
     if (!InitEmbeddedDLLs(hInstance)) {
@@ -736,6 +899,27 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     Config &config = Config::GetConfig();
     ViewSettings &cView = config.GetViewSettings();
     PlaybackSettings &cPlayback = config.GetPlaybackSettings();
+    if (g_Bench.active) {
+        // Defaults only, no audio, nothing that depends on the clock or on the user's settings.
+        SHCreateDirectoryExW(NULL, g_Bench.outDir.c_str(), NULL);
+        srand(1);
+        config.GetVideoSettings().eRenderer = g_Bench.renderer ? VideoSettings::DirectX12 : VideoSettings::DirectX11;
+        config.GetVideoSettings().bLimitFPS = false;
+        config.GetVideoSettings().bShowFPS = false;
+        config.GetAudioSettings().bPreRenderAudio = false;
+        config.GetAudioSettings().iOutDevice = -1;
+        config.GetVizSettings().bKDMAPI = false;
+        config.GetVizSettings().bDisableUI = !g_Bench.ui;
+        config.GetVizSettings().bTickBased = g_Bench.tick;
+        config.GetVizSettings().bDualPianoRoll = g_Bench.dual;
+        config.GetVizSettings().bHorizontalPianoRoll = g_Bench.horizontal && !g_Bench.dual;
+        config.GetVizSettings().bEnableLogging = false;
+        config.GetVisualSettings().eKeysShown = VisualSettings::All;
+        cView.SetKeyboard(g_Bench.keys, false);
+        cView.SetControls(false, false);
+        if (g_Bench.sliding >= 0)
+            SetEnvironmentVariableA("PGFA_SLIDING", g_Bench.sliding >= 2 ? "2" : (g_Bench.sliding ? "1" : "0"));
+    }
     {
         const AudioSettings& cAudio = config.GetAudioSettings();
         const wchar_t* outName = (cAudio.iOutDevice >= 0 && cAudio.iOutDevice < (int)cAudio.vMIDIOutDevices.size())
@@ -746,8 +930,10 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
                    (int)cAudio.bPreRenderAudio, (int)g_bLoggingEnabled.load(std::memory_order_relaxed));
     }
 
+    g_iKDMAPISynth = config.GetAudioSettings().iKDMAPISynth;
+
     // Bug the user if WinMM isn't patched
-    if (!config.GetVizSettings().bKDMAPI || !PGFALoadSynthModule(L"OmniMIDI")) {
+    if (!config.GetVizSettings().bKDMAPI || !PGFAGetKDMAPIModule()) {
         wchar_t winmm_path[1024] = {};
         wchar_t win_dir[MAX_PATH] = {};
         if (GetModuleFileName(GetModuleHandle(L"winmm.dll"), winmm_path, _countof(winmm_path)) &&
@@ -757,8 +943,16 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
         }
     }
 
-    g_hWnd = CreateWindowEx( 0, CLASSNAME, L"PlayGroundFromAbove " __DATE__, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, cView.GetMainLeft(), cView.GetMainTop(),
-                             cView.GetMainWidth(), cView.GetMainHeight(), NULL, NULL, wc.hInstance, NULL );
+    int winLeft = cView.GetMainLeft(), winTop = cView.GetMainTop(), winW = cView.GetMainWidth(), winH = cView.GetMainHeight();
+    if (g_Bench.active) {
+        RECT rcWanted = { 0, 0, g_Bench.width, g_Bench.height };
+        AdjustWindowRectEx(&rcWanted, WS_OVERLAPPEDWINDOW, FALSE, 0);
+        winLeft = 40; winTop = 40; // fully on screen so the compositor keeps presenting
+        winW = rcWanted.right - rcWanted.left;
+        winH = rcWanted.bottom - rcWanted.top;
+    }
+    g_hWnd = CreateWindowEx( 0, CLASSNAME, L"PlayGroundFromAbove " __DATE__, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, winLeft, winTop,
+                             winW, winH, NULL, NULL, wc.hInstance, NULL );
     if ( !g_hWnd ) return 1;
 
     // Accept drag and drop
@@ -785,28 +979,29 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     SetOnTop( cView.GetOnTop() );
     ShowControls( cView.GetControls() );
     ShowWindow( g_hWndGfx, SW_SHOW );
-    ShowWindow( g_hWnd, nCmdShow );
+    ShowWindow( g_hWnd, g_Bench.active ? SW_SHOWNOACTIVATE : nCmdShow );
     UpdateWindow( g_hWnd );
     SetFocus( g_hWndGfx );
     cPlayback.SetPaused( false, false );
 
-    if ( lpszCmdLine && lpszCmdLine[0] )
+    if ( g_Bench.active )
+    {
+        PlayFile( g_Bench.midi, false );
+    }
+    else if ( lpszCmdLine && lpszCmdLine[0] )
     {
         // Tokenize the command line (quotes respected)
         std::vector<std::wstring> tokens;
         {
-            std::wstring cmdLine( (size_t)MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, NULL, 0 ), L'\0' );
-            MultiByteToWideChar( CP_ACP, 0, lpszCmdLine, -1, &cmdLine[0], (int)cmdLine.size() );
-            cmdLine.resize( cmdLine.size() - 1 );
-            bool inQuotes = false;
-            std::wstring cur;
-            for ( wchar_t c : cmdLine )
+            // lpszCmdLine is the ANSI command line: characters outside the code page (e.g. a fullwidth
+            // question mark in a file name) are already replaced by '?'. Read the wide one instead.
+            int argc = 0;
+            if ( LPWSTR* argv = CommandLineToArgvW( GetCommandLineW(), &argc ) )
             {
-                if ( c == L'"' ) { inQuotes = !inQuotes; continue; }
-                if ( c == L' ' && !inQuotes ) { if ( !cur.empty() ) { tokens.push_back( cur ); cur.clear(); } }
-                else cur += c;
+                for ( int i = 1; i < argc; i++ )
+                    if ( argv[i][0] ) tokens.push_back( argv[i] );
+                LocalFree( argv );
             }
-            if ( !cur.empty() ) tokens.push_back( cur );
         }
 
         if ( tokens.size() >= 4 && tokens[0] == L"-repro" )
@@ -848,15 +1043,21 @@ INT WINAPI WinMain( HINSTANCE hInstance, HINSTANCE, LPSTR lpszCmdLine, INT nCmdS
     }
 
     StartupLog_End("app closed before a MIDI was loaded");
+    ShutdownWatchdogStart();
+    ShutdownStage("UI: message loop ended, waiting for the game thread to finish");
     g_MsgQueue.ForcePush( msg );
     WaitForSingleObject( hThread, INFINITE );
 
+    ShutdownStage("UI: saving config");
     config.SaveConfigValues();
 
+    ShutdownStage("UI: unregistering window class / CoUninitialize");
     UnregisterClass( CLASSNAME, wc.hInstance );
     CoUninitialize();
     InterlockedExchange(&g_bTeardown, 1);
+    ShutdownStage("UI: freeing embedded DLLs (BASS/SDL)");
     FreeEmbeddedDLLs();
+    ShutdownStage("UI: WinMain returning (CRT exit, static destructors, DLL unload)");
     return 0;
 }
 
@@ -1214,12 +1415,16 @@ static DWORD GameThreadBody( LPVOID lpParameter )
         }
     }
 
+    ShutdownStage("game: waiting for the GPU to go idle");
     pRenderer->WaitForGPU();
 
+    ShutdownStage("game: destroying the game state (audio threads, song data)");
     delete pGameState;
     g_pGameState = nullptr;
+    ShutdownStage("game: destroying the renderer");
     delete pRenderer;
     s_pGameRenderer = nullptr;
+    ShutdownStage("game: thread finished, waiting for the UI thread");
 
     } __except([&]() -> int {
         // Exceptions the vectored backstop already reported (the user chose to continue) skip the

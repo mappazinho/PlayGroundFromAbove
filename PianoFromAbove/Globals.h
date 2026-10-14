@@ -14,6 +14,7 @@
 #include "Misc.h"
 #include "StartupLog.h"
 #include "ImageBufferTrace.h"
+#include "Bench.h"
 
 extern HINSTANCE g_hInstance;
 extern HWND g_hWnd;
@@ -32,6 +33,7 @@ extern GameState* g_pGameState; // Current game state; game thread owns it
 #define ID_PRELOAD_DISCARD (WM_APP + 0x101)
 #define ID_PRELOAD_DRAIN (WM_APP + 0x102) // Drain the GPU queue before a window transition animates
 #define ID_APPLY_FULLSCREEN (WM_APP + 0x103) // UI thread applies a fullscreen toggle requested from the game thread
+#define ID_BOUNCE_WINDOW (WM_APP + 0x105) // UI thread moves the window: lParam = hop height in px above its resting position (0 = back at rest)
 #define ID_CRASH_RECOVERED (WM_APP + 0x104) // Game thread restarted on the start screen after a crash: reset the UI's song state
 extern DWORD g_dwGameThreadId;
 extern bool g_bSkipGPUWait; // Experiment: skip WaitForGPU fence waits entirely (default true)
@@ -56,6 +58,11 @@ bool VideoRenderSongLoaded(); // True when the current state is a loaded song sc
 std::wstring GetFFmpegExePath(const std::wstring& inPath);
 
 void HeartbeatLog(const char* tag); // Temporary debug diagnostics (game thread only)
+
+// Shutdown watchdog: ShutdownStage() records the step the app is on while closing (shown if it hangs);
+// ShutdownWatchdogStart() begins the countdown after which a "PGFA is not closing" report is shown.
+void ShutdownStage(const char* stage); // string literals only
+void ShutdownWatchdogStart();
 
 // Mirrors the persisted "wait for dense buffers" setting into the runtime gate
 // (which lives in the image-buffer prepared store, not in Config).

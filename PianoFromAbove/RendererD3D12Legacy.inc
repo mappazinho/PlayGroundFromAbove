@@ -1308,6 +1308,7 @@ HRESULT D3D12Renderer::ClearAndBeginScene(DWORD color) {
     m_vRectsIntermediate.clear();
     m_vNotesIntermediate.clear();
     m_vPianoRollStripNotesIntermediate.clear();
+    m_bStripPresampled = false;
     for (auto& tierNotes : m_vRibbonNotes)
         tierNotes.clear();
     m_uRibbonNoteCount = 0;
@@ -1424,7 +1425,15 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     IB_TRACE(IB_ENDSCENE);
     auto s_t0 = std::chrono::steady_clock::now();
     ImGui::Render();
-    ImGui::GetDrawData()->AddDrawList(m_pDrawList);
+    {
+        // The strip keyboard is an external draw list. Appended last it paints over the menu bar's
+        // dropdowns and other popups, so slot it in front of everything ImGui drew (i.e. behind it).
+        ImDrawData* drawData = ImGui::GetDrawData();
+        const int before = drawData->CmdLists.Size;
+        drawData->AddDrawList(m_pDrawList);
+        if (drawData->CmdLists.Size > before)
+            std::rotate(drawData->CmdLists.begin(), drawData->CmdLists.end() - 1, drawData->CmdLists.end());
+    }
     auto s_t1 = std::chrono::steady_clock::now();
 
     if (draw_bg) {
@@ -1580,6 +1589,12 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
         m_pCommandList->DrawIndexedInstanced((rect_count - rect_split) / 4 * 6, 1, rect_split / 4 * 6, 0, 0);
     }
     auto s_t2 = std::chrono::steady_clock::now();
+
+    // Horizontal mode draws the whole note field through the strip pass. Do it before the blur/bloom
+    // capture below, otherwise they only ever see an empty background and the blur looks missing.
+    const bool bStripBeforeBlur = Config::GetConfig().GetVizSettings().bHorizontalPianoRoll;
+    if (bStripBeforeBlur)
+        DrawPianoRollStrip();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
     if (!g_bDisableBlur) {
@@ -1745,7 +1760,8 @@ HRESULT D3D12Renderer::EndScene(bool draw_bg) {
     }
 
     DrawPianoRollStripBackground();
-    DrawPianoRollStrip();
+    if (!bStripBeforeBlur)
+        DrawPianoRollStrip();
     auto s_t3 = std::chrono::steady_clock::now();
 
     const auto& vignetteViz = Config::GetConfig().GetVizSettings();
@@ -1857,6 +1873,7 @@ HRESULT D3D12Renderer::PresentBackend() {
 }
 
 void D3D12Renderer::DrawPianoRollStripBackground() {
+    if (m_bSuppressStrip) return;
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
         return;
@@ -1912,6 +1929,7 @@ void D3D12Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D12Renderer::DrawPianoRollStrip() {
+    if (m_bSuppressStrip) return;
     m_bStripDepthCleared = false;
     DrawPianoRollStripNotes();
     DrawPianoRollStripRibbons();
@@ -1999,13 +2017,13 @@ void D3D12Renderer::DrawPianoRollStripNotes() {
         if (stripNotes.empty())
         return;
 
-    const size_t stripCount = m_bUnlimitedNotes
+    const size_t stripCount = m_bStripPresampled ? stripNotes.size() : m_bUnlimitedNotes
         ? stripNotes.size()
         : min(stripNotes.size(), (size_t)m_NotesPerPass);
     if (stripCount == 0)
         return;
 
-    const size_t stride = (stripCount + StripNoteBudget - 1) / StripNoteBudget;
+    const size_t stride = m_bStripPresampled ? 1 : (stripCount + StripNoteBudget - 1) / StripNoteBudget;
     const size_t sampledCount = (stripCount + stride - 1) / stride;
 
     const float menuBarHeight = 20.0f;

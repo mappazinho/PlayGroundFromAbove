@@ -116,6 +116,9 @@ public:
 
     virtual ~Renderer() {}
 
+    // Set by the splash screen: it draws plain notes only, so the dual/horizontal strip passes are skipped.
+    bool m_bSuppressStrip = false;
+
     // Picks the backend: D3D12 when the user requested it and this machine can create a D3D12 device
     // (g_bD3D12Available probe, no boot-time fallback), otherwise D3D11.
     static Renderer* CreateInstance();
@@ -194,6 +197,17 @@ public:
     }
 
     inline void PushNoteData(NoteData data) { m_vNotesIntermediate.push_back(data); };
+    // Same result as PushNoteData for every note of every slice in order (including the occlusion filter on
+    // very dense frames), but the filtering runs in parallel. Slices are consumed.
+    void PushNoteSlices(std::vector<std::vector<NoteData>>& slices);
+    // Appends notes that were already culled by the caller (the sliding note window) without running the occlusion filter.
+    void AppendCulledNotes(const std::vector<NoteData>& notes);
+    // Dual / horizontal roll: the caller collected exactly the notes DrawPianoRollStripNotes would have sampled (every
+    // stride-th note of the full list, see StripNoteCap / StripBudget); this installs them and switches the renderer's own
+    // sampling off for the frame.
+    size_t StripNoteCap() const { return m_bUnlimitedNotes ? (size_t)-1 : (size_t)m_NotesPerPass; }
+    size_t StripBudget() const { return StripNoteBudget; }
+    void AppendStripNotesPresampled(std::vector<std::vector<NoteData>>& parts);
     inline void PushPianoRollStripNoteData(NoteData data) { m_vPianoRollStripNotesIntermediate.push_back(data); };
 
     // Pitch-bend ribbons: notes whose shape follows a per-channel bend curve instead of sliding
@@ -236,6 +250,7 @@ public:
     void RenderImGuiFrame();
     ImDrawList* GetDrawList() { return m_pDrawList; }
     void SetPlaybackPosition(float pos) { m_fPlaybackPosition = pos; }
+    void SetPlaybackTimes(double curSec, double totalSec) { m_dPlaybackCurSec = curSec; m_dPlaybackTotalSec = totalSec; }
     void SetPianoRollView(int startNote, int endNote, float playheadFraction) {
         m_iPianoRollStartNote = startNote;
         m_iPianoRollEndNote = endNote;
@@ -343,6 +358,7 @@ protected:
     bool m_bDeviceLost = false;
     bool m_bAllowTearing = true;
     bool m_bUnlimitedNotes = true;
+    bool m_bStripPresampled = false; // the strip notes were already sampled by the caller this frame
     unsigned m_NotesPerPass = MaxNotesPerPass;
 
     HWND m_hWnd = NULL;
@@ -398,6 +414,7 @@ protected:
     int m_resWidth = 0;
     int m_resHeight = 0;
     float m_fPlaybackPosition = 0.0f;
+    double m_dPlaybackCurSec = 0.0, m_dPlaybackTotalSec = 0.0; // for the toolbar time readout
 
     // Blur/bloom output exposed to ImGui as a texture id.
     ImTextureID m_BlurTextureID = 0;

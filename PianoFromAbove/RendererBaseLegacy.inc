@@ -788,6 +788,13 @@ void Renderer::RenderImGuiFrame() {
                 ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
                 ImGui::Unindent();
             }
+            ImGui::Checkbox("Bounce window to the beat", &viz.bBounceWindow);
+            if (viz.bBounceWindow) {
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                ImGui::SliderInt("Window hop", &viz.iBounceWindowPx, 1, 60, "%d px");
+                ImGui::Unindent();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("RenderMode")) {
@@ -809,12 +816,7 @@ void Renderer::RenderImGuiFrame() {
             ImGui::Checkbox("Visualize Pitch Bends", &viz.bVisualizePitchBends);
             ImGui::Checkbox("Visualize Modulation", &viz.bVisualizeModulation);
             ImGui::Checkbox("Disable all blurs", &viz.bDisableBlurs);
-            if (ImGui::Checkbox("Visual Buffer Notes", &viz.bImageBufferNotes) && viz.bImageBufferNotes)
-                viz.bDualPianoRoll = false;
-            if (viz.bImageBufferNotes) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("(%u/64)", ImageBufferGetCachedCount());
-            }
+            ImGui::Checkbox("Sliding note window (fast dense MIDIs)", &viz.bSlidingNotes);
             ImGui::Separator();
             ImGui::Checkbox("Bloom", &viz.bBloom);
             if (viz.bBloom) {
@@ -882,7 +884,7 @@ void Renderer::RenderImGuiFrame() {
     const float menuBarHeight = ImGui::GetFrameHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     
-    if (m_bShowToolbar && view.GetControls()) {
+    if (m_bShowToolbar && view.GetControls() && playback.GetPlayMode() == GameState::Practice) { // no toolbar on the splash screen
         bool showToolbar = true;
         if (view.GetFullScreen() && !visual.bAlwaysShowControls) {
             POINT pt;
@@ -912,13 +914,40 @@ void Renderer::RenderImGuiFrame() {
 
 if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 float buttonWidth = 35.0f;
-
                 bool hasSong = playback.GetPlayMode() != GameState::Intro;
+
+                // Transport buttons with drawn icons (the text glyphs "|>", "||" and "[]" looked uneven).
+                enum class Icon { Play, Pause, Stop };
+                auto iconButton = [&](const char* id, Icon icon, const char* tip) -> bool {
+                    const bool pressed = ImGui::Button(id, ImVec2(buttonWidth, 0));
+                    const bool hovered = ImGui::IsItemHovered();
+                    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                    const ImVec2 c((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+                    const float h = (b.y - a.y) * 0.27f;
+                    const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    switch (icon) {
+                    case Icon::Play:
+                        dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - h), ImVec2(c.x - h * 0.7f, c.y + h), ImVec2(c.x + h, c.y), col);
+                        break;
+                    case Icon::Pause:
+                        dl->AddRectFilled(ImVec2(c.x - h * 0.85f, c.y - h), ImVec2(c.x - h * 0.2f, c.y + h), col);
+                        dl->AddRectFilled(ImVec2(c.x + h * 0.2f, c.y - h), ImVec2(c.x + h * 0.85f, c.y + h), col);
+                        break;
+                    case Icon::Stop:
+                        dl->AddRectFilled(ImVec2(c.x - h * 0.9f, c.y - h * 0.9f), ImVec2(c.x + h * 0.9f, c.y + h * 0.9f), col, 1.5f);
+                        break;
+                    }
+                    if (hovered && tip)
+                        ImGui::SetTooltip("%s", tip);
+                    return pressed;
+                };
+
                 ImGui::BeginDisabled(!hasSong);
-                if (ImGui::Button(playback.GetPaused() ? "|>" : "||", ImVec2(buttonWidth, 0)))
+                if (iconButton("##playpause", playback.GetPaused() ? Icon::Play : Icon::Pause, playback.GetPaused() ? "Play" : "Pause"))
                     PostMessage(g_hWnd, WM_COMMAND, ID_PLAY_PLAYPAUSE, 0);
                 ImGui::SameLine();
-                if (ImGui::Button("[]", ImVec2(buttonWidth, 0)))
+                if (iconButton("##stop", Icon::Stop, "Stop"))
                     PostMessage(g_hWnd, WM_COMMAND, ID_PLAY_STOP, 0);
                 ImGui::EndDisabled();
 
@@ -927,16 +956,44 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 ImGui::BeginDisabled(!hasSong);
                 if (ImGui::ArrowButton("##skipb", ImGuiDir_Left))
                     PostMessage(g_hWnd, WM_COMMAND, ID_PLAY_SKIPBACK, 0);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip back");
                 ImGui::SameLine();
                 if (ImGui::ArrowButton("##skipf", ImGuiDir_Right))
                     PostMessage(g_hWnd, WM_COMMAND, ID_PLAY_SKIPFWD, 0);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip forward");
                 ImGui::EndDisabled();
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
 
+                // Value sliders carry their own label in the format string; double-click resets to 100%.
+                auto percentSlider = [&](const char* id, const char* fmt, int* value, int lo, int hi, float width, const char* tip) -> bool {
+                    ImGui::SetNextItemWidth(width);
+                    const bool changed = ImGui::SliderInt(id, value, lo, hi, fmt);
+                    // The second click of a double-click leaves the slider active and dragging, so it would
+                    // rewrite the value from the mouse position every frame: keep forcing 100 until the
+                    // button is released.
+                    static ImGuiID s_resetId = 0;
+                    const ImGuiID itemId = ImGui::GetItemID();
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s\nDouble-click: reset to 100%%   Ctrl+click: type a value", tip);
+                        if (ImGui::IsMouseDoubleClicked(0)) {
+                            s_resetId = itemId;
+                            *value = 100; // immediately, even if the press and release land in one frame
+                            return true;
+                        }
+                    }
+                    if (s_resetId == itemId) {
+                        if (ImGui::IsMouseDown(0)) {
+                            *value = 100;
+                            return true;
+                        }
+                        s_resetId = 0;
+                    }
+                    return changed;
+                };
+
                 int volPct = (int)(playback.GetVolume() * 100.0 + 0.5);
-                ImGui::SetNextItemWidth(70);
-                if (ImGui::SliderInt("##vol", &volPct, 0, 100, "%d%%"))
+                if (percentSlider("##vol", "Vol %d%%", &volPct, 0, 100, 96, "Volume"))
                     playback.SetVolume(volPct / 100.0, true);
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
@@ -947,24 +1004,39 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                 if (!ImGui::IsItemActive()) {
                     seekPos = (int)(m_fPlaybackPosition * 1000.0f);
                 }
-                float sliderW = 300.0f;
+                // Scales with the window instead of a fixed 300 px.
+                float sliderW = std::clamp(vp->Size.x * 0.28f, 180.0f, 520.0f);
+                auto fmtTime = [](double sec, char* out, size_t cch) {
+                    const int s = (int)(sec < 0.0 ? 0.0 : sec);
+                    if (s >= 3600) snprintf(out, cch, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+                    else snprintf(out, cch, "%d:%02d", s / 60, s % 60);
+                };
+                char curStr[24], totStr[24], seekFmt[64];
+                fmtTime(m_dPlaybackCurSec, curStr, sizeof(curStr));
+                fmtTime(m_dPlaybackTotalSec, totStr, sizeof(totStr));
+                snprintf(seekFmt, sizeof(seekFmt), "%s / %s", curStr, totStr);
                 ImGui::SetNextItemWidth(sliderW);
-                if (ImGui::SliderInt("##pos", &seekPos, 0, 1000, "%d", ImGuiSliderFlags_NoInput))
+                if (ImGui::SliderInt("##pos", &seekPos, 0, 1000, seekFmt, ImGuiSliderFlags_NoInput))
                     HandOffMsg(TBM_SETPOS, 0, seekPos);
+                if (ImGui::IsItemHovered() && m_dPlaybackTotalSec > 0.0) {
+                    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                    const float f = std::clamp((ImGui::GetIO().MousePos.x - a.x) / (b.x - a.x), 0.0f, 1.0f);
+                    char hoverStr[24];
+                    fmtTime(f * m_dPlaybackTotalSec, hoverStr, sizeof(hoverStr));
+                    ImGui::SetTooltip("Seek to %s", hoverStr);
+                }
                 ImGui::EndDisabled();
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
 
                 int speedPct = (int)(playback.GetSpeed() * 100.0 + 0.5);
-                ImGui::SetNextItemWidth(70);
-                if (ImGui::SliderInt("% Spd", &speedPct, 0, 200, "%d%%"))
+                if (percentSlider("##spd", "Speed %d%%", &speedPct, 0, 200, 110, "Playback speed"))
                     playback.SetSpeed(speedPct / 100.0, true);
 
                 ImGui::SameLine(); ImGui::Separator(); ImGui::SameLine();
 
                 int nspeedPct = (int)(playback.GetNSpeed() * 100.0 + 0.5);
-                ImGui::SetNextItemWidth(70);
-                if (ImGui::SliderInt("% Nts", &nspeedPct, 0, 200, "%d%%"))
+                if (percentSlider("##nspd", "Notes %d%%", &nspeedPct, 0, 200, 110, "Note fall speed (how much of the song is visible)"))
                     playback.SetNSpeed(nspeedPct / 100.0, true);
 
                 // Soft rounded capsule behind the centered controls: blurred
@@ -1120,6 +1192,11 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ImGui::EndCombo();
                     }
                     ImGui::Checkbox("KDMAPI", &viz.bKDMAPI);
+                    ImGui::BeginDisabled(!viz.bKDMAPI);
+                    if (ImGui::Combo("KDMAPI Synth", &as.iKDMAPISynth, "SuperVirtualMIDISynth\0OmniMIDI\0"))
+                        as.iKDMAPISynth = as.iKDMAPISynth == 1 ? 1 : 0;
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Synth change applies on restart.");
                     ImGui::Separator();
                     ImGui::Checkbox("Prerendered Audio", &as.bPreRenderAudio);
                     ImGui::SameLine();
@@ -1167,6 +1244,13 @@ if (ImGui::Begin("##Toolbar", &m_bShowToolbar, tbFlags)) {
                         ImGui::Indent();
                         ImGui::SetNextItemWidth(200);
                         ImGui::SliderInt("Low Activity Threshold", &viz.iBounceNPSThreshold, 0, 100, "%d%% lower");
+                        ImGui::Unindent();
+                    }
+                    ImGui::Checkbox("Bounce window to the beat", &viz.bBounceWindow);
+                    if (viz.bBounceWindow) {
+                        ImGui::Indent();
+                        ImGui::SetNextItemWidth(200);
+                        ImGui::SliderInt("Window hop", &viz.iBounceWindowPx, 1, 60, "%d px");
                         ImGui::Unindent();
                     }
 #ifdef PGFA_FORCE_LOGGING

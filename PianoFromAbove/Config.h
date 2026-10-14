@@ -71,6 +71,7 @@ struct AudioSettings : public ISettings
     void LoadMIDIDevices();
     vector< wstring > vMIDIOutDevices;
     int iOutDevice;
+    int iKDMAPISynth; // 0 = SuperVirtualMIDISynth (SVMSAPI.dll), 1 = OmniMIDI; falls back to the other if missing
     wstring sDesiredOut;
     bool bPreRenderAudio;
     wstring sPreSoundfontPath;
@@ -280,7 +281,10 @@ struct VizSettings : public ISettings {
     std::vector<unsigned int> vGUIColors;
     bool bBounceStats;
     int iBounceNPSThreshold;
-    bool bImageBufferNotes;
+    bool bBounceWindow;   // also hop the OS window on the beat
+    int iBounceWindowPx;  // hop height in pixels
+    bool bImageBufferNotes; // retired: replaced by the sliding note window (bSlidingNotes); always false
+    bool bSlidingNotes;     // sliding note window: fast, exact rendering of very dense frames
     bool bWaitDenseBuffers; // Persisted: "wait for dense buffers before playback" (runtime mirror lives in the image-buffer prepared store)
 };
 

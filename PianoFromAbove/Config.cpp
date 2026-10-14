@@ -19,6 +19,7 @@ using namespace std;
 #include "Config.h"
 #include "Misc.h"
 #include "Globals.h"
+#include "Bench.h"
 
 namespace {
 constexpr size_t RecentMIDILimit = 10;
@@ -72,6 +73,7 @@ void Config::LoadDefaultValues()
 
 void Config::LoadConfigValues()
 {
+    if ( g_bBenchMode ) return; // the bench runs on defaults and never touches the user's settings
     // Where to load?
     string sPath = GetFolder();
     if ( sPath.length() == 0 ) return;
@@ -115,6 +117,7 @@ void Config::LoadConfigValues( TiXmlElement *txRoot )
 
 bool Config::SaveConfigValues()
 {
+    if ( g_bBenchMode ) return true;
     // Where to save?
     string sPath = GetFolder();
     if ( sPath.length() == 0 ) return false;
@@ -182,6 +185,7 @@ void VisualSettings::LoadDefaultValues()
 void AudioSettings::LoadDefaultValues()
 {
     this->iOutDevice = -1;
+    this->iKDMAPISynth = 0;
     this->bPreRenderAudio = false;
     this->sPreSoundfontPath = L"";
     this->sPreSoundfontDir = L"";
@@ -293,7 +297,10 @@ void VizSettings::LoadDefaultValues() {
     this->vGUIColors.clear();
     this->bBounceStats = false;
     this->iBounceNPSThreshold = 90;
+    this->bBounceWindow = false;
+    this->iBounceWindowPx = 12;
     this->bImageBufferNotes = false;
+    this->bSlidingNotes = true;
     this->bWaitDenseBuffers = true;
     this->sFFmpegDir = L"";
     this->iRenderWidth = 1920;
@@ -410,6 +417,8 @@ void AudioSettings::LoadConfigValues( TiXmlElement *txRoot )
     }
 
     int iAttrVal = 0;
+    if ( txAudio->QueryIntAttribute( "KDMAPISynth", &iAttrVal ) == TIXML_SUCCESS )
+        this->iKDMAPISynth = iAttrVal == 1 ? 1 : 0;
     if ( txAudio->QueryIntAttribute( "PreRenderAudio", &iAttrVal ) == TIXML_SUCCESS )
         this->bPreRenderAudio = (iAttrVal != 0);
 
@@ -645,7 +654,10 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
                 const char* path = txMIDI->Attribute("Path");
                 if (!path || !*path)
                     continue;
-                const std::wstring recentPath = Util::StringToWstring(path);
+                std::wstring recentPath = Util::StringToWstring(path);
+                std::wstring repaired;
+                if (Util::RepairMojibakePath(recentPath, repaired)) // saved by an older build that mangled non-ASCII names
+                    recentPath = repaired;
                 const bool duplicate = std::any_of(recentMIDIs.begin(), recentMIDIs.end(),
                     [&](const std::wstring& entry) { return SameRecentMIDIPath(entry, recentPath); });
                 if (!duplicate)
@@ -691,16 +703,15 @@ void VizSettings::LoadConfigValues(TiXmlElement* txRoot) {
         bBounceStats = (iAttrVal != 0);
     txViz->QueryIntAttribute("BounceNPSThreshold", &iBounceNPSThreshold);
     iBounceNPSThreshold = max(0, min(iBounceNPSThreshold, 100));
-    if (txViz->QueryIntAttribute("ImageBufferNotes", &iAttrVal) == TIXML_SUCCESS)
-        bImageBufferNotes = (iAttrVal != 0);
-    if (bImageBufferNotes)
-        bDualPianoRoll = false;
-    // Legacy configs predate the persisted flag: inherit the Image Buffer Notes
-    // state, which matches what the preferences UI used to auto-enable.
-    if (txViz->QueryIntAttribute("WaitDenseBuffers", &iAttrVal) == TIXML_SUCCESS)
-        bWaitDenseBuffers = (iAttrVal != 0);
-    else
-        bWaitDenseBuffers = bImageBufferNotes;
+    if (txViz->QueryIntAttribute("BounceWindow", &iAttrVal) == TIXML_SUCCESS)
+        bBounceWindow = (iAttrVal != 0);
+    txViz->QueryIntAttribute("BounceWindowPx", &iBounceWindowPx);
+    iBounceWindowPx = max(1, min(iBounceWindowPx, 60));
+    // Visual Buffer Notes was replaced by the sliding note window: old configs that had it on just use the new path.
+    bImageBufferNotes = false;
+    if (txViz->QueryIntAttribute("SlidingNotes", &iAttrVal) == TIXML_SUCCESS)
+        bSlidingNotes = (iAttrVal != 0);
+    bWaitDenseBuffers = false;
     PFASetWaitDenseBuffers(bWaitDenseBuffers);
     sTempStr = "";
     txViz->QueryStringAttribute("FFmpegDir", &sTempStr);
@@ -785,6 +796,7 @@ bool AudioSettings::SaveConfigValues( TiXmlElement *txRoot )
 
     if ( this->sDesiredOut.length() > 0 )
         txAudio->SetAttribute( "MIDIOutDevice", Util::WstringToString( this->sDesiredOut ) );
+    txAudio->SetAttribute( "KDMAPISynth", this->iKDMAPISynth );
     txAudio->SetAttribute( "PreRenderAudio", this->bPreRenderAudio );
     if ( this->sPreSoundfontDir.length() > 0 )
         txAudio->SetAttribute( "PreSoundfontDir", Util::WstringToString( this->sPreSoundfontDir ) );
@@ -947,7 +959,9 @@ bool VizSettings::SaveConfigValues(TiXmlElement* txRoot) {
     }
     txViz->SetAttribute("BounceStats", bBounceStats);
     txViz->SetAttribute("BounceNPSThreshold", iBounceNPSThreshold);
-    txViz->SetAttribute("ImageBufferNotes", bImageBufferNotes);
+    txViz->SetAttribute("BounceWindow", bBounceWindow);
+    txViz->SetAttribute("BounceWindowPx", iBounceWindowPx);
+    txViz->SetAttribute("SlidingNotes", bSlidingNotes);
     txViz->SetAttribute("WaitDenseBuffers", bWaitDenseBuffers);
     if (sFFmpegDir.length() > 0)
         txViz->SetAttribute("FFmpegDir", Util::WstringToString(sFFmpegDir));

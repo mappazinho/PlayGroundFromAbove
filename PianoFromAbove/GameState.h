@@ -31,6 +31,7 @@ using namespace std;
 #include "Renderer.h"
 #include "MIDI.h"
 #include "Misc.h"
+#include "SlidingNoteWindow.h"
 
 // Abstract base class
 class GameState
@@ -97,6 +98,7 @@ class SplashScreen : public GameState
 {
 public:
     SplashScreen( HWND hWnd, Renderer *pRenderer );
+    ~SplashScreen() override;
 
     const char* DebugName() const override { return "SplashScreen"; }
     void AbandonAfterCrash() override;
@@ -310,6 +312,8 @@ protected:
 
     // packed-song prototype: slides the expanded window along the song (see PackedPump)
     void PackedPump();
+    void BenchPreFrame();   // -bench: parameters / seeks for this frame (see Bench.h)
+    void BenchPostFrame();  // -bench: statistics, capture and exit
     void StartPlaybackAudioThread();
     void StopPlaybackAudioThread();
     void SyncPlaybackAudioThread(bool forceSeek = false);
@@ -353,6 +357,9 @@ void RenderText();
     void RenderSysStats();
     void RenderCCStats();
     float GetStatsBounceScale() const;
+    float ComputeBeatBounce() const; // 0..0.06 beat-synced pulse shared by the stats and window bounces
+    void UpdateWindowBounce();
+    int m_iWindowBouncePx = 0; // last hop height posted to the UI thread
     void RenderMarker(const char* str);
     void RenderMessage( LPRECT prcMsg, TCHAR *sMsg );
 
@@ -385,6 +392,18 @@ void RenderText();
     long long m_llDisplayTime; // Wall-clock song position for the status bar:
     int m_iStartTick; // Tick that corresponds with m_llStartTime. Used to help with beat and metronome detection
     vector<int> m_vState[128];  // The notes that are on at time m_llStartTime.
+    // Sliding note window (SlidingNoteWindow.h): per-key persistent visible notes, see MainScreen::SnwRender
+    SlidingNoteWindow m_snw;
+    int m_iSnwIdleFrames = 0;
+    bool SnwRender();
+    void SnwSync( long long lo, long long hi );
+    void SnwAddNote( long long evIdx );
+    void SnwAppendRange( long long from, long long to );
+    long long StripEventEnd( long long lo0, long long stripEnd ) const;
+    bool StripCollect( long long lo0, long long hi );
+    bool StripCollectGlobal( long long lo0, long long hi );
+    void GwAppend( long long from, long long to );
+    SnwGlobal m_gw;
     vector<thread_work_t> m_vThreadWork[128];
     int m_pNoteState[128]; // The last note that was turned on
     double m_dSpeed; // Speed multiplier
@@ -575,6 +594,16 @@ private:
         unsigned long msg;
         bool operator>(const ScheduledSend& o) const { return dueQpcUs > o.dueQpcUs; }
     };
+    // While batching (the repeater/looper section of Logic), events are staged here and handed to the
+    // dispatch thread with one lock and one wake instead of one per event.
+    std::vector<ScheduledSend> m_vAudioStage;
+    bool m_bAudioBatching = false;
+    // Repeater audio runs on the audio thread (see FreePlayAudioThreadMain); these tell it what to fire.
+    std::atomic<bool> m_bRepeatActive{ false };
+    std::atomic<uint64_t> m_uRepeatKeys[2] = { 0, 0 };
+    std::atomic<double> m_dRepeatPeriodUs{ 0.0 };
+    bool m_bQueueMuted = false; // game thread only: visual-only notes, no sound queued
+    void FlushFreePlayAudioStage();
     std::thread m_FreePlayAudioThread;
     std::mutex m_FreePlayAudioMutex;
     std::condition_variable m_FreePlayAudioCv;
@@ -587,10 +616,27 @@ private:
     void RenderNoteIdx(int idx);
 
     struct ReleasedNote {
-        long long releaseTime;
-        long long finalLength;
+        long long releaseTime = 0;
+        long long finalLength = 0;
+        bool valid = false;
     };
-    std::unordered_map<int, ReleasedNote> m_mReleasedNotes; // eventIdx -> release info
+    // eventIdx -> release info. A flat array indexed by event: the per-frame loops probe every live note,
+    // and hashing 100k+ of them per frame was the main free play cost.
+    struct ReleasedTable {
+        std::vector<ReleasedNote> v;
+        const ReleasedNote* find(int idx) const {
+            return (idx >= 0 && (size_t)idx < v.size() && v[idx].valid) ? &v[idx] : nullptr;
+        }
+        void set(int idx, long long releaseTime, long long finalLength) {
+            if ((size_t)idx >= v.size())
+                v.resize((std::max)((size_t)idx + 1, v.size() * 2));
+            v[idx] = { releaseTime, finalLength, true };
+        }
+        void erase(int idx) {
+            if (idx >= 0 && (size_t)idx < v.size())
+                v[idx].valid = false;
+        }
+    } m_Released;
     std::deque<int> m_dReleaseOrder; // eventIdx of released notes, oldest first, for O(1) slot recycling
 
     bool m_bShowColorPicker = true;
@@ -603,7 +649,20 @@ private:
     bool m_bRainbow = false;     // rainbow colors per key press
     int m_iRainbowOffset = 0;    // advances by one hue step per press
     bool m_bMirrorKeys = false;  // duplicate each press at the opposite side of the piano
-    std::vector<int> m_vFreeSlots; // free color-slot indices for new notes
+    // Free color slots, oldest-freed first so new notes get consecutive slots (keeps the per-frame color
+    // upload range small). A slot is (track << 4 | channel): every one of the 16 channels of each color
+    // track is its own slot, so 16x more simultaneous notes than tracks.
+    std::deque<int> m_vFreeSlots;
+    bool m_bFreePlayColorsSynced = false;
+    // Event rows of notes that scrolled off are recycled instead of appending forever (m_vEvents and the
+    // MIDI event pool otherwise grow for as long as you play).
+    std::vector<int> m_vFreeEvents;
+    int m_iLastOnIdx = -1; // event index NoteOnSingle just used
+    int AllocEvent(MIDIChannelEvent* out);
+    struct KeyFreed { std::vector<int> slots, events; };
+    KeyFreed m_aKeyFreed[128]; // per-key results of the parallel scroll-off pass, merged serially
+    std::vector<std::vector<NoteData>> m_vRenderSlices = std::vector<std::vector<NoteData>>(128);
+    NoteData MakeNoteData(int idx) const;
     struct LoopEvent {
         bool isOn;
         unsigned char note;

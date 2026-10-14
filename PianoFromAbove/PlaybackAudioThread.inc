@@ -137,8 +137,9 @@ public:
                 m_svms.destroy_session(m_svmsSession);
             m_svmsSession = 0;
         } else if (m_mode == Mode::KDMAPI) {
-            if (m_terminateKDMAPI)
-                m_terminateKDMAPI();
+            // Not terminated: MIDIOutDevice shares this stream (see OpenKDMAPI). Silence it instead.
+            if (m_resetKDMAPI)
+                m_resetKDMAPI();
         } else if (m_mode == Mode::WinMM) {
             m_winmm.Close();
         }
@@ -200,6 +201,15 @@ public:
         return true;
     }
 
+    // Returns every channel to a freshly reset synth (see PGFAAppendFullSynthReset).
+    void FullReset()
+    {
+        std::vector<uint32_t> msgs;
+        PGFAAppendFullSynthReset(msgs);
+        for (uint32_t m : msgs)
+            Send(m, 0);
+    }
+
     void Silence()
     {
         if (m_mode == Mode::SvmsNative) {
@@ -255,9 +265,9 @@ private:
 
     bool OpenSvmsNative()
     {
-        static const wchar_t* names[] = { L"SVMS.dll", L"SVMSAPI.dll" };
-        for (const wchar_t* name : names) {
-            HMODULE module = PGFALoadSiblingModule(name);
+        // Only the provider chosen in settings (see PGFAGetKDMAPIModule); OmniMIDI has no SVMS_GetInterface.
+        for (HMODULE module : { PGFAGetKDMAPIModule() }) {
+            const wchar_t* name = L"KDMAPI provider";
             if (!module)
                 continue;
             auto getInterface = reinterpret_cast<PGFASvmsGetInterfaceFn>(
@@ -293,9 +303,8 @@ private:
 
     bool OpenKDMAPI()
     {
-        static const wchar_t* names[] = { L"SVMS.dll", L"SVMSAPI.dll", L"OmniMIDI.dll", L"OmniMIDI" };
-        for (const wchar_t* name : names) {
-            HMODULE module = PGFALoadSiblingModule(name);
+        for (HMODULE module : { PGFAGetKDMAPIModule() }) {
+            const wchar_t* name = L"KDMAPI provider";
             if (!module)
                 continue;
             auto initialize = reinterpret_cast<PGFAInitializeKDMAPIFn>(GetProcAddress(module, "InitializeKDMAPIStream"));
@@ -305,10 +314,13 @@ private:
                 StartupLog("%ls: missing KDMAPI exports", name);
                 continue;
             }
-            if (!initialize()) {
+            // The stream is shared with MIDIOutDevice and never terminated (a terminate/initialize
+            // cycle is slow and has hung the UI), so only the first opener initializes it.
+            if (!KDMAPIStreamAlive(module) && !initialize()) {
                 StartupLog("%ls: InitializeKDMAPIStream failed", name);
                 continue;
             }
+            KDMAPIStreamSetAlive(module);
             m_module = module;
             m_terminateKDMAPI = terminate;
             m_sendDirectData = send;
@@ -347,6 +359,24 @@ static uint64_t PGFAQpcFrequency()
     }();
     return frequency;
 }
+// Index of the lowest set bit (m != 0). _BitScanForward64 works on the SSE4.2 build too, unlike tzcnt.
+static inline int PGFALowBit(uint64_t m)
+{
+    unsigned long i = 0;
+    _BitScanForward64(&i, m);
+    return (int)i;
+}
+
+
+// Microseconds on the QPC clock. The free play scheduler's due times, Fp<->QPC mapping and wait math are all in
+// microseconds; they used raw QPC ticks (0.1 us each on a 10 MHz counter), which made the mapping run 10x
+// fast so scheduled stamps were always already past and every note fired the moment it was queued.
+static uint64_t PGFAQpcNowUs()
+{
+    const uint64_t ticks = PGFAQpcNow();
+    const uint64_t freq = PGFAQpcFrequency();
+    return (ticks / freq) * 1000000ULL + (ticks % freq) * 1000000ULL / freq;
+}
 
 static long long PGFAClampSongTime(long long value, long long lo, long long hi)
 {
@@ -358,7 +388,19 @@ static long long PGFAClampSongTime(long long value, long long lo, long long hi)
 MainScreen::~MainScreen()
 {
     IB_TRACE(IB_SCREENDTOR);
+    // The prerender generator reads this song's events (and its memory-mapped file); it must be
+    // joined before m_MIDI is destroyed or it faults on unmapped memory (seen when closing the app).
+    if (m_iWindowBouncePx != 0)
+        PostMessage(g_hWnd, ID_BOUNCE_WINDOW, 0, 0); // leave the window at rest
+    ShutdownStage("game: ~MainScreen stopping the prerender generator");
+    if (PRE_MIDIAudio && PRE_MIDIAudio->m_pMIDI == &m_MIDI)
+    {
+        PRE_MIDIAudio->Stop();
+        PRE_MIDIAudio->m_pMIDI = nullptr;
+    }
+    ShutdownStage("game: ~MainScreen stopping the playback audio thread");
     StopPlaybackAudioThread();
+    ShutdownStage("game: ~MainScreen joining the packed-song builder");
     if (m_PackedBuilder.joinable())
         m_PackedBuilder.join();
     delete m_pPackedNext;
@@ -409,7 +451,7 @@ void FreePlayScreen::StartFreePlayAudioThread()
     // Anchor the freeplay-time <-> QPC mapping so stamps produced by the frame
     // loop line up with the audio thread's clock from the first tick.
     m_llFreePlayAudioClockFpUs.store(m_llFreePlayTime, std::memory_order_relaxed);
-    m_llFreePlayAudioClockQpcUs.store((long long)PGFAQpcNow(), std::memory_order_relaxed);
+    m_llFreePlayAudioClockQpcUs.store((long long)PGFAQpcNowUs(), std::memory_order_relaxed);
     m_FreePlayAudioThread = std::thread(&FreePlayScreen::FreePlayAudioThreadMain, this);
 }
 
@@ -443,24 +485,47 @@ void FreePlayScreen::QueueFreePlayEvent(unsigned char status, unsigned char p1, 
 
 void FreePlayScreen::QueueFreePlayEventAt(long long llStampFpUs, unsigned char status, unsigned char p1, unsigned char p2)
 {
+    if (m_bQueueMuted)
+        return;
     // Stamps in the past (or "now") go out immediately; future stamps are fired
     // by the dispatch thread at their exact musical time.
     unsigned long long due;
     if (llStampFpUs < 0)
-        due = PGFAQpcNow();
+        due = PGFAQpcNowUs();
     else
-        due = (unsigned long long)(std::max)(FpStampToQpcUs(llStampFpUs), (long long)PGFAQpcNow());
+        due = (unsigned long long)(std::max)(FpStampToQpcUs(llStampFpUs), (long long)PGFAQpcNowUs());
+    const ScheduledSend send{ due,
+        (unsigned long)status | ((unsigned long)p1 << 8) | ((unsigned long)p2 << 16) };
+    if (m_bAudioBatching) {
+        m_vAudioStage.push_back(send);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
         // Insane-burst guard: drop the soonest events rather than grow unbounded.
         while (m_qFreePlayAudio.size() >= 16384)
             m_qFreePlayAudio.pop();
-        m_qFreePlayAudio.push(ScheduledSend{ due,
-            (unsigned long)status | ((unsigned long)p1 << 8) | ((unsigned long)p2 << 16) });
+        m_qFreePlayAudio.push(send);
     }
     m_FreePlayAudioCv.notify_one();
 }
 
+void FreePlayScreen::FlushFreePlayAudioStage()
+{
+    m_bAudioBatching = false;
+    if (m_vAudioStage.empty())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_FreePlayAudioMutex);
+        for (const ScheduledSend& send : m_vAudioStage) {
+            while (m_qFreePlayAudio.size() >= 16384)
+                m_qFreePlayAudio.pop();
+            m_qFreePlayAudio.push(send);
+        }
+    }
+    m_vAudioStage.clear();
+    m_FreePlayAudioCv.notify_one();
+}
 void FreePlayScreen::FreePlayAudioThreadMain()
 {
     timeBeginPeriod(1);
@@ -473,7 +538,7 @@ void FreePlayScreen::FreePlayAudioThreadMain()
     batch.reserve(256);
     // Keep the freeplay-time <-> QPC mapping current: both advance at real time.
     long long mapFp = m_llFreePlayAudioClockFpUs.load(std::memory_order_relaxed);
-    uint64_t mapQpc = PGFAQpcNow();
+    uint64_t mapQpc = PGFAQpcNowUs();
 
     // Calibrate the real wait granularity of this process. Timer resolution is
     // ref-counted process-wide (Timer dtor calls timeEndPeriod) and Windows 11
@@ -492,11 +557,14 @@ void FreePlayScreen::FreePlayAudioThreadMain()
     const long long spinWindowUs = 2500;                       // final stretch: spin for exact timing
     const long long sleepGuardUs = (long long)waitGranUs + spinWindowUs + 500;
 
+    bool repWasActive = false;
+    double repNextFire = 0.0;
+    uint64_t repSounding[2] = { 0, 0 };
     bool exiting = false;
     while (!exiting) {
         ++hzTicks;
 
-        const uint64_t now = PGFAQpcNow();
+        const uint64_t now = PGFAQpcNowUs();
         if (now > mapQpc) {
             mapFp += (long long)(now - mapQpc);
             mapQpc = now;
@@ -527,13 +595,55 @@ void FreePlayScreen::FreePlayAudioThreadMain()
                                   (unsigned char)((msg >> 8) & 0xffu),
                                   (unsigned char)((msg >> 16) & 0xffu));
 
+        // Repeater (SLAM / held key with a repeat rate): fired here, on the audio thread's own clock, so
+        // frame lag only delays the visuals. Each fire releases what the last one struck, then strikes
+        // the key set again. Timing is in raw QPC ticks since a fire can be a tick or two apart.
+        {
+            const bool repActive = !exiting && m_bRepeatActive.load(std::memory_order_acquire);
+            if (repActive) {
+                const uint64_t keys[2] = { m_uRepeatKeys[0].load(std::memory_order_relaxed),
+                                           m_uRepeatKeys[1].load(std::memory_order_relaxed) };
+                const double periodTicks = (std::max)(1.0,
+                    m_dRepeatPeriodUs.load(std::memory_order_relaxed) * (double)qpcFreq / 1000000.0);
+                uint64_t nowTicks = PGFAQpcNow();
+                if (!repWasActive) {
+                    repNextFire = (double)nowTicks;
+                    repSounding[0] = repSounding[1] = 0;
+                }
+                int fires = 0;
+                while ((double)nowTicks >= repNextFire && fires < 4096) {
+                    for (int half = 0; half < 2; half++)
+                        for (uint64_t m = repSounding[half]; m; m &= m - 1)
+                            m_OutDevice.PlayEvent(0x80, (unsigned char)(half * 64 + PGFALowBit(m)), 0);
+                    for (int half = 0; half < 2; half++)
+                        for (uint64_t m = keys[half]; m; m &= m - 1)
+                            m_OutDevice.PlayEvent(0x90, (unsigned char)(half * 64 + PGFALowBit(m)), 100);
+                    repSounding[0] = keys[0];
+                    repSounding[1] = keys[1];
+                    repNextFire += periodTicks;
+                    ++fires;
+                    if ((fires & 63) == 0)
+                        nowTicks = PGFAQpcNow();
+                }
+                // Fell more than 50 ms behind (synth can't keep up): skip ahead instead of catching up forever.
+                if ((double)nowTicks - repNextFire > (double)qpcFreq / 20.0)
+                    repNextFire = (double)nowTicks;
+            } else if (repWasActive) {
+                for (int half = 0; half < 2; half++)
+                    for (uint64_t m = repSounding[half]; m; m &= m - 1)
+                        m_OutDevice.PlayEvent(0x80, (unsigned char)(half * 64 + PGFALowBit(m)), 0);
+                repSounding[0] = repSounding[1] = 0;
+            }
+            repWasActive = repActive;
+        }
+
         if (!exiting && haveFuture) {
             // Hybrid precision wait: block in coarse slices while far from the
             // deadline, then spin the final stretch so the fire time is exact
             // no matter what the system timer resolution is.
             for (;;) {
-                const long long remainUs = (long long)(nextDue - PGFAQpcNow());
-                if (remainUs <= spinWindowUs ||
+                const long long remainUs = (long long)(nextDue - PGFAQpcNowUs());
+                if (remainUs <= spinWindowUs || m_bRepeatActive.load(std::memory_order_acquire) ||
                     m_bFreePlayAudioExit.load(std::memory_order_acquire))
                     break;
                 if (remainUs > sleepGuardUs) {
@@ -544,6 +654,8 @@ void FreePlayScreen::FreePlayAudioThreadMain()
                     YieldProcessor();
                 }
             }
+        } else if (!exiting && m_bRepeatActive.load(std::memory_order_acquire)) {
+            YieldProcessor(); // repeater running: stay on the CPU so fires land on time
         } else if (!exiting) {
             // Idle: heartbeat so pushes wake us instantly and the Audio FPS
             // readout keeps updating like normal play's scheduler.
@@ -787,6 +899,9 @@ void MainScreen::PlaybackAudioThreadMain()
             output.Panic();
             output.Close();
             output.Open(wantKDMAPI, device);
+            // The synth still holds the previous song's (or the splash's) controllers, programs and notes.
+            if (output.IsOpen())
+                output.FullReset();
         }
         providerWasLive = output.IsOpen();
 
@@ -1100,6 +1215,8 @@ GameState::GameError MainScreen::Logic(void)
 {
     if (IsFreePlay())
         return LogicLegacy();
+    if (g_Bench.active)
+        return LogicLegacy(); // no audio threads, no live clock: the bench drives time itself
 
     if (m_llPendingJumpUs != LLONG_MIN) {
         // first frame of a continuation window: land on the playhead of the screen it replaces

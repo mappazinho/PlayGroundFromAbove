@@ -132,8 +132,8 @@ void Timer::IncrementFrame()
 
 // The next three functions assume the returned buffer will immediately be consumed by the string constructor
 // Doesn't return string or wstring in order to minimize the number of copying.
-char Util::m_sBuf[16384];
-wchar_t Util::m_wsBuf[16384];
+thread_local char Util::m_sBuf[16384];
+thread_local wchar_t Util::m_wsBuf[16384];
 
 wchar_t* Util::StringToWstring( const string &s )
 {
@@ -255,4 +255,30 @@ void Util::CommaPrintf( TCHAR buf[32], int iVal )
     else if ( iAbsVal < 1000000 ) _stprintf_s( buf, 32, TEXT( "%d,%03d" ), iVal / 1000, iAbsVal % 1000 );
     else if ( iAbsVal < 1000000000 ) _stprintf_s( buf, 32, TEXT( "%d,%03d,%03d" ), iVal / 1000000, ( iAbsVal / 1000 ) % 1000, iAbsVal % 1000 );
     else _stprintf_s( buf, 32, TEXT( "%d,%03d,%03d,%03d" ), iVal / 1000000000, ( iAbsVal / 1000000 ) % 1000, ( iAbsVal / 1000 ) % 1000, iAbsVal % 1000 );
+}
+bool Util::RepairMojibakePath( const wstring &path, wstring &repaired )
+{
+    if ( path.empty() || GetFileAttributesW( path.c_str() ) != INVALID_FILE_ATTRIBUTES )
+        return false; // intact (or nothing to repair)
+    bool bHigh = false;
+    for ( wchar_t c : path ) if ( c >= 0x80 ) { bHigh = true; break; }
+    if ( !bHigh )
+        return false;
+
+    // wide -> the CP-1252 bytes it was decoded from -> read those bytes as the UTF-8 they really were
+    BOOL bDefaultUsed = FALSE;
+    int nBytes = WideCharToMultiByte( 1252, 0, path.c_str(), (int)path.size(), NULL, 0, NULL, &bDefaultUsed );
+    if ( nBytes <= 0 ) return false;
+    string bytes( (size_t)nBytes, '\0' );
+    bDefaultUsed = FALSE;
+    WideCharToMultiByte( 1252, 0, path.c_str(), (int)path.size(), &bytes[0], nBytes, NULL, &bDefaultUsed );
+    if ( bDefaultUsed ) return false;
+    int nWide = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, bytes.c_str(), nBytes, NULL, 0 );
+    if ( nWide <= 0 ) return false;
+    wstring fixed( (size_t)nWide, L'\0' );
+    MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, bytes.c_str(), nBytes, &fixed[0], nWide );
+    if ( fixed == path || GetFileAttributesW( fixed.c_str() ) == INVALID_FILE_ATTRIBUTES )
+        return false;
+    repaired = fixed;
+    return true;
 }

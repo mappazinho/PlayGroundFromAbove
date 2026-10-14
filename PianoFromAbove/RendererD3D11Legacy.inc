@@ -766,6 +766,7 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
     m_vRectsIntermediate.clear();
     m_vNotesIntermediate.clear();
     m_vPianoRollStripNotesIntermediate.clear();
+    m_bStripPresampled = false;
     for (auto& tierNotes : m_vRibbonNotes)
         tierNotes.clear();
     m_uRibbonNoteCount = 0;
@@ -812,7 +813,15 @@ HRESULT D3D11Renderer::ClearAndBeginScene(DWORD color) {
 
 HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     ImGui::Render();
-    ImGui::GetDrawData()->AddDrawList(m_pDrawList);
+    {
+        // The strip keyboard is an external draw list. Appended last it paints over the menu bar's
+        // dropdowns and other popups, so slot it in front of everything ImGui drew (i.e. behind it).
+        ImDrawData* drawData = ImGui::GetDrawData();
+        const int before = drawData->CmdLists.Size;
+        drawData->AddDrawList(m_pDrawList);
+        if (drawData->CmdLists.Size > before)
+            std::rotate(drawData->CmdLists.begin(), drawData->CmdLists.end() - 1, drawData->CmdLists.end());
+    }
 
     if (draw_bg) {
         SetPipeline(Pipeline::Background);
@@ -916,6 +925,12 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
         m_pContext->IASetIndexBuffer(m_pIndexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
         m_pContext->DrawIndexed((UINT)((rect_count - rect_split) / 4 * 6), (UINT)(rect_split / 4 * 6), 0);
     }
+
+    // Horizontal mode draws the whole note field through the strip pass. Do it before the blur/bloom
+    // capture below, otherwise they only ever see an empty background and the blur looks missing.
+    const bool bStripBeforeBlur = Config::GetConfig().GetVizSettings().bHorizontalPianoRoll;
+    if (bStripBeforeBlur)
+        DrawPianoRollStrip();
 
     const auto& bloomViz = Config::GetConfig().GetVizSettings();
     if (!g_bDisableBlur) {
@@ -1041,7 +1056,8 @@ HRESULT D3D11Renderer::EndScene(bool draw_bg) {
     }
 
     DrawPianoRollStripBackground();
-    DrawPianoRollStrip();
+    if (!bStripBeforeBlur)
+        DrawPianoRollStrip();
 
     const auto& vignetteViz = Config::GetConfig().GetVizSettings();
     if (vignetteViz.bVignette && vignetteViz.fVignetteIntensity > 0.0f && m_pVignettePS && m_pBlendVignette && m_pVignetteConstants) {
@@ -1558,6 +1574,7 @@ void D3D11Renderer::ApplyBlur() {
 }
 
 void D3D11Renderer::DrawPianoRollStripBackground() {
+    if (m_bSuppressStrip) return;
     const auto& stripViz = Config::GetConfig().GetVizSettings();
     if (g_bDisableBlur || stripViz.bHorizontalPianoRoll || !stripViz.bDualPianoRoll || !m_pBlurOutput)
         return;
@@ -1611,6 +1628,7 @@ void D3D11Renderer::DrawPianoRollStripBackground() {
 }
 
 void D3D11Renderer::DrawPianoRollStrip() {
+    if (m_bSuppressStrip) return;
     m_bStripDepthCleared = false;
     DrawPianoRollStripNotes();
     DrawPianoRollStripRibbons();
@@ -1684,13 +1702,13 @@ void D3D11Renderer::DrawPianoRollStripNotes() {
         if (stripNotes.empty())
         return;
 
-    const size_t stripCount = m_bUnlimitedNotes
+    const size_t stripCount = m_bStripPresampled ? stripNotes.size() : m_bUnlimitedNotes
         ? stripNotes.size()
         : min(stripNotes.size(), (size_t)m_NotesPerPass);
     if (stripCount == 0)
         return;
 
-    const size_t stride = (stripCount + StripNoteBudget - 1) / StripNoteBudget;
+    const size_t stride = m_bStripPresampled ? 1 : (stripCount + StripNoteBudget - 1) / StripNoteBudget;
     const size_t sampledCount = (stripCount + stride - 1) / stride;
 
     const float menuBarHeight = 20.0f;

@@ -600,6 +600,21 @@ private:
 // thread). Never FreeLibrary a module returned from here.
 HMODULE PGFALoadSynthModule(const wchar_t* nameOrPath);
 
+// The KDMAPI provider used by MIDIOutDevice: SVMSAPI.dll beside the exe if usable, else OmniMIDI.
+extern int g_iKDMAPISynth; // AudioSettings::iKDMAPISynth, copied in at startup before the first open
+HMODULE PGFAGetKDMAPIModule();
+
+// A KDMAPI stream is initialized once and never terminated (all users share it; a terminate/initialize cycle is slow and has hung the UI).
+// Per synth DLL (OmniMIDI vs SVMS are separate streams).
+bool KDMAPIStreamAlive(HMODULE module);
+void KDMAPIStreamSetAlive(HMODULE module);
+
+
+// Packed short messages that return every channel to a freshly reset synth: sound off, all notes off,
+// controllers reset, sustain/sostenuto/soft off, bank 0, program 0, volume 100, pan 64, expression 127,
+// reverb 40 / chorus 0, pitch bend centered, bend range 2 semitones. A song inherits none of the
+// previous song's controller state this way (ResetKDMAPIStream / midiOutReset leave it behind).
+void PGFAAppendFullSynthReset( std::vector< uint32_t > &out );
 class MIDIOutDevice
 {
 public:
@@ -620,6 +635,7 @@ public:
     const wstring& GetDevice() const { return m_sDevice; };
 
     void AllNotesOff();
+    void FullReset(); // see PGFAAppendFullSynthReset
     void AllNotesOff( const vector< int > &vChannels );
     void SetVolume( double dVolume );
 

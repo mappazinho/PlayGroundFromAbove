@@ -20,6 +20,8 @@
 #include <thread>
 #include <memory>
 #include <algorithm>
+#include <mutex>
+#include <vector>
 #include <intrin.h>
 #include <smmintrin.h>
 #include "lzma.h"
@@ -2215,6 +2217,18 @@ bool MIDIOutDevice::Open( int iDev )
     return m_bIsOpen;
 }
 
+static std::mutex s_kdmapiMtx;
+static std::vector<HMODULE> s_kdmapiAlive;
+bool KDMAPIStreamAlive(HMODULE module) {
+    std::lock_guard<std::mutex> lock(s_kdmapiMtx);
+    return std::find(s_kdmapiAlive.begin(), s_kdmapiAlive.end(), module) != s_kdmapiAlive.end();
+}
+void KDMAPIStreamSetAlive(HMODULE module) {
+    std::lock_guard<std::mutex> lock(s_kdmapiMtx);
+    if (std::find(s_kdmapiAlive.begin(), s_kdmapiAlive.end(), module) == s_kdmapiAlive.end())
+        s_kdmapiAlive.push_back(module);
+}
+
 bool MIDIOutDevice::OpenKDMAPI() {
     if (m_bIsOpen)
         Close();
@@ -2225,7 +2239,14 @@ bool MIDIOutDevice::OpenKDMAPI() {
     StartupLog("KDMAPI open (MIDIOutDevice)");
     auto InitializeKDMAPIStream = (int(WINAPI*)())GetOmniMIDIProc("InitializeKDMAPIStream");
     *(FARPROC*)&SendDirectData = GetOmniMIDIProc("SendDirectData");
-    m_bIsOpen = (SendDirectData && InitializeKDMAPIStream && InitializeKDMAPIStream());
+    // Initializing OmniMIDI's stream takes seconds (4+ s on a loaded system) and can stall, so it is
+    // initialized once per process and kept alive across screen changes (see Close()).
+    HMODULE hOmni = PGFAGetKDMAPIModule();
+    if (SendDirectData && InitializeKDMAPIStream)
+        m_bIsOpen = KDMAPIStreamAlive(hOmni) || InitializeKDMAPIStream();
+    else
+        m_bIsOpen = false;
+    if (m_bIsOpen) KDMAPIStreamSetAlive(hOmni);
     StartupLog("KDMAPI open (MIDIOutDevice) -> %s", m_bIsOpen ? "ok" : "failed");
     return m_bIsOpen;
 }
@@ -2235,9 +2256,11 @@ void MIDIOutDevice::Close()
     if ( !m_bIsOpen ) return;
 
     if (m_bIsKDMAPI) {
-        auto TerminateKDMAPIStream = (int(WINAPI*)())GetOmniMIDIProc("TerminateKDMAPIStream");
-        if (TerminateKDMAPIStream)
-            TerminateKDMAPIStream();
+        // Not terminated: the next screen re-opens it, and a terminate/initialize cycle is slow and
+        // has been seen to hang the UI. Just silence it; the stream ends with the process.
+        auto ResetKDMAPIStream = (void(WINAPI*)())GetOmniMIDIProc("ResetKDMAPIStream");
+        if (ResetKDMAPIStream)
+            ResetKDMAPIStream();
     } else {
         midiOutReset(m_hMIDIOut);
         midiOutClose(m_hMIDIOut);
@@ -2332,10 +2355,47 @@ HMODULE PGFALoadSynthModule(const wchar_t* nameOrPath) {
     return module;
 }
 
+int g_iKDMAPISynth = 0;
+
+static HMODULE PGFALoadKDMAPISvms() {
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = (n > 0 && n < MAX_PATH) ? wcsrchr(path, L'\\') : nullptr;
+    if (slash && wcslen(path) + 12 < MAX_PATH) {
+        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"SVMSAPI.dll");
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            HMODULE svms = PGFALoadSynthModule(path);
+            if (svms && GetProcAddress(svms, "InitializeKDMAPIStream") && GetProcAddress(svms, "SendDirectData"))
+                return svms;
+        }
+    }
+    return NULL;
+}
+
+static HMODULE PGFALoadKDMAPIOmni() {
+    HMODULE omni = GetModuleHandle(L"OmniMIDI");
+    return omni ? omni : PGFALoadSynthModule(L"OmniMIDI");
+}
+
+// The KDMAPI provider for this process, chosen by g_iKDMAPISynth (SuperVirtualMIDISynth's SVMSAPI.dll
+// next to the exe, or the system's OmniMIDI), falling back to the other if the choice is missing.
+// Resolved once so every user shares one stream; changing the setting applies on restart.
+HMODULE PGFAGetKDMAPIModule() {
+    static HMODULE s_module = []() -> HMODULE {
+        HMODULE m = NULL;
+        if (g_iKDMAPISynth == 1) {
+            if (!(m = PGFALoadKDMAPIOmni())) m = PGFALoadKDMAPISvms();
+        } else {
+            if (!(m = PGFALoadKDMAPISvms())) m = PGFALoadKDMAPIOmni();
+        }
+        StartupLog("KDMAPI provider (setting %d) -> %p", g_iKDMAPISynth, (void*)m);
+        return m;
+    }();
+    return s_module;
+}
+
 FARPROC MIDIOutDevice::GetOmniMIDIProc(const char* func) {
-    auto dll = GetModuleHandle(L"OmniMIDI");
-    if (!dll)
-        dll = PGFALoadSynthModule(L"OmniMIDI");
+    auto dll = PGFAGetKDMAPIModule();
     return dll ? GetProcAddress(dll, func) : NULL;
 }
 
@@ -2347,4 +2407,45 @@ void CALLBACK MIDIOutDevice::MIDIOutProc(HMIDIOUT, UINT wMsg, DWORD_PTR, DWORD_P
         {
         }
     }
+}
+
+void PGFAAppendFullSynthReset( std::vector< uint32_t > &out )
+{
+    auto cc = [&]( unsigned ch, unsigned num, unsigned val ) {
+        out.push_back( 0xB0u | ch | ( num << 8 ) | ( val << 16 ) );
+    };
+    for ( unsigned ch = 0; ch < 16; ch++ )
+    {
+        cc( ch, 120, 0 );   // all sound off
+        cc( ch, 123, 0 );   // all notes off
+        cc( ch, 121, 0 );   // reset all controllers
+        cc( ch, 64, 0 );    // sustain
+        cc( ch, 66, 0 );    // sostenuto
+        cc( ch, 67, 0 );    // soft pedal
+        cc( ch, 0, 0 );     // bank select MSB / LSB
+        cc( ch, 32, 0 );
+        cc( ch, 1, 0 );     // modulation
+        cc( ch, 7, 100 );   // volume
+        cc( ch, 10, 64 );   // pan
+        cc( ch, 11, 127 );  // expression
+        cc( ch, 91, 40 );   // reverb
+        cc( ch, 93, 0 );    // chorus
+        cc( ch, 101, 0 );   // RPN 0,0: pitch bend range = 2 semitones
+        cc( ch, 100, 0 );
+        cc( ch, 6, 2 );
+        cc( ch, 38, 0 );
+        cc( ch, 101, 127 ); // RPN null
+        cc( ch, 100, 127 );
+        out.push_back( 0xC0u | ch );                          // program 0
+        out.push_back( 0xE0u | ch | ( 0u << 8 ) | ( 0x40u << 16 ) ); // pitch bend center
+    }
+}
+
+void MIDIOutDevice::FullReset()
+{
+    if ( !m_bIsOpen ) return;
+    std::vector< uint32_t > msgs;
+    PGFAAppendFullSynthReset( msgs );
+    for ( uint32_t m : msgs )
+        PlayEvent( (unsigned char)( m & 0xFF ), (unsigned char)( ( m >> 8 ) & 0xFF ), (unsigned char)( ( m >> 16 ) & 0xFF ) );
 }

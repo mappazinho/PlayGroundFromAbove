@@ -254,6 +254,7 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                 HandOffMsg(WM_COMMAND, ID_FILE_STOPRENDER, 0);
                 return 0;
             }
+            ShutdownWatchdogStart();
             break;
         case WM_RENDERPROG_CREATE:
             CreateRenderProgressWindow();
@@ -329,7 +330,7 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
                     cPlayback.SetPlayable( false, true );
                     cPlayback.SetPosition( 0 );
                     SetMainTitle(L"PlayGroundFromAbove " __DATE__);
-                    HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )new IntroScreen( NULL, NULL ) );
+                    HandOffMsg( WM_COMMAND, ID_CHANGESTATE, ( LPARAM )new SplashScreen( NULL, NULL ) );
                     return 0;
                 }
                 case ID_CRASH_RECOVERED:
@@ -532,6 +533,33 @@ LRESULT WINAPI WndProc( HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam )
         case ID_APPLY_FULLSCREEN:
             SetFullScreen( (BOOL)wParam );
             return 0;
+        case ID_BOUNCE_WINDOW:
+        {
+            // Beat hop: lParam = pixels above the resting position. The resting position is captured on
+            // the first hop; if the user dragged the window meanwhile, the new spot becomes the rest.
+            static bool s_bHopping = false;
+            static POINT s_ptRest = {}, s_ptSet = {};
+            static int s_iHop = 0;
+            const int iHop = (int)lParam;
+            RECT rc = {};
+            GetWindowRect( g_hWnd, &rc );
+            const LONG_PTR style = GetWindowLongPtr( g_hWnd, GWL_STYLE );
+            const bool bMovable = !IsIconic( g_hWnd ) && !IsZoomed( g_hWnd ) && ( style & WS_CAPTION ) == WS_CAPTION && !g_bInSizeMove;
+            if ( s_bHopping && ( rc.left != s_ptSet.x || rc.top != s_ptSet.y ) )
+                s_ptRest = { rc.left, rc.top + s_iHop }; // moved by the user
+            else if ( !s_bHopping )
+                s_ptRest = { rc.left, rc.top };
+            const int iTarget = bMovable ? iHop : 0;
+            if ( s_bHopping || iTarget != 0 )
+            {
+                s_ptSet = { s_ptRest.x, s_ptRest.y - iTarget };
+                if ( bMovable ) // never touch a window that was maximized/minimized/fullscreened meanwhile
+                    SetWindowPos( g_hWnd, NULL, s_ptSet.x, s_ptSet.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+                s_iHop = iTarget;
+                s_bHopping = iTarget != 0;
+            }
+            return 0;
+        }
         case WM_DEVICECHANGE:
             Sleep( 200 );
             Config::GetConfig().LoadMIDIDevices();
@@ -754,8 +782,15 @@ static bool WaitServicingSentMessages( HANDLE hEvent, DWORD dwTimeoutMs )
     }
 }
 
-BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
+BOOL PlayFile( const wstring &sFileArg, bool bCustomSettings )
 {
+    wstring sFile = sFileArg;
+    {
+        // Library entries saved by older builds can have their non-ASCII characters mangled.
+        wstring sRepaired;
+        if ( Util::RepairMojibakePath( sFile, sRepaired ) )
+            sFile = sRepaired;
+    }
     Config &config = Config::GetConfig();
     const VisualSettings &cVisual = config.GetVisualSettings();
     PlaybackSettings &cPlayback = config.GetPlaybackSettings();
@@ -768,6 +803,9 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
     g_LoadingProgress.progress = 0;
     g_LoadingProgress.max = 0;
     g_bShowLoading = true;
+    // Bring the prerender synth up in the background while the file parses.
+    if ( config.GetAudioSettings().bPreRenderAudio && !PRE_MIDIAudio )
+        std::thread( PGFA_EnsurePreRenderAudio ).detach();
     // Free the previous song BEFORE parsing the new one: the old state's song
     // data (merged events + SoA pools) otherwise stays resident through the
     // whole load, and the combined peak TDRs the driver on memory-tight
@@ -825,6 +863,13 @@ BOOL PlayFile( const wstring &sFile, bool bCustomSettings )
     if (!pGameState || !pGameState->IsValid())
     {
         g_bShowLoading = false;
+        if (g_Bench.active)
+        {
+            // Unattended run: report in the result file and quit, never wait on a dialog.
+            const std::string msg = "status=LOAD_FAILED\nmidi=" + BenchNarrow(sFile) + "\n";
+            BenchWriteFile(g_Bench.outDir + L"/result.txt", msg.data(), msg.size());
+            ExitProcess(3);
+        }
         MessageBox(g_hWnd, (L"Was not able to load " + sFile).c_str(), TEXT("Error"), MB_OK | MB_ICONEXCLAMATION);
         delete pGameState;
         return FALSE;

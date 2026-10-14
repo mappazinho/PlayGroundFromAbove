@@ -14,6 +14,9 @@ extern std::atomic<bool> g_bGenDead;
 #include <atomic>
 extern std::atomic<float> g_fGameFPS;
 
+// One-time creation of the prerender synth + SDL device (PRE_MIDIAudio). Blocks until done; callable from any thread.
+extern void PGFA_EnsurePreRenderAudio();
+
 // Initializes the SDL audio device and the ring buffer that the SDL callback pulls from. Must be called AFTER PRE_MIDIAudio has been created.
 extern int PRE_InitAudio();
 

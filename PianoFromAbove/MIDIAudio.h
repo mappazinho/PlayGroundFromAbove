@@ -159,16 +159,23 @@ public:
 	int m_iMaxAheadFrames = 48000 * 30;
 	void SetMaxAheadMs(int ms);
 	void EnsureBufferCapacity(int minFrames);
+	void ApplyPendingBufferResize();
 
 	double GetPlayerTime() { return m_dStartTime + m_iBufferReadPos / 48000.0; }
 	double GetBufferSeconds() { return max(0, m_iBufferWritePos - m_iBufferReadPos) / 48000.0; }
 	bool IsAudioStarted() { return m_bAudioStarted; }
+	bool IsGeneratorRunning() const; // a generator thread is attached and not being stopped
+	// Seek inside audio the generator has already rendered by moving the read position (no restart, no rebuild).
+	// False when the target is outside what the ring still holds (or leaves too little runway ahead).
+	bool TrySeekWithinBuffer(double timeSec);
  // Diagnostics for the pianoroll overlay. Thread-unsafe by design; read-ownly.
 	unsigned long long GetBufferUnderruns() { return m_ullBufferUnderruns; }
 	int GetBufferWritePos() { return m_iBufferWritePos; }
 	int GetBufferReadPos() { return m_iBufferReadPos; }
 
 private:
+	void GrowBuffer(int minFloats);
+	std::atomic<int> m_iPendingBufferFloats{ 0 }; // growth requested while a generator was running
 	int m_iBufferReadPos = 0;
 	int m_iBufferWritePos = 0;
 	int m_iBufferLength;
